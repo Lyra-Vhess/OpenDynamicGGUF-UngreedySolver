@@ -106,7 +106,7 @@ OpenDynamicGGUF/
 │  TRUST LAYER
 ├── report.py               # report.html generator (charts from run artifacts)
 ├── explain.py              # per-group decision explanations from sensitivity table
-├── benchmark.py            # lm-eval-harness runner + benchmarks.html
+├── experiment.py           # same-model lm-eval experiment (BF16 vs Q4/Q5/Q6 vs ODG)
 ├── scan.py                 # security scanner: checksums, provenance, recipe replay
 │
 │  DISTRIBUTION LAYER
@@ -121,7 +121,7 @@ OpenDynamicGGUF/
 ├── plugins.py              # entry-point discovery: odg.metrics / odg.search / odg.export / odg.evals
 │
 │  INTERFACE LAYER
-├── cli.py                  # extended: odg fit / recipe / benchmark / report / publish / scan / card
+├── cli.py                  # extended: odg fit / recipe / experiment / report / publish / scan / card
 ├── webui/                  # local FastAPI + static frontend over the run store
 └── action/                 # GitHub Action wrapper (composite action + Dockerfile)
 ```
@@ -143,7 +143,7 @@ odg recipe gemma4-27b --device rtx-3060               # fetch + build from regis
 odg recipe submit ./recipe.yaml                       # validate for marketplace PR
 
 # Trust layer
-odg benchmark model.gguf --suite standard             # MMLU/GSM8K/HumanEval/…
+odg experiment run --all                              # BF16 vs Q4/Q5/Q6 vs ODG, pinned lm-eval
 odg report --model gemma4-27b                         # report.html from run artifacts
 odg explain --model gemma4-27b                        # why each group got its bits
 odg scan model.gguf --recipe recipe.yaml              # provenance + checksum verify
@@ -196,11 +196,11 @@ meta:
     toks_per_sec: {rtx-3060-12gb: 34.2}
 ```
 
-### 5.3 Benchmark result (`odg/benchresult/v1`)
+### 5.3 Experiment comparison (`odg/experiment/v1`)
 
-One JSON per (gguf, suite) pair; consumed by reports, model cards, and the leaderboard.
-Always stores the **paired delta vs BF16** with confidence intervals, never just raw scores
-(design principle 7).
+One table per (model, pin) covering BF16, uniform Q4_K_M / Q5_K_M / Q6_K, and OpenDynamicGGUF.
+Quality, GGUF size, perplexity/KL, and throughput. Consumed by `benchmark/results/comparison.md`
+and optionally by `report.html` when copied into the run as `experiment/comparison.json`.
 
 ### 5.4 Plugin entry points
 
@@ -233,7 +233,7 @@ core engine      steps 01–12                  →  sensitivity table
 autosearch.py    candidates around greedy     →  Pareto frontier of recipes
 objectives.py    quality × speed × vram       →  pick frontier point for this profile
 core engine      steps 13–15                  →  GGUF + gates
-benchmark.py     suite=standard               →  benchresult.json (paired vs BF16)
+experiment.py    BF16 / Q4 / Q5 / Q6 / ODG    →  comparison.md (same model, same harness)
 explain.py       sensitivity + recipe         →  per-group reasons
 report.py        all artifacts                →  report.html
 scan.py          recipe replay + checksums    →  provenance block

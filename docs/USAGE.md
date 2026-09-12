@@ -20,7 +20,7 @@ End-to-end guide: install → run the pipeline → read the recipe → **write a
 9. [Useful flags](#9-useful-flags)
 10. [Inspecting runs](#10-inspecting-runs)
 11. [Troubleshooting](#11-troubleshooting)
-12. [Platform commands: fit, benchmark, report](#12-platform-commands-fit-benchmark-report)
+12. [Platform commands: fit, experiment, report](#12-platform-commands-fit-experiment-report)
 
 ---
 
@@ -413,7 +413,7 @@ odg validate --model functiongemma:latest --force
 
 ---
 
-## 12. Platform commands: fit, benchmark, report
+## 12. Platform commands: fit, experiment, report
 
 Phase 1 of the [platform expansion](./platform/README.md) adds intent-level commands on top of the pipeline.
 
@@ -436,21 +436,25 @@ budget = memory pool × usable fraction − KV cache(model, ctx) − runtime ove
 
 > Resuming a run that already has an optimized recipe keeps the old recipe; pass `--force` (or `--new-run`) to re-optimize under the new hardware budget.
 
-### `odg benchmark` — comparable numbers for any GGUF
+### `odg experiment` — same model, same harness, only quantization changes
+
+Default test model: `google/functiongemma-270m-it`. Variants: BF16, Q4_K_M, Q5_K_M, Q6_K, OpenDynamicGGUF. Tasks: MMLU, GSM8K, HellaSwag, ARC-Challenge, TruthfulQA. Nothing except the weights is allowed to change.
 
 ```bash
-odg benchmark model-UD.gguf --suite smoke          # minutes
-odg benchmark --model functiongemma:latest         # uses the run's exported GGUF
-odg benchmark model.gguf --suite standard --device rtx-3060-12gb
+# one command
+./benchmark/run_all.sh
+
+# or
+odg experiment prepare                         # HF snapshot + GGUFs
+odg experiment run --all                       # identical lm-eval on every variant
+odg experiment compare                         # → benchmark/results/comparison.md
 ```
 
-Writes `benchresult.json` (`odg/benchresult/v1`) with:
+`dev` (default) caps each task at 32 samples. Full tasks: `--suite paper`.
 
-- **throughput** via `llama-bench` (needs `LLAMA_CPP_DIR`; skipped honestly otherwise),
-- **quality** via lm-eval-harness (`pip install lm-eval` to enable; skipped honestly otherwise) — deltas are paired per-question vs the BF16 reference with bootstrap CIs, never raw thresholds,
-- file size + sha256, and the device profile tag.
+Gemma/FunctionGemma weights are gated (`huggingface-cli login` or `HF_TOKEN`). Quality needs `pip install 'lm-eval[hf]' transformers torch` plus `llama-cpp-python` for GGUF K-quants. Missing tools are recorded as skipped — never faked.
 
-Results stored under `<run>/benchmarks/` are picked up by the report automatically.
+If you copy `benchmark/results/comparison.json` to `<run>/experiment/comparison.json`, `odg report` includes the table.
 
 ### `odg report` — one self-contained report.html
 

@@ -100,7 +100,7 @@ averaged across devices.
 - [ ] Every row passes the four integrity rules in CI — unverifiable rows are impossible
 - [ ] Quality shown as paired delta + CI vs BF16, throughput shown per-device
 - [ ] Each row links to recipe, benchresult, report, and author
-- [ ] A stranger can submit a row with only `odg benchmark` + `odg leaderboard submit` + a PR
+- [ ] A stranger can submit a row with only `odg experiment compare` + `odg leaderboard submit` + a PR
 
 ## Next
 

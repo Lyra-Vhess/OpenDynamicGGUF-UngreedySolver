@@ -482,50 +482,55 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_dev.add_argument("--no-explain", action="store_true")
 
-    # --- benchmark (suite runner → benchresult.json) ---
-    p_bench = sub.add_parser(
-        "benchmark",
-        help="Benchmark a GGUF (throughput via llama-bench; quality via lm-eval "
-        "when installed) → benchresult.json",
+    # --- experiment (same model, same harness; only quantization changes) ---
+    p_exp = sub.add_parser(
+        "experiment",
+        help="Same-model experiment: FunctionGemma 270M BF16 vs Q4_K_M / "
+        "Q5_K_M / Q6_K / OpenDynamicGGUF on a pinned lm-eval suite",
     )
-    p_bench.add_argument(
-        "gguf",
-        nargs="?",
-        default=None,
-        help="Path to a .gguf (default: the run's exported GGUF)",
+    p_exp.add_argument(
+        "action",
+        choices=("prepare", "run", "compare"),
+        help="prepare GGUFs, run one/all variants, or write the comparison table",
     )
-    p_bench.add_argument("--model", "-m", default=None)
-    p_bench.add_argument("--run", default=None)
-    p_bench.add_argument(
-        "--suite",
-        default="smoke",
-        help="Suite id: smoke (default), standard, coding",
-    )
-    p_bench.add_argument(
-        "--device",
-        default=None,
-        metavar="ID",
-        help="Tag throughput with a named hardware profile",
-    )
-    p_bench.add_argument(
-        "--llama-bench",
+    p_exp.add_argument(
+        "--root",
         type=Path,
         default=None,
-        help="Path to llama-bench binary (or set LLAMA_CPP_DIR)",
+        help="Experiment directory (default: ./benchmark)",
     )
-    p_bench.add_argument(
-        "--out",
-        type=Path,
+    p_exp.add_argument(
+        "--model",
+        "-m",
         default=None,
-        help="Output dir for benchresult.json (default: <run>/benchmarks/…)",
+        help="HF repo (default: google/functiongemma-270m-it)",
     )
-    p_bench.add_argument("--no-explain", action="store_true")
+    p_exp.add_argument(
+        "--variant",
+        "-v",
+        default=None,
+        help="bf16 | q4_k_m | q5_k_m | q6_k | odg",
+    )
+    p_exp.add_argument("--all", action="store_true", help="Run every prepared variant")
+    p_exp.add_argument("--suite", default="dev", help="dev (default, 32 samples) or paper")
+    p_exp.add_argument("--limit", type=int, default=None, help="Override per-task sample cap")
+    p_exp.add_argument(
+        "--gguf-backend",
+        choices=("gguf", "hf"),
+        default=None,
+        help="gguf (llama-cpp-python, default) or hf (gguf_file=)",
+    )
+    p_exp.add_argument("--skip-odg", action="store_true")
+    p_exp.add_argument("--skip-quality", action="store_true")
+    p_exp.add_argument("--skip-behavior", action="store_true")
+    p_exp.add_argument("--force", action="store_true")
+    p_exp.add_argument("--no-explain", action="store_true")
 
     # --- report (self-contained report.html from run artifacts) ---
     p_report = sub.add_parser(
         "report",
         help="Render report.html (allocations, sensitivity heatmap, Pareto, "
-        "gates, benchmarks) from run artifacts",
+        "gates, experiment table) from run artifacts",
     )
     p_report.add_argument("--model", "-m", default=None)
     p_report.add_argument("--run", default=None)
@@ -587,8 +592,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_fit(args)
     if args.command == "devices":
         return cmd_devices(args)
-    if args.command == "benchmark":
-        return cmd_benchmark(args)
+    if args.command == "experiment":
+        return cmd_experiment(args)
     if args.command == "report":
         return cmd_report(args)
 
@@ -2870,132 +2875,159 @@ def cmd_fit(args: argparse.Namespace) -> int:
     return cmd_run(pipeline_args)
 
 
-def cmd_benchmark(args: argparse.Namespace) -> int:
-    from datetime import datetime, timezone
-
-    from benchmark import SUITES, run_benchmark
-
-    print_explain = not args.no_explain
-
-    if args.suite not in SUITES:
-        known = ", ".join(sorted(SUITES))
-        print(f"ERROR: unknown suite {args.suite!r}. Suites: {known}", file=sys.stderr)
-        return 1
-
-    # Locate the GGUF: explicit path, or the run's exported candidate.
-    store = _store(args)
-    meta = None
-    gguf_path = Path(args.gguf) if args.gguf else None
-    model_ref = None
-    recipe_path = None
-    if gguf_path is None or args.model or args.run:
-        try:
-            meta = _require_run(store, model=args.model, run_id=args.run)
-            model_ref = meta.model_ref
-        except ValueError as exc:
-            if gguf_path is None:
-                print(
-                    f"ERROR: {exc}\n"
-                    "Pass a GGUF path, or --model/--run for a finished run.",
-                    file=sys.stderr,
-                )
-                return 1
-    if gguf_path is None and meta is not None:
-        export_out = store.read_step_output(meta.run_id, "export") or {}
-        gguf_out = export_out.get("gguf_out")
-        if not gguf_out or not Path(gguf_out).is_file():
-            print(
-                "ERROR: this run has no exported GGUF (export was dry_run?).\n"
-                f"  Produce one: odg export --model {meta.model_ref} --mode llama --force\n"
-                "  Or pass a .gguf path directly: odg benchmark path/to/model.gguf",
-                file=sys.stderr,
-            )
-            return 1
-        gguf_path = Path(gguf_out)
-        rp = Path(export_out.get("recipe_path") or "")
-        recipe_path = rp if rp.is_file() else None
-    if gguf_path is None or not gguf_path.is_file():
-        print(f"ERROR: GGUF not found: {gguf_path}", file=sys.stderr)
-        return 1
-
-    device_profile = None
-    if args.device:
-        from hardware import get_device
-
-        try:
-            device_profile = get_device(args.device).to_dict()
-        except ValueError as exc:
-            print(f"ERROR: {exc}", file=sys.stderr)
-            return 1
-
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    if args.out:
-        out_dir = Path(args.out)
-    elif meta is not None:
-        out_dir = Path(meta.root) / "benchmarks" / f"{stamp}-{args.suite}"
-    else:
-        out_dir = gguf_path.parent / "odg-benchmarks" / f"{stamp}-{args.suite}"
-
-    ui.step_banner(
-        0,
-        "Benchmark",
-        model=model_ref or gguf_path.name,
-        run_id=meta.run_id if meta else "(standalone)",
-        root=str(out_dir),
-        goal="Measure throughput (llama-bench) and quality (lm-eval, if installed).",
-        bullets=[
-            f"Suite: {args.suite} — {SUITES[args.suite].description}",
-            f"GGUF: {gguf_path}",
-            "Quality deltas are paired vs BF16 with CIs — never raw thresholds",
-        ],
-        explain=print_explain,
+def cmd_experiment(args: argparse.Namespace) -> int:
+    """Same-model / same-harness experiment. Quantization is the only variable."""
+    from experiment import (
+        VARIANTS,
+        VARIANT_LABELS,
+        compare,
+        default_root,
+        prepare,
+        render_comparison_markdown,
+        results_dir,
+        run_variant,
     )
 
-    try:
-        with ui.working("Benchmarking…", explain=print_explain):
-            result = run_benchmark(
-                gguf_path,
-                suite_id=args.suite,
-                model_ref=model_ref,
-                device_profile=device_profile,
-                recipe_path=recipe_path,
-                llama_bench=args.llama_bench,
-                out_dir=out_dir,
-            )
-    except (FileNotFoundError, ValueError) as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
+    print_explain = not args.no_explain
+    root = Path(args.root) if args.root else default_root()
+    model = args.model or "google/functiongemma-270m-it"
 
-    payload = result.summary_dict()
+    if args.action == "prepare":
+        ui.step_banner(
+            0,
+            "Experiment prepare",
+            model=model,
+            run_id="(experiment)",
+            root=str(root),
+            goal="Same BF16 checkpoint → Q4_K_M / Q5_K_M / Q6_K / OpenDynamicGGUF.",
+            bullets=[
+                "Original weights stay untouched",
+                "Uniform baselines share one imatrix with ODG",
+                "Evaluation config is pinned in benchmark/config.json",
+            ],
+            explain=print_explain,
+        )
+        try:
+            with ui.working("Preparing variants…", explain=print_explain):
+                manifest = prepare(
+                    root,
+                    model=args.model,
+                    force=args.force,
+                    skip_odg=args.skip_odg,
+                )
+        except Exception as exc:  # noqa: BLE001
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        if print_explain:
+            sizes = manifest.get("sizes") or {}
+            rows = [("model", manifest.get("model")), ("n_params", manifest.get("n_params"))]
+            for vid, info in sizes.items():
+                mb = info.get("mb")
+                status = "ok" if info.get("present") else "missing"
+                rows.append(
+                    (
+                        VARIANT_LABELS.get(vid, vid),
+                        f"{status} · {mb:.1f} MB" if mb is not None else status,
+                    )
+                )
+            ui.section("experiment prepare")
+            ui.kv(rows)
+            ui.notes(manifest.get("notes") or [])
+            ui.next_step("odg experiment run --all   # or ./benchmark/run_all.sh")
+        else:
+            print(json.dumps(manifest, indent=2))
+        return 0
+
+    if args.action == "run":
+        if args.all:
+            variants = list(VARIANTS)
+        elif args.variant:
+            variants = [args.variant]
+        else:
+            print("ERROR: pass --variant V or --all", file=sys.stderr)
+            return 1
+        ui.step_banner(
+            0,
+            "Experiment run",
+            model=model,
+            run_id="(experiment)",
+            root=str(root),
+            goal="Identical lm-eval config on every variant. Only weights change.",
+            bullets=[
+                f"Variants: {', '.join(VARIANT_LABELS.get(v, v) for v in variants)}",
+                f"Suite: {args.suite}",
+                "Tasks: MMLU, GSM8K, HellaSwag, ARC-Challenge, TruthfulQA",
+            ],
+            explain=print_explain,
+        )
+        rc = 0
+        for vid in variants:
+            try:
+                with ui.working(f"Evaluating {VARIANT_LABELS.get(vid, vid)}…", explain=print_explain):
+                    payload = run_variant(
+                        vid,
+                        root,
+                        suite=args.suite,
+                        limit_override=args.limit,
+                        gguf_backend=args.gguf_backend,
+                        force=args.force,
+                        skip_quality=args.skip_quality,
+                        skip_behavior=args.skip_behavior,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                print(f"ERROR ({vid}): {exc}", file=sys.stderr)
+                rc = 1
+                continue
+            if print_explain:
+                q = payload.get("quality") or {}
+                rows = [
+                    ("variant", payload.get("label")),
+                    ("pin", payload.get("config_fingerprint")),
+                    ("size", f"{(payload.get('memory') or {}).get('mb') or '—'} MB"),
+                ]
+                if q.get("skipped"):
+                    rows.append(("quality", f"skipped — {q.get('reason')}"))
+                else:
+                    for tid, entry in (q.get("tasks") or {}).items():
+                        score = entry.get("score")
+                        rows.append(
+                            (
+                                tid,
+                                "—" if score is None else f"{score * 100:.1f}"
+                                if 0 <= float(score) <= 1
+                                else str(score),
+                            )
+                        )
+                ui.section(str(payload.get("label") or vid))
+                ui.kv(rows)
+                ui.notes(payload.get("notes") or [])
+            else:
+                print(json.dumps(payload, indent=2))
+        if print_explain:
+            ui.next_step("odg experiment compare")
+        return rc
+
+    # compare
+    ui.step_banner(
+        0,
+        "Experiment compare",
+        model=model,
+        run_id="(experiment)",
+        root=str(root),
+        goal="One table: quality, size, behavior, inference — same pin, every variant.",
+        bullets=["Bold = best quantized score per task", "Size vs Q4_K_M is part of the claim"],
+        explain=print_explain,
+    )
+    with ui.working("Writing comparison table…", explain=print_explain):
+        comp = compare(root)
+    md = render_comparison_markdown(comp)
+    out_md = results_dir(root) / "comparison.md"
     if print_explain:
-        tp = result.throughput or {}
-        rows = [
-            ("gguf", Path(result.gguf_path).name),
-            ("sha256", result.gguf_sha256[:16] + "…"),
-            ("size", f"{result.memory['weights_gb']} GB"),
-            (
-                "throughput",
-                f"pp {tp.get('pp_tps', '—')} t/s · tg {tp.get('tg_tps', '—')} t/s"
-                if tp
-                else "not measured (llama-bench unavailable)",
-            ),
-            (
-                "quality",
-                "skipped: " + str(result.quality.get("reason"))
-                if result.quality.get("skipped")
-                else f"{len(result.quality.get('tasks') or {})} tasks",
-            ),
-            ("result", result.result_path),
-        ]
-        ui.section("benchmark result")
-        ui.kv(rows)
-        ui.notes(result.notes)
-        if meta is not None:
-            ui.next_step(
-                f"Included in the report on next render: odg report --model {model_ref}"
-            )
+        print(md)
+        ui.notes(comp.get("warnings") or [])
+        ui.next_step(f"Table written to {out_md}")
     else:
-        print(json.dumps(payload, indent=2))
+        print(json.dumps(comp, indent=2))
     return 0
 
 

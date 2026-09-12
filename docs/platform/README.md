@@ -36,7 +36,7 @@ The core engine (steps 01–15) is unchanged. Platform features wrap around it i
 | # | Feature | File | One-line summary | State |
 |---|---|---|---|---|
 | 01 | Hardware-aware optimizer | [01-hardware-aware-optimizer.md](./01-hardware-aware-optimizer.md) | `odg fit --gpu 24GB` — hardware in, budget out | ✅ `hardware.py` · `odg fit` / `odg devices` |
-| 02 | Benchmark runner | [02-benchmark-runner.md](./02-benchmark-runner.md) | `odg benchmark model.gguf` — paired suites vs BF16 | ✅ `benchmark.py` · `odg benchmark` (llama-bench + optional lm-eval) |
+| 02 | Same-model experiment | [02-benchmark-runner.md](./02-benchmark-runner.md) | FunctionGemma 270M BF16 vs Q4/Q5/Q6 vs ODG on a pinned lm-eval suite | ✅ `experiment.py` · `odg experiment` · `benchmark/` |
 | 03 | Interactive HTML report | [03-report-visualization.md](./03-report-visualization.md) | `report.html` — heatmaps, Pareto, KLD distributions | ✅ `report.py` · `odg report` (auto after `run`/`fit`) |
 
 ### Phase 2 — Share

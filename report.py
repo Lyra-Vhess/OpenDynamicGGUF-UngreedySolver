@@ -247,15 +247,15 @@ def extract_gates(run_root: Path) -> dict[str, Any]:
 
 
 def extract_benchmarks(run_root: Path) -> dict[str, Any]:
-    from benchmark import find_run_benchresults
-
-    results = find_run_benchresults(run_root)
-    if not results:
+    """Read the same-model experiment table if it was copied into this run."""
+    path = Path(run_root) / "experiment" / "comparison.json"
+    data = _read_json(path)
+    if not data:
         return {"available": False}
     return {
         "available": True,
-        "source": "benchmarks/*/benchresult.json",
-        "results": results,
+        "source": "experiment/comparison.json",
+        "comparison": data,
     }
 
 
@@ -612,47 +612,64 @@ def render_html(data: dict[str, Any]) -> str:
     else:
         parts.append(_not_run("Validation gates", "step 15 (validate) has not run"))
 
-    # --- benchmarks ---
+    # --- experiment (same model, same harness) ---
     b = data["benchmarks"]
     if b.get("available"):
-        blocks = []
-        for res in b["results"]:
-            tasks = (res.get("quality") or {}).get("tasks") or {}
-            tp = res.get("throughput") or {}
-            rws = []
-            for tid, t in tasks.items():
-                delta = (
-                    f"{t['paired_delta']:+.4f} [{t['ci_low']:+.4f}, {t['ci_high']:+.4f}]"
-                    if "paired_delta" in t
-                    else '<span class="dim">no reference</span>'
-                )
-                score = f"{t['score']:.4f}" if t.get("score") is not None else "—"
-                rws.append(
-                    f"<tr><th>{_esc(tid)}</th><td>{score}</td><td>{delta}</td></tr>"
-                )
-            tbl = (
-                "<table><thead><tr><th>task</th><th>score</th>"
-                "<th>Δ vs BF16 (95% CI)</th></tr></thead>"
-                f"<tbody>{''.join(rws)}</tbody></table>"
-                if rws
-                else '<p class="dim">quality tasks skipped '
-                f"({_esc((res.get('quality') or {}).get('reason') or 'n/a')})</p>"
+        comp = b.get("comparison") or {}
+        variants = ["bf16", "q4_k_m", "q5_k_m", "q6_k", "odg"]
+        labels = {
+            "bf16": "BF16",
+            "q4_k_m": "Q4_K_M",
+            "q5_k_m": "Q5_K_M",
+            "q6_k": "Q6_K",
+            "odg": "ODG",
+        }
+        head = (
+            "<thead><tr><th>benchmark</th>"
+            + "".join(f"<th>{labels[v]}</th>" for v in variants)
+            + "</tr></thead>"
+        )
+        rws = []
+        for row in comp.get("quality") or []:
+            cells = []
+            for v in variants:
+                val = (row.get("scores") or {}).get(v)
+                if val is None:
+                    cells.append("—")
+                elif 0 <= float(val) <= 1:
+                    cells.append(f"{float(val) * 100:.1f}")
+                else:
+                    cells.append(f"{float(val):.3f}")
+            rws.append(
+                "<tr><th>"
+                + _esc(row.get("label") or row.get("task"))
+                + "</th>"
+                + "".join(f"<td>{c}</td>" for c in cells)
+                + "</tr>"
             )
-            tp_line = (
-                f"pp {tp.get('pp_tps', '—')} t/s · tg {tp.get('tg_tps', '—')} t/s"
-                + (f" on {_esc(tp['device'])}" if tp.get("device") else "")
-                if tp
-                else "throughput not measured"
+        size_rws = []
+        for row in comp.get("compression") or []:
+            mb = row.get("bytes")
+            size = f"{float(mb) / (1024**2):.1f} MB" if mb else "—"
+            size_rws.append(f"<tr><th>{_esc(row.get('label'))}</th><td>{size}</td></tr>")
+        inner = f"<p class='cap'>{_esc(comp.get('model') or '')}</p>"
+        if rws:
+            inner += f"<table>{head}<tbody>{''.join(rws)}</tbody></table>"
+        if size_rws:
+            inner += (
+                "<table><thead><tr><th>model</th><th>size</th></tr></thead>"
+                f"<tbody>{''.join(size_rws)}</tbody></table>"
             )
-            blocks.append(
-                f"<p><b>suite {_esc(res.get('suite'))}</b> · {_esc(res.get('created_at'))} · "
-                f"{tp_line} · gguf <code>{_esc((res.get('gguf_sha256') or '')[:16])}…</code></p>"
-                + tbl
-            )
-        parts.append(_section("Benchmarks", b.get("source"), "".join(blocks)))
+        if comp.get("size_note"):
+            inner += f'<p class="cap">{_esc(comp["size_note"])}</p>'
+        parts.append(_section("Experiment", b.get("source"), inner))
     else:
         parts.append(
-            _not_run("Benchmarks", "no benchresult.json — run: odg benchmark <gguf> --suite smoke")
+            _not_run(
+                "Experiment",
+                "no experiment/comparison.json — run: odg experiment prepare "
+                "&& odg experiment run --all && odg experiment compare",
+            )
         )
 
     # --- reproducibility ---

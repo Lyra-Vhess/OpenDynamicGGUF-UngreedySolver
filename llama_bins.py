@@ -27,6 +27,8 @@ def find_llama_binary(name: str, explicit: str | Path | None = None) -> Path | N
     candidates += [
         home / "llama.cpp" / "build" / "bin" / name,
         home / "llama.cpp" / name,
+        home / ".unsloth" / "llama.cpp" / "build" / "bin" / name,
+        home / ".unsloth" / "llama.cpp" / name,
         Path(f"/opt/homebrew/bin/{name}"),
         Path(f"/usr/local/bin/{name}"),
     ]

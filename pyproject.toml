@@ -25,6 +25,13 @@ Issues = "https://github.com/imrrohitt/OpenDynamicGGUF/issues"
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+eval = [
+  "lm-eval>=0.4.5",
+  "transformers>=4.44",
+  "torch",
+  "accelerate",
+  "sentencepiece",
+]
 
 [project.scripts]
 odg = "cli:main"
@@ -58,6 +65,6 @@ py-modules = [
   "validate",
   "quant_formats",
   "hardware",
-  "benchmark",
+  "experiment",
   "report",
 ]

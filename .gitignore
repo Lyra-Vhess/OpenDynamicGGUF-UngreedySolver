@@ -8,3 +8,9 @@ artifacts/
 .cache/
 *.gguf
 .DS_Store
+benchmark/results/*
+!benchmark/results/.gitkeep
+benchmark/models/*
+!benchmark/models/.gitkeep
+benchmark/artifacts/
+benchmark/manifest.json

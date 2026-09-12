@@ -1,123 +1,98 @@
-# Feature 02 — Benchmark runner
+# Feature 02 — Same-model experiment
 
 ← [01 Hardware-aware optimizer](./01-hardware-aware-optimizer.md) · [Index](./README.md) · Next: [03 HTML report](./03-report-visualization.md) →
 
-Priority: ⭐⭐⭐⭐⭐ · Phase 1 · New modules: `benchmark.py` · New command: `odg benchmark`
+Priority: ⭐⭐⭐⭐⭐ · Phase 1 · Module: `experiment.py` · Command: `odg experiment` · Scripts: `benchmark/`
 
 ---
 
 ## Goal
 
-One command turns a GGUF into comparable, trustworthy numbers:
+Prove (or refute) OpenDynamicGGUF against the original model and against uniform GGUF baselines **on the same model, the same tokenizer, and the same lm-eval-harness config**. Quantization is the only independent variable.
 
-```bash
-odg benchmark gemma-UD.gguf                       # standard suite
-odg benchmark gemma-UD.gguf --suite coding        # HumanEval + LiveCodeBench focus
-odg benchmark gemma-UD.gguf --tasks mmlu,gsm8k
+Default test model: `google/functiongemma-270m-it`.
+
+```text
+                    SAME MODEL
+                       │
+             ┌─────────┴─────────┐
+             │                   │
+        Original model       OpenDynamicGGUF
+          BF16/FP16             quantized
+             │                   │
+             └─────────┬─────────┘
+                       │
+                 SAME BENCHMARK
+                       │
+        ┌──────────────┼──────────────┐
+        MMLU        GSM8K       HellaSwag
+        ARC         TruthfulQA
 ```
 
-producing `benchresult.json` (machine-readable) and feeding `benchmarks.html` (feature 03).
+```bash
+./benchmark/run_all.sh
+# or
+odg experiment prepare
+odg experiment run --all
+odg experiment compare
+```
+
+Writes `benchmark/results/comparison.md` — quality, size, behavior, inference.
 
 ---
 
 ## Why it exists
 
-Today everyone benchmarks quantized models manually, with different harness versions, few-shot
-settings, and prompts — so numbers across the community are not comparable. A standard runner
-with pinned configs makes every OpenDynamicGGUF model immediately comparable, and it is the
-data source for the report (03), the leaderboard (05), and model cards (11).
+A single GGUF score is not a claim. The claim is:
 
-This is also the productization of the existing **Tier-3 gate** in step 15: same statistical
-methodology, promoted from an internal gate to a user-facing command.
+> At approximately the same compression level, OpenDynamicGGUF retains more
+> benchmark performance than Q4_K_M.
 
----
-
-## Depends on
-
-- lm-eval-harness (llama.cpp / GGUF backend) — external.
-- Step 15's paired-comparison rule (design principle 7): all deltas are **paired per-question
-  vs the BF16 reference with confidence intervals**, never raw score thresholds.
-- Optional: feature 01's hardware profile, to record throughput per device.
+That requires BF16 + uniform Q4_K_M / Q5_K_M / Q6_K + ODG, identical harness settings, and a size column. See [EleutherAI lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness) and the known GGUF-eval caveat ([issue 2887](https://github.com/EleutherAI/lm-evaluation-harness/issues/2887)).
 
 ---
 
-## Design
+## Pin (do not change between variants)
 
-### Suites
+| Knob | Value |
+|---|---|
+| Model | `google/functiongemma-270m-it` |
+| Tasks | `mmlu`, `gsm8k`, `hellaswag`, `arc_challenge`, `truthfulqa_mc2` |
+| Shots | harness defaults (not a global `--num_fewshot`) |
+| Seed | `0` |
+| Batch size | `8` |
+| Tokenizer | original HF tokenizer |
+| Suite | `dev` (32 samples, laptop) or `paper` (full) |
 
-| Suite | Tasks | Cost |
-|---|---|---|
-| `smoke` | tiny MMLU slice + 20 generations | minutes |
-| `standard` | MMLU, GSM8K, HumanEval, TruthfulQA | hours |
-| `coding` | HumanEval, MBPP, LiveCodeBench subset | hours |
-| `long-context` | needle-in-haystack, RULER subset | hours |
-| `tools` | schema-valid JSON rate on tool-call traces | ~1 hour |
+Config lives in `benchmark/config.json`. A fingerprint is stored on every `result.json`; `compare` refuses to treat mismatched pins as comparable.
 
-Suites are data (a YAML of task ids + pinned few-shot/config), not code — so the plugin
-system (feature 12) can later add suites via `odg.evals` entry points.
+---
 
-### Result schema (`odg/benchresult/v1`)
+## Layout
 
-```json
-{
-  "schema": "odg/benchresult/v1",
-  "gguf_sha256": "…",
-  "recipe_sha256": "…",
-  "reference": {"model": "bf16", "gguf_sha256": "…"},
-  "harness": {"name": "lm-eval", "version": "0.4.x", "commit": "…"},
-  "tasks": {
-    "mmlu": {
-      "score": 0.712,
-      "paired_delta_vs_bf16": -0.002,
-      "ci95": [-0.009, 0.005],
-      "n": 14042
-    }
-  },
-  "throughput": {"device": "rtx-3060-12gb", "pp_tps": 812.0, "tg_tps": 34.2},
-  "memory": {"weights_gb": 10.8, "peak_vram_gb": 12.6, "ctx": 8192}
-}
+```text
+benchmark/
+├── prepare.sh
+├── run_bf16.sh
+├── run_q4.sh
+├── run_q5.sh
+├── run_q6.sh
+├── run_odg.sh
+├── run_all.sh
+├── compare.py
+├── config.json
+└── results/
 ```
-
-Every field the leaderboard or a model card will ever show comes from this file.
-
-### Two measurement halves
-
-1. **Quality** — lm-eval-harness over the GGUF via llama.cpp server/bindings, plus the BF16
-   reference (cached per model: run once, reuse for every candidate — same trick as step 11's
-   logit cache).
-2. **Performance** — `llama-bench` style prompt-processing / token-generation throughput and
-   peak memory on the current machine, tagged with the hardware profile id.
-
----
-
-## Build steps
-
-1. **Result schema + writer.** `odg/benchresult/v1` dataclass, validation, content-addressed
-   storage in the run store. No runner yet.
-2. **Throughput half.** Wrap `llama-bench` (discovery via existing `llama_bins.py`), parse
-   output into the schema. Fast to build, immediately useful.
-3. **Harness adapter.** One task (MMLU slice) end-to-end through lm-eval-harness against a
-   GGUF. Pin harness version; record it in the result.
-4. **BF16 reference cache.** Run the reference once per (model, suite), key by hash, reuse —
-   candidates only pay their own eval cost.
-5. **Paired statistics.** Per-question pairing + bootstrap CI, shared with step 15's Tier-3
-   gate (extract the existing gate math into `benchmark.py` and have `validate.py` call it).
-6. **Suite definitions.** `smoke` first (used in CI for this repo), then `standard`, then the
-   domain suites.
-7. **`odg benchmark` CLI.** `--suite`, `--tasks`, `--reference` (auto from run store when the
-   GGUF came from a run), `--device` tag.
-8. **Wire into step 15.** Tier-3 gate becomes "run `smoke`/`standard` suite and apply gate
-   thresholds to the paired deltas".
 
 ---
 
 ## Done when
 
-- [ ] `odg benchmark x.gguf --suite smoke` produces a valid `benchresult.json` in minutes
-- [ ] Deltas are paired vs a cached BF16 reference with CIs — no raw-score-only output
-- [ ] Harness version + task configs are pinned and recorded in the result
-- [ ] Throughput + peak memory captured and tagged with a hardware profile id
-- [ ] Step 15 Tier-3 consumes the same code path (one implementation of the statistics)
+- [x] Old single-GGUF `odg benchmark` / `benchmark.py` removed
+- [x] `./benchmark/run_all.sh` produces `results/comparison.md`
+- [x] BF16, Q4_K_M, Q5_K_M, Q6_K, ODG share one eval command except `model_args`
+- [x] Size / bytes-per-parameter sit next to quality
+- [x] Missing lm-eval or GGUF is recorded as skipped — never faked
 
 ## Next
 

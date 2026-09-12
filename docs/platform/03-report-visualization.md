@@ -19,7 +19,7 @@ A single self-contained HTML file that makes the whole optimization transparent:
 - final layer/group allocations (which bits went where, and why)
 - byte distribution (where the gigabytes actually live)
 - KLD distribution (mean, p99.9, max — the same numbers the gates check)
-- perplexity + benchmark comparison vs BF16 (from feature 02, when present)
+- perplexity + same-model experiment table vs BF16 / Q4 / Q5 / Q6 / ODG (from feature 02, when present)
 - size ↔ quality Pareto frontier with the chosen point highlighted
 
 ---
@@ -37,7 +37,7 @@ users share (and feature 06 uploads to HF alongside the GGUF).
 
 - Run artifacts that already exist: catalog (05), weight/activation features (06/08),
   sensitivity table (12), recipe + Pareto set (13), validation metrics (15).
-- Feature 02's `benchresult.json` — optional section, rendered when present.
+- Feature 02's `experiment/comparison.json` — optional section, rendered when present.
 
 ---
 
@@ -63,7 +63,7 @@ users share (and feature 06 uploads to HF alongside the GGUF).
 | Allocation table with reasons | `13_optimize/recipe.yaml` + sensitivity rows (feature 10 deepens this) |
 | KLD distribution | `15_validate` Tier-1 metrics |
 | Pareto frontier | `13_optimize/pareto/*.yaml` |
-| Benchmarks | `benchresult.json` (feature 02) |
+| Experiment | `experiment/comparison.json` (feature 02) |
 | Reproducibility block | source SHA, imatrix SHA, recipe hash, command line |
 
 ---
@@ -76,8 +76,7 @@ users share (and feature 06 uploads to HF alongside the GGUF).
    render "not run" gracefully.
 3. **Charts, cheapest first.** Allocation table → byte treemap → sensitivity heatmap → KLD
    histogram → Pareto scatter. One PR each.
-4. **Benchmark section.** Render `benchresult.json` with paired-delta CIs shown as error
-   bars, not bare scores.
+4. **Experiment section.** Render `comparison.json` (BF16 vs Q4/Q5/Q6 vs ODG, plus size).
 5. **`odg report` CLI** + auto-generation at the end of `odg run` / `odg fit` when step 15
    completes.
 6. **Source-hash captions.** Wire artifact path + sha into every section footer.

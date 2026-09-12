@@ -123,14 +123,30 @@ def run_dir(tmp_path):
         },
     )
     _write(
-        root / "benchmarks/20260101-000000-smoke/benchresult.json",
+        root / "experiment/comparison.json",
         {
-            "schema": "odg/benchresult/v1",
-            "suite": "smoke",
-            "created_at": "2026-01-01T00:00:00Z",
-            "gguf_sha256": "bb22" * 16,
-            "quality": {"skipped": True, "reason": "lm-eval not installed", "tasks": {}},
-            "throughput": {"pp_tps": 800.0, "tg_tps": 30.0, "device": "mac-16gb"},
+            "schema": "odg/experiment/v1",
+            "model": "google/functiongemma-270m-it",
+            "quality": [
+                {
+                    "task": "mmlu",
+                    "label": "MMLU",
+                    "metric": "acc,none",
+                    "scores": {
+                        "bf16": 0.321,
+                        "q4_k_m": 0.298,
+                        "q5_k_m": 0.310,
+                        "q6_k": 0.318,
+                        "odg": 0.315,
+                    },
+                    "best_quantized": "q6_k",
+                }
+            ],
+            "compression": [
+                {"variant": "bf16", "label": "BF16", "bytes": 540_000_000},
+                {"variant": "q4_k_m", "label": "Q4_K_M", "bytes": 180_000_000},
+                {"variant": "odg", "label": "OpenDynamicGGUF", "bytes": 185_000_000},
+            ],
         },
     )
     return root
@@ -176,7 +192,7 @@ class TestRendering:
             assert external not in html
         assert "<svg" in html and "<style>" in html
         # key content present
-        for needle in ("test:model", "PROVISIONAL", "ffn_up@early", "Q3_K", "smoke"):
+        for needle in ("test:model", "PROVISIONAL", "ffn_up@early", "Q3_K", "MMLU"):
             assert needle in html
         # sections caption their source artifacts
         assert "steps/12_sensitivity/sensitivity.json" in html
