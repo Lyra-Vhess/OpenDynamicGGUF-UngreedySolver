@@ -14,3 +14,7 @@ benchmark/models/*
 !benchmark/models/.gitkeep
 benchmark/artifacts/
 benchmark/manifest.json
+benchmarks/*
+!benchmarks/.gitkeep
+evaluation/results/*
+!evaluation/results/.gitkeep

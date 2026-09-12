@@ -1,0 +1,36 @@
+{
+  "schema": "odg/eval-suite/v1",
+  "tasks": ["mmlu", "gsm8k", "hellaswag", "arc_challenge"],
+  "split": "test only (HellaSwag: original val — test labels are hidden)",
+  "subset": "first N rows of the published file order; same items for every GGUF",
+  "suites": {
+    "dev": {
+      "description": "Fast loop while changing the quantizer. Not a release claim.",
+      "limits": {
+        "mmlu": 500,
+        "gsm8k": 200,
+        "hellaswag": 500,
+        "arc_challenge": 200
+      }
+    },
+    "release": {
+      "description": "Full official test splits (~26K items). Use for a published comparison.",
+      "limits": {
+        "mmlu": null,
+        "gsm8k": null,
+        "hellaswag": null,
+        "arc_challenge": null
+      },
+      "expected_n": {
+        "mmlu": 14042,
+        "gsm8k": 1319,
+        "hellaswag": 10042,
+        "arc_challenge": 1172
+      }
+    }
+  },
+  "later": [
+    "ARC-Easy (2,376 test) — not in this suite",
+    "Perplexity on a fixed local text corpus — task scores miss distributional degradation"
+  ]
+}

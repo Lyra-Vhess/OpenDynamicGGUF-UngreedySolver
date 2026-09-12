@@ -436,25 +436,21 @@ budget = memory pool × usable fraction − KV cache(model, ctx) − runtime ove
 
 > Resuming a run that already has an optimized recipe keeps the old recipe; pass `--force` (or `--new-run`) to re-optimize under the new hardware budget.
 
-### `odg experiment` — same model, same harness, only quantization changes
+### `python benchmark.py` — same GGUFs, original test splits
 
-Default test model: `google/functiongemma-270m-it`. Variants: BF16, Q4_K_M, Q5_K_M, Q6_K, OpenDynamicGGUF. Tasks: MMLU, GSM8K, HellaSwag, ARC-Challenge, TruthfulQA. Nothing except the weights is allowed to change.
+Test sets only (no training data). Two suites, pinned in `evaluation/config.json`:
+
+| | MMLU | GSM8K | HellaSwag | ARC-C |
+|---|---:|---:|---:|---:|
+| `--suite dev` (default) | 500 | 200 | 500 | 200 |
+| `--suite release` | full | 1,319 | full val | 1,172 |
 
 ```bash
-# one command
-./benchmark/run_all.sh
-
-# or
-odg experiment prepare                         # HF snapshot + GGUFs
-odg experiment run --all                       # identical lm-eval on every variant
-odg experiment compare                         # → benchmark/results/comparison.md
+python benchmark.py --model original.gguf --model opendynamic.gguf
+python benchmark.py --suite release --model original.gguf --model opendynamic.gguf
 ```
 
-`dev` (default) caps each task at 32 samples. Full tasks: `--suite paper`.
-
-Gemma/FunctionGemma weights are gated (`huggingface-cli login` or `HF_TOKEN`). Quality needs `pip install 'lm-eval[hf]' transformers torch` plus `llama-cpp-python` for GGUF K-quants. Missing tools are recorded as skipped — never faked.
-
-If you copy `benchmark/results/comparison.json` to `<run>/experiment/comparison.json`, `odg report` includes the table.
+Place original CSV/JSONL files under `benchmarks/` later (see [`../evaluation/README.md`](../evaluation/README.md)). `llama-server` on `PATH` or `LLAMA_CPP_DIR`.
 
 ### `odg report` — one self-contained report.html
 

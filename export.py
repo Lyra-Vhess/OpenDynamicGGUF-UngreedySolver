@@ -71,6 +71,17 @@ def _embedding_output_types(recipe_tt: Path) -> tuple[str | None, str | None]:
     return emb, out
 
 
+def _sanitize_tensor_type_file(src: Path, dest: Path) -> Path:
+    """This llama.cpp rejects '#' comments in --tensor-type-file."""
+    kept = [
+        ln.strip()
+        for ln in src.read_text(encoding="utf-8").splitlines()
+        if ln.strip() and not ln.strip().startswith("#")
+    ]
+    dest.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+    return dest
+
+
 def build_quantize_command(
     *,
     binary: Path,
@@ -81,8 +92,11 @@ def build_quantize_command(
     base_type: str = "q4_k_m",
     embedding_type: str | None = None,
     output_type: str | None = None,
+    allow_requantize: bool = True,
 ) -> list[str]:
     cmd = [str(binary)]
+    if allow_requantize:
+        cmd.append("--allow-requantize")
     if imatrix and imatrix.is_file():
         cmd += ["--imatrix", str(imatrix)]
     cmd += ["--tensor-type-file", str(recipe_tt)]
@@ -95,7 +109,7 @@ def build_quantize_command(
         "--override-kv",
         "general.description=str:OpenDynamicGGUF dynamic quant",
     ]
-    cmd += [str(gguf_in), str(gguf_out), base_type]
+    cmd += [str(gguf_in), str(gguf_out), str(base_type).upper()]
     return cmd
 
 
@@ -132,6 +146,7 @@ def export_gguf(
     # Copy recipe artifacts into export step for provenance
     shutil.copy2(recipe_path, out_dir / "recipe.yaml")
     shutil.copy2(recipe_tt, out_dir / "recipe.tt")
+    recipe_tt_clean = _sanitize_tensor_type_file(out_dir / "recipe.tt", out_dir / "recipe.tt")
 
     slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", model_ref).strip("-") or "model"
     out_name = out_name or f"{slug}-UD.gguf"
@@ -162,7 +177,7 @@ def export_gguf(
             binary=binary,
             gguf_in=gguf_in,
             gguf_out=gguf_out,
-            recipe_tt=out_dir / "recipe.tt",
+            recipe_tt=recipe_tt_clean,
             imatrix=imatrix,
             base_type=base_type,
             embedding_type=emb,
@@ -200,7 +215,7 @@ def export_gguf(
                 binary=binary,
                 gguf_in=gguf_in,
                 gguf_out=gguf_out,
-                recipe_tt=out_dir / "recipe.tt",
+                recipe_tt=recipe_tt_clean,
                 imatrix=imatrix,
                 base_type=base_type,
                 embedding_type=emb,
@@ -219,7 +234,7 @@ def export_gguf(
             binary=fake_bin,
             gguf_in=gguf_in,
             gguf_out=gguf_out,
-            recipe_tt=out_dir / "recipe.tt",
+            recipe_tt=recipe_tt_clean,
             imatrix=imatrix,
             base_type=base_type,
             embedding_type=emb,
