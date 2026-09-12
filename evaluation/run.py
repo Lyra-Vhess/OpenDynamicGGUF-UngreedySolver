@@ -18,7 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from evaluation.fetch import fetch_all, link_models
-from evaluation.server import LlamaServer
+from evaluation.server import LlamaServer, open_backend
 from evaluation.suites import load_config, resolve_limits
 from evaluation.tasks import PROTOCOLS, TaskResult, run_task
 
@@ -32,12 +32,19 @@ DEFAULT_TASKS = tuple(load_config()["tasks"])
 LABELS = {
     "original": "Source",
     "original.gguf": "Source",
+    "functiongemma-270m-bf16.gguf": "Source",
     "q4_k_m": "Q4_K_M",
     "q4_k_m.gguf": "Q4_K_M",
+    "functiongemma-270m-q4_k_m.gguf": "Q4_K_M",
     "q5_k_m": "Q5_K_M",
+    "q5_k_m.gguf": "Q5_K_M",
+    "functiongemma-270m-q5_k_m.gguf": "Q5_K_M",
     "q6_k": "Q6_K",
+    "q6_k.gguf": "Q6_K",
+    "functiongemma-270m-q6_k.gguf": "Q6_K",
     "opendynamic": "OpenDynamicGGUF",
     "opendynamic.gguf": "OpenDynamicGGUF",
+    "functiongemma-270m-odg.gguf": "OpenDynamicGGUF",
 }
 
 
@@ -74,12 +81,21 @@ def eval_one(
         "tasks": {},
         "notes": [],
     }
-    with LlamaServer(gguf) as server:
+    server = open_backend(gguf)
+    if getattr(server, "_fallback_note", None):
+        out["notes"].append(server._fallback_note)
+        print(f"  note: {server._fallback_note}")
+    try:
         for name in tasks:
             cap = limits.get(name)
             shown = "full" if cap is None else str(cap)
             print(f"  {out['label']}: {name} (n≤{shown})")
-            result: TaskResult = run_task(server, name, limit=cap)
+            try:
+                result: TaskResult = run_task(server, name, limit=cap)
+            except RuntimeError as exc:
+                out["tasks"][name] = {"skipped": True, "reason": str(exc), "n": 0, "limit": cap}
+                print(f"    skipped: {exc}")
+                continue
             out["tasks"][name] = {
                 "score": result.score,
                 "metric": result.metric,
@@ -89,6 +105,8 @@ def eval_one(
                 "extra": result.extra,
             }
             print(f"    {result.metric}={result.score:.4f}  n={result.n}")
+    finally:
+        server.close()
     _write(out_dir / f"{gguf.stem}.json", out)
     return out
 

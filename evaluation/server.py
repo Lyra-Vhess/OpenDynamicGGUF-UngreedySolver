@@ -78,6 +78,7 @@ class LlamaServer:
             "-ngl",
             str(n_gpu_layers),
         ]
+        self.supports_loglikelihood = True
 
     def start(self, *, timeout_s: float = 120.0) -> None:
         self._proc = subprocess.Popen(
@@ -230,3 +231,91 @@ def letter_logprobs(dist: dict[str, float], letters: tuple[str, ...] = ("A", "B"
         if text in scored and lp > scored[text]:
             scored[text] = lp
     return scored
+
+
+OLLAMA_TAGS = {
+    "functiongemma-270m-bf16.gguf": "functiongemma-src",
+    "original.gguf": "functiongemma-src",
+    "functiongemma-270m-q4_k_m.gguf": "functiongemma-q4",
+    "q4_k_m.gguf": "functiongemma-q4",
+    "functiongemma-270m-odg.gguf": "functiongemma-odg",
+    "opendynamic.gguf": "functiongemma-odg",
+}
+
+
+def ollama_tag_for(gguf: Path) -> str | None:
+    return OLLAMA_TAGS.get(Path(gguf).name) or OLLAMA_TAGS.get(Path(gguf).name.lower())
+
+
+class OllamaServer:
+    """Greedy generate via local Ollama. No token logprobs."""
+
+    supports_loglikelihood = False
+
+    def __init__(self, tag: str, *, host: str = "http://127.0.0.1:11434") -> None:
+        self.tag = tag
+        self.base = host.rstrip("/")
+        self.gguf = Path(tag)
+
+    def start(self) -> None:
+        code, _ = _get(f"{self.base}/api/tags")
+        if code != 200:
+            raise RuntimeError("Ollama is not running. Start it with: ollama serve")
+
+    def close(self) -> None:
+        return None
+
+    def __enter__(self) -> "OllamaServer":
+        self.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def generate(self, prompt: str, *, n_predict: int = 256, stop: list[str] | None = None) -> str:
+        raw = _post(
+            f"{self.base}/api/generate",
+            {
+                "model": self.tag,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0,
+                    "num_predict": n_predict,
+                    "stop": stop or [],
+                },
+            },
+            timeout=180.0,
+        )
+        if raw.get("error"):
+            raise RuntimeError(f"Ollama generate failed: {raw['error']}")
+        return str(raw.get("response") or "")
+
+    def loglikelihood(self, context: str, continuation: str) -> tuple[float, int]:
+        raise NotImplementedError("Ollama backend has no continuation logprobs")
+
+    def next_logprobs(self, prompt: str | list[int], *, top: int = 128) -> dict[str, float]:
+        raise NotImplementedError("Ollama backend has no next-token logprobs")
+
+
+def open_backend(gguf: Path):
+    """llama-server if it can load the GGUF; otherwise a matching Ollama tag."""
+    server: LlamaServer | None = None
+    try:
+        server = LlamaServer(gguf)
+        server.start()
+        return server
+    except Exception as exc:
+        if server is not None:
+            server.close()
+        tag = ollama_tag_for(gguf)
+        if tag is None:
+            raise
+        note = (
+            f"llama-server could not load {Path(gguf).name} "
+            f"({exc.__class__.__name__}); using Ollama tag {tag}"
+        )
+        backend = OllamaServer(tag)
+        backend.start()
+        backend._fallback_note = note  # noqa: SLF001
+        return backend

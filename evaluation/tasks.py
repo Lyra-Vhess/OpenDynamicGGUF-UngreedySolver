@@ -187,15 +187,32 @@ def iter_arc_challenge(root: Path = BENCH, *, limit: int | None = None) -> Itera
                 return
 
 
+def extract_choice_letter(text: str, labels: tuple[str, ...] | list[str]) -> str:
+    labs = [str(x).strip().upper() for x in labels]
+    blob = (text or "").strip().upper()
+    for lab in labs:
+        if blob.startswith(lab) and (len(blob) == len(lab) or not blob[len(lab)].isalnum()):
+            return lab
+    for lab in labs:
+        m = re.search(rf"\b{re.escape(lab)}\b", blob)
+        if m:
+            return lab
+    return ""
+
+
 def score_mcq(server: LlamaServer, prompt: str, gold: str, labels: tuple[str, ...] | list[str]) -> bool:
-    """lm-eval-style MCQ: loglikelihood of ' {letter}' after the original prompt."""
-    scored: dict[str, float] = {}
-    for lab in labels:
-        letter = str(lab).strip().upper()
-        ll, _n = server.loglikelihood(prompt, f" {letter}")
-        scored[letter] = ll
-    pred = max(scored, key=scored.get)
-    return pred == str(gold).strip().upper()
+    gold_l = str(gold).strip().upper()
+    if getattr(server, "supports_loglikelihood", True):
+        scored: dict[str, float] = {}
+        for lab in labels:
+            letter = str(lab).strip().upper()
+            ll, _n = server.loglikelihood(prompt, f" {letter}")
+            scored[letter] = ll
+        pred = max(scored, key=scored.get)
+        return pred == gold_l
+    # Hendrycks-style generate the answer letter (Ollama has no logprobs).
+    text = server.generate(prompt, n_predict=8, stop=["\n"])
+    return extract_choice_letter(text, labels) == gold_l
 
 
 def score_hellaswag(server: LlamaServer, context: str, endings: list[str], gold: int) -> tuple[bool, bool]:
@@ -241,6 +258,10 @@ def run_task(
             n_ok += int(extract_gsm8k_pred(text) == ex["gold"])
             n += 1
     elif name == "hellaswag":
+        if not getattr(server, "supports_loglikelihood", True):
+            raise RuntimeError(
+                "HellaSwag needs ending loglikelihood; this backend only supports greedy generate"
+            )
         acc = acc_n = 0
         for ex in iter_hellaswag(root, limit=limit):
             a, an = score_hellaswag(server, ex["context"], ex["endings"], ex["gold"])

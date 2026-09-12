@@ -11,6 +11,7 @@ from evaluation.server import letter_logprobs
 from evaluation.suites import resolve_limits, suite_limits
 from evaluation.tasks import (
     PROTOCOLS,
+    extract_choice_letter,
     extract_gsm8k_pred,
     gsm8k_gold,
     iter_arc_challenge,
@@ -102,6 +103,7 @@ def _write_arc(root: Path) -> None:
 
 
 class FakeServer:
+    supports_loglikelihood = True
     def next_logprobs(self, prompt, top=128):
         return {" A": -0.1, "A": -0.2, " B": -2.0, " C": -3.0, " D": -4.0, "id:1": -0.1}
 
@@ -199,6 +201,8 @@ def test_letter_logprobs_collapses_tokenizer_variants():
     assert scored["B"] == -1.0
     assert scored["C"] == -3.0
     assert scored["D"] == float("-inf")
+    assert extract_choice_letter("B.", ["A", "B", "C", "D"]) == "B"
+    assert extract_choice_letter("The answer is C\n", ["A", "B", "C", "D"]) == "C"
 
 
 def test_run_task_against_original_fixtures(tmp_path):
