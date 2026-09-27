@@ -57,6 +57,7 @@ py-modules = [
   "enumerate",
   "classify",
   "catalog",
+  "colgen",
   "weight_features",
   "corpus",
   "dp_mckp",

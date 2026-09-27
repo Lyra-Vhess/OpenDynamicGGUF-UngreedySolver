@@ -233,6 +233,119 @@ def greedy_optimize(
     }
 
 
+def _candidate_ladder(
+    *,
+    catalog: dict[str, Any],
+    sensitivity_rows: list[dict[str, Any]],
+    start_type: str = "Q6_K",
+    pins: dict[str, str] | None = None,
+    use_pins: bool = True,
+) -> tuple[dict[str, list[str]], dict[str, str]]:
+    """Candidate quant ladder per group, reusing greedy's pin logic (Spec 2.2).
+
+    Returns (candidates high->low precision, floors). Floors come from
+    DEFAULT_PINS plus the same pin_high-hint floor (Q5_K) greedy applies.
+    """
+    pins = dict(DEFAULT_PINS) if use_pins else {}
+    groups = catalog.get("groups") or {}
+    floors: dict[str, str] = {}
+    for gid, g in groups.items():
+        if not g.get("quantizable", True):
+            continue
+        floors[gid] = pins.get(str(g.get("role") or ""), "Q2_K").upper()
+    for r in sensitivity_rows:
+        if r.get("decision_hint") == "pin_high" and r.get("probe") == "Q4_K":
+            gid = r["group_id"]
+            if gid in floors:
+                floors[gid] = _min_quant(floors[gid], "Q5_K")
+    candidates: dict[str, list[str]] = {}
+    for gid in floors:
+        lo = _ladder_index(start_type.upper())
+        hi = _ladder_index(floors[gid])
+        if hi < lo:  # pin above start (e.g. embedding Q8): pin wins
+            candidates[gid] = [floors[gid]]
+        else:
+            candidates[gid] = LADDER[lo : hi + 1]
+    return candidates, floors
+
+
+def dp_mckp_optimize(
+    *,
+    catalog: dict[str, Any],
+    sensitivity_rows: list[dict[str, Any]],
+    budget_bytes: int,
+    start_type: str = "Q6_K",
+    pins: dict[str, str] | None = None,
+    use_pins: bool = True,
+    imatrix_groups: dict[str, Any] | None = None,
+    lipschitz_L: float | None = None,
+    certificate_mode: str = "bounded",
+    delta_bins: int = 16,
+    batch_size: int = 1,
+) -> dict[str, Any]:
+    """Optimize via column generation + DP MCKP (Spec 2.3/2.4).
+
+    Sizes come from the catalog (no probe needed); KLD comes from
+    sensitivity rows when present, else the same proxy estimator the
+    rows themselves use (proxy scaffolding until llama probes land).
+    """
+    from colgen import run_column_generation
+    from kld import proxy_tail_from_mean
+    from sensitivity import _proxy_delta_kld
+
+    groups_t = catalog.get("groups") or {}
+    tensors = catalog.get("tensors") or {}
+    candidates, floors = _candidate_ladder(
+        catalog=catalog, sensitivity_rows=sensitivity_rows,
+        start_type=start_type, pins=pins, use_pins=use_pins,
+    )
+    groups = sorted(candidates)
+    row_index = _build_row_index(sensitivity_rows)
+
+    def imatrix_imp(gid: str) -> float | None:
+        if imatrix_groups and gid in imatrix_groups:
+            return float(imatrix_groups[gid].get("importance_mean") or 0.0)
+        return None
+
+    def probe_fn(gid: str, q: str) -> dict[str, Any]:
+        row = row_index.get((gid, q.upper()))
+        if row is not None and row.get("kld_tail_1pct") is not None:
+            return {
+                "kld_mean": float(row.get("kld_mean", row.get("delta_kld") or 0.0)),
+                "kld_tail_1pct": float(row["kld_tail_1pct"]),
+                "n_tokens": row.get("n_tokens"),
+            }
+        g = groups_t.get(gid) or {}
+        mean = _proxy_delta_kld(g, tensors, q, imatrix_group_importance=imatrix_imp(gid))
+        return {"kld_mean": mean, "kld_tail_1pct": proxy_tail_from_mean(mean),
+                "n_tokens": None}
+
+    size_bytes = {
+        (gid, q): estimate_group_nbytes(_group_n_elements(groups_t[gid], tensors), q)
+        for gid in groups
+        for q in candidates[gid]
+    }
+    imatrix_scores = None
+    if imatrix_groups:
+        imatrix_scores = {
+            gid: float(imatrix_groups[gid].get("importance_mean") or 0.0)
+            for gid in groups
+            if gid in imatrix_groups
+        } or None
+
+    result = run_column_generation(
+        groups=groups, candidates=candidates, size_bytes=size_bytes,
+        probe_fn=probe_fn, budget_bytes=budget_bytes,
+        imatrix_scores=imatrix_scores, lipschitz_L=lipschitz_L,
+        delta_bins=delta_bins, mode=certificate_mode, batch_size=batch_size,
+        floor_of=floors,
+    )
+    result["start_type"] = start_type.upper()
+    result["floors"] = floors
+    result["meets_budget"] = result["total_bytes"] <= budget_bytes
+    return result
+
+
 def _yaml_escape(s: str) -> str:
     if any(c in s for c in ":#{}[]|&*!?>'%@`,"):
         return json.dumps(s)
