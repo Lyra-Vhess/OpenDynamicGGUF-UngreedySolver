@@ -8,7 +8,8 @@ import pytest
 
 from dp_mckp import BIN_BYTES, bytes_to_bins
 from optimizer import (
-    SIZE_ESTIMATE_MARGIN,
+    SIZE_SANITY_ABS,
+    SIZE_SANITY_REL,
     _estimate_total_bytes,
     dp_mckp_optimize,
     optimize_recipes,
@@ -213,15 +214,59 @@ def test_tail_cap_refuses_proxy_tails():
         )
 
 
-def test_size_margin_inflates_estimates():
+def test_size_margin_default_is_neutral():
+    """No margin constant: default 1.0 is a no-op; explicit margin scales."""
     catalog = tiny_catalog()
     groups, tensors = catalog["groups"], catalog["tensors"]
     assign = {g: "Q6_K" for g in groups}
-    base = _estimate_total_bytes(assign, groups, tensors, size_margin=1.0)
+    base = _estimate_total_bytes(assign, groups, tensors)
     assert _estimate_total_bytes(
-        assign, groups, tensors, size_margin=SIZE_ESTIMATE_MARGIN) == int(
-            base * SIZE_ESTIMATE_MARGIN)
-    assert SIZE_ESTIMATE_MARGIN == pytest.approx(1.09)
+        assign, groups, tensors, size_margin=1.0) == base
+    assert _estimate_total_bytes(
+        assign, groups, tensors, size_margin=2.0) == int(base * 2.0)
+
+
+def test_measured_sizes_preferred_and_audited():
+    """Row bytes_measured replaces the estimate; entries carry measured:true."""
+    catalog = tiny_catalog()
+    sens, idx = _measured_index(catalog)
+    n_elem = {g: sum(catalog["tensors"][n].get("n_elements") or 0
+                     for n in catalog["groups"][g]["tensor_names"])
+              for g in catalog["groups"]}
+    # Stamp exact measured bytes within sanity bounds of the estimate.
+    for r in sens["rows"]:
+        g, q = r["group_id"], r["probe"]
+        r["bytes_measured"] = estimate_group_nbytes(n_elem[g], q)
+    res = dp_mckp_optimize(
+        catalog=catalog, sensitivity_rows=sens["rows"], objective="mean",
+        auto_cap=False, budget_bytes=200 * BIN_BYTES,
+    )
+    assert all(e["measured"] for e in res["cost_matrix"]["entries"]
+               if e["probed"])
+
+
+def test_measured_size_sanity_trip_names_column():
+    """A wildly-off measured size aborts loudly naming (group, type)."""
+    catalog = tiny_catalog()
+    sens, idx = _measured_index(catalog)
+    gid = sorted(catalog["groups"])[0]
+    for r in sens["rows"]:
+        if r["group_id"] == gid and r["probe"] == "Q2_K":
+            r["bytes_measured"] = 10  # absurd vs ~MiB-scale estimate
+    with pytest.raises(ValueError, match=rf"\({gid}, Q2_K\)"):
+        dp_mckp_optimize(
+            catalog=catalog, sensitivity_rows=sens["rows"], objective="mean",
+            auto_cap=False, budget_bytes=200 * BIN_BYTES,
+        )
+
+
+def test_measured_size_within_bounds_passes():
+    """Sanity constants are sane: 15% rel, 256KiB abs floor."""
+    assert SIZE_SANITY_REL == pytest.approx(0.15)
+    assert SIZE_SANITY_ABS == 256 * 1024
+    assert BIN_BYTES == 256 * 1024
+    assert bytes_to_bins(BIN_BYTES) == 1
+    assert bytes_to_bins(BIN_BYTES + 1) == 2
 
 
 def test_auto_cap_two_pass_beats_nothing_and_respects_tstar():

@@ -51,11 +51,13 @@ DEFAULT_PINS: dict[str, str] = {
     "attn_v": "Q5_K",
 }
 
-#: Safety margin multiplied onto BYTES_PER_ELEM size estimates. Measured
-#: exports run ~8-9% over the raw estimate on the 270M test model (GGUF
-#: headers, alignment, quant-block overhead). Single-model calibration:
-#: re-calibrate per model family once multi-model data exists.
-SIZE_ESTIMATE_MARGIN = 1.09
+#: Sanity bound for measured trial-file sizes vs the BYTES_PER_ELEM
+#: estimate. A probed column trips it only when BOTH hold, so tiny groups
+#: (where fixed GGUF metadata overhead dominates) don't cry wolf while big
+#: absolute lies on large groups still abort. Trips are hard errors naming
+#: the column — corrupt trials must never become a quiet recipe.
+SIZE_SANITY_REL = 0.15
+SIZE_SANITY_ABS = 256 * 1024
 
 
 def _ladder_index(q: str) -> int:
@@ -89,7 +91,7 @@ def _estimate_total_bytes(
     assignments: dict[str, str],
     groups: dict[str, Any],
     tensors: dict[str, Any],
-    size_margin: float = SIZE_ESTIMATE_MARGIN,
+    size_margin: float = 1.0,
 ) -> int:
     total = 0
     assigned = set()
@@ -161,11 +163,12 @@ def greedy_optimize(
     start_type: str = "Q6_K",
     pins: dict[str, str] | None = None,
     use_pins: bool = True,
-    size_margin: float = SIZE_ESTIMATE_MARGIN,
+    size_margin: float = 1.0,
 ) -> dict[str, Any]:
     """
     Start high, greedily downgrade best efficiency until size ≤ budget.
-    Sizes carry SIZE_ESTIMATE_MARGIN so the result fits real exports.
+    Sizes are exact trial-file measurements where probed; `size_margin`
+    (default 1.0, no-op) scales estimates for never-probed columns only.
     """
     pins = dict(DEFAULT_PINS) if use_pins else {}
     groups = catalog.get("groups") or {}
@@ -302,11 +305,11 @@ def _dp_mckp_optimize_once(
     imatrix_groups: dict[str, Any] | None = None,
     lipschitz_L: float | None = None,
     certificate_mode: str = "bounded",
-    delta_bins: int = 16,
+    delta_bins: int = 64,
     batch_size: int = 1,
     objective: str = "tail",
     tail_cap: float | None = None,
-    size_margin: float = SIZE_ESTIMATE_MARGIN,
+    size_margin: float = 1.0,
 ) -> dict[str, Any]:
     """Optimize via column generation + DP MCKP (Spec 2.3/2.4).
 
@@ -322,7 +325,8 @@ def _dp_mckp_optimize_once(
     allocations (percentiles don't add); constraining each group's worst-1%
     while minimizing the additive mean is the sound shape. Needs measured
     tails everywhere it filters — same hard error as the tail objective.
-    ``size_margin`` scales all size estimates (see SIZE_ESTIMATE_MARGIN).
+    ``size_margin`` (default 1.0) scales estimates for never-probed
+    columns; probed columns use exact trial-file sizes.
     """
     from colgen import run_column_generation
     from sensitivity import _proxy_delta_kld
@@ -414,14 +418,36 @@ def _dp_mckp_optimize_once(
         mean = _proxy_delta_kld(g, tensors, q, imatrix_group_importance=imatrix_imp(gid))
         return {"kld_mean": mean, "kld_tail_1pct": None, "n_tokens": None}
 
-    size_bytes = {
-        (gid, q): int(
-            estimate_group_nbytes(_group_n_elements(groups_t[gid], tensors), q)
-            * size_margin
-        )
-        for gid in groups
-        for q in candidates[gid]
-    }
+    # Sizes: exact trial-file bytes where the column was measured
+    # (row "bytes_measured" from step-12 llama probes), BYTES_PER_ELEM
+    # estimate otherwise. Measured values are sanity-checked against the
+    # estimate — dual threshold (relative AND absolute) so tiny groups
+    # don't trip on fixed metadata overhead; trips abort loudly.
+    size_bytes: dict[tuple[str, str], int] = {}
+    size_measured: dict[tuple[str, str], bool] = {}
+    for gid in groups:
+        n_elem = _group_n_elements(groups_t[gid], tensors)
+        for q in candidates[gid]:
+            row = row_index.get((gid, q.upper()))
+            got = row.get("bytes_measured") if row else None
+            if got is not None:
+                est = estimate_group_nbytes(n_elem, q)
+                dev = abs(int(got) - est)
+                if dev > SIZE_SANITY_ABS and dev / max(est, 1) > SIZE_SANITY_REL:
+                    raise ValueError(
+                        f"Measured size for ({gid}, {q}) is {int(got)} bytes "
+                        f"vs {est} estimated "
+                        f"({dev / max(est, 1):.1%} off, threshold "
+                        f"{SIZE_SANITY_REL:.0%}/{SIZE_SANITY_ABS // 1024}KiB). "
+                        f"Trial file corrupt or mis-mapped — refusing to solve."
+                    )
+                size_bytes[(gid, q)] = int(got)
+                size_measured[(gid, q)] = True
+            else:
+                size_bytes[(gid, q)] = int(
+                    estimate_group_nbytes(n_elem, q) * size_margin
+                )
+                size_measured[(gid, q)] = False
     imatrix_scores = None
     if imatrix_groups:
         imatrix_scores = {
@@ -439,6 +465,8 @@ def _dp_mckp_optimize_once(
     )
     result["start_type"] = start_type.upper()
     result["floors"] = eff_floors
+    for e in result["cost_matrix"]["entries"]:
+        e["measured"] = bool(size_measured.get((e["group"], e["type"]), False))
     result["tail_cap"] = tail_cap
     result["auto_cap"] = False
     result["pass1_mean_kld"] = None
@@ -460,12 +488,12 @@ def dp_mckp_optimize(
     imatrix_groups: dict[str, Any] | None = None,
     lipschitz_L: float | None = None,
     certificate_mode: str = "bounded",
-    delta_bins: int = 16,
+    delta_bins: int = 64,
     batch_size: int = 1,
     objective: str = "tail",
     tail_cap: float | None = None,
     auto_cap: bool = True,
-    size_margin: float = SIZE_ESTIMATE_MARGIN,
+    size_margin: float = 1.0,
 ) -> dict[str, Any]:
     """Optimize via column generation + DP MCKP; see _dp_mckp_optimize_once.
 
@@ -637,7 +665,7 @@ def render_tensor_type_file(
 
 def default_budget_bytes(
     catalog: dict[str, Any], *, ratio: float = 0.72,
-    size_margin: float = SIZE_ESTIMATE_MARGIN,
+    size_margin: float = 1.0,
 ) -> int:
     """
     Budget as a fraction of all-Q6_K size, but never below the pinned floor
@@ -688,7 +716,7 @@ def _optimize_dp_mckp(
     imatrix_groups: dict[str, Any] | None,
     tail_cap: float | None = None,
     auto_cap: bool = True,
-    size_margin: float = SIZE_ESTIMATE_MARGIN,
+    size_margin: float = 1.0,
 ) -> OptimizeResult:
     """DP-MCKP path (Spec 2.3/2.4/2.6): colgen master + DP Pareto + certificate."""
     from dp_mckp import InfeasibleBudget, solve_mckp
@@ -1009,7 +1037,7 @@ def optimize_recipes(
     imatrix_groups: dict[str, Any] | None = None,
     tail_cap: float | None = None,
     auto_cap: bool = True,
-    size_margin: float = SIZE_ESTIMATE_MARGIN,
+    size_margin: float = 1.0,
 ) -> OptimizeResult:
     log: list[str] = []
     notes: list[str] = []

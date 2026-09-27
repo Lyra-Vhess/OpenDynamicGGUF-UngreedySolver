@@ -45,13 +45,19 @@ def measure_column(
     imatrix: str | Path | None = None,
     perplexity_args: list[str] | None = None,
     keep_trial: bool = False,
+    group_tensors: list[str] | None = None,
 ) -> dict[str, Any]:
     """Quantize one trial and measure its KL vs the reference base.
 
     ``group_regex=None`` measures the all-baseline config (the run's anchor
     for deltas). Returns absolute (non-delta) metrics: ``kld_mean``,
     ``kld_tail_1pct`` (P99), plus ``same_top_p``/``perplexity`` when the
-    log has them. Raises loudly on any tool failure or missing KL line.
+    log has them. When ``group_tensors`` is given, the trial GGUF's own
+    metadata is read (before any deletion) and the group's actual payload
+    bytes summed as ``group_bytes_measured`` — exact block arithmetic from
+    the file, not an estimate. A trial tensor missing from the file raises
+    loudly (mapping corruption must never become a quiet size). Raises
+    loudly on any tool failure or missing KL line.
     """
     from llama_bins import find_llama_binary
     from logits import find_llama_perplexity as find_ppl
@@ -98,6 +104,19 @@ def measure_column(
     (work / f"trial-{tag}.perplexity.log").write_text(plog, encoding="utf-8")
 
     measured = parse_llama_perplexity_kl(plog)  # hard error if lines missing
+    if group_tensors:
+        from gguf_tensors import gguf_tensor_map
+
+        tmap = gguf_tensor_map(trial)["tensors"]
+        missing = [n for n in group_tensors if n not in tmap]
+        if missing:
+            raise RuntimeError(
+                f"Trial {tag}: {len(missing)} group tensor(s) missing from "
+                f"trial GGUF metadata ({missing[0]!r}...). Mapping corrupt?"
+            )
+        measured["group_bytes_measured"] = int(
+            sum(int(tmap[n]["nbytes"]) for n in group_tensors)
+        )
     if not keep_trial:
         trial.unlink(missing_ok=True)
     measured["trial_tag"] = tag

@@ -18,7 +18,7 @@ bounded gain per extra byte exceeds the shadow price. Operationally identical.
 Shadow price (Spec 2.4, sign fixed — V is non-increasing in b, so the
 reduction per byte is (V[B-D] - V[B]) / D_bytes >= 0):
   lambda = (V[|G|][B_bins] ... [B_bins-D]) / (D_bins * bin_bytes),
-  D = delta_bins (default 16 bins = 16 MiB) to smooth discretization noise.
+  D = delta_bins (default 64 bins = 16 MiB) to smooth discretization noise.
   If no feasible bin exists below B, lambda falls back to 0.0 (the safe
   direction: probe everything with positive bound, never wrongly exclude).
 
@@ -162,7 +162,7 @@ def shadow_price(
     n_groups: int,
     budget_bins: int,
     *,
-    delta_bins: int = 16,
+    delta_bins: int = 64,
     bin_bytes: int = BIN_BYTES,
 ) -> float:
     """Marginal tail-KLD reduction per byte near the optimum (finite diff)."""
@@ -189,7 +189,7 @@ def run_column_generation(
     imatrix_scores: dict[str, float] | None = None,
     lipschitz_L: float | None = None,
     bin_bytes: int = BIN_BYTES,
-    delta_bins: int = 16,
+    delta_bins: int = 64,
     mode: str = "bounded",
     floor_of: dict[str, str] | None = None,
     max_rounds: int | None = None,

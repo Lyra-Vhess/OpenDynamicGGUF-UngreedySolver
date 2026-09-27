@@ -391,6 +391,7 @@ def probe_groups_llama(
                 group_regex=tensor_type_regex(g),
                 probe_type=q,
                 tag=f"{gid}-{q}".replace("@", "_").replace("/", "_"),
+                group_tensors=list(g.get("tensor_names") or []),
                 **log_ctx,
             ): (gid, q)
             for gid, g, q in targets
@@ -432,6 +433,9 @@ def probe_groups_llama(
                 "kld_p999": m.get("kld_p999"),
                 "same_top_p": m.get("same_top_p"),
                 "perplexity": m.get("perplexity"),
+                # Actual group payload bytes from the trial file's own
+                # metadata (exact); None when the probe predates measurement.
+                "bytes_measured": m.get("group_bytes_measured"),
                 "top_token_agree": max(0.0, 1.0 - 2.5 * delta_kld),
                 "efficiency": score,
                 "decision_hint": hint,

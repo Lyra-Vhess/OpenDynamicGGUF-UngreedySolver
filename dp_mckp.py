@@ -6,7 +6,7 @@ sum_g bytes[g][q] <= B (absolute sizes, not savings).
 
 Discretization / rounding convention (also recorded in the recipe):
   Budgets and sizes are binned with ceil(): bin(x) = ceil(x / BIN_BYTES),
-  BIN_BYTES = 1 MiB by default. Ceil is conservative: a binned-feasible
+  BIN_BYTES = 256 KiB. Ceil is conservative: a binned-feasible
   allocation always fits the true byte budget, because
   sum(ceil(s_i)) >= ceil(sum(s_i)).
 
@@ -26,8 +26,9 @@ from typing import Any
 
 import numpy as np
 
-#: Discretization bin: 1 MiB per Spec 2.3.
-BIN_BYTES = 1024 * 1024
+#: Discretization bin: 256 KiB (finer than Spec 2.3's 1 MiB; per-group
+#: ceil waste is ~1 bin per group). DP table stays a few MB.
+BIN_BYTES = 256 * 1024
 
 
 class InfeasibleBudget(Exception):
