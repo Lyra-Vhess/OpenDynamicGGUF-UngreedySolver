@@ -189,3 +189,78 @@ def test_default_grid_covers_pinned_ladders():
 
     for gid, g in catalog["groups"].items():
         assert group_probe_grid(g, grid), gid
+
+
+def _two_group_catalog():
+    return {
+        "tensors": {
+            "blk.0.attn_q.weight": {"n_elements": 1024},
+            "token_embd.weight": {"n_elements": 512},
+        },
+        "groups": {
+            "attn_q@early": {
+                "role": "attn_q", "depth": "early", "quantizable": True,
+                "n_tensors": 1, "tensor_names": ["blk.0.attn_q.weight"],
+            },
+            "embedding@global": {
+                "role": "embedding", "depth": "global", "quantizable": True,
+                "n_tensors": 1, "tensor_names": ["token_embd.weight"],
+            },
+        },
+    }
+
+
+def test_fixed_groups_skipped_proxy():
+    from sensitivity import probe_groups_proxy
+
+    catalog = _two_group_catalog()
+    rows = probe_groups_proxy(
+        catalog, probe_types=["Q4_K"], baseline_type="Q6_K",
+        fixed_groups=frozenset({"embedding@global"}),
+    )
+    assert {r["group_id"] for r in rows} == {"attn_q@early"}
+    with pytest.raises(ValueError, match="unknown groups"):
+        probe_groups_proxy(
+            catalog, probe_types=["Q4_K"], fixed_groups=frozenset({"nope"}),
+        )
+
+
+def test_fixed_groups_skipped_llama(tmp_path, monkeypatch):
+    import llama_probe
+    from sensitivity import probe_groups_llama
+
+    def fake_measure_column(**kw):
+        if kw.get("group_regex") is None:
+            return {"kld_mean": 0.01, "kld_tail_1pct": 0.10}
+        return {
+            "kld_mean": 0.02, "kld_tail_1pct": 0.20,
+            "group_bytes_measured": 12345,
+        }
+
+    monkeypatch.setattr(llama_probe, "measure_column", fake_measure_column)
+    for name in ("model.gguf", "search.txt", "kl.bin"):
+        (tmp_path / name).write_bytes(b"x")
+    rows, base = probe_groups_llama(
+        _two_group_catalog(),
+        model_gguf=tmp_path / "model.gguf",
+        search_txt=tmp_path / "search.txt",
+        kl_base_bin=tmp_path / "kl.bin",
+        probe_types=["Q4_K"], baseline_type="Q6_K",
+        work_dir=tmp_path / "trials", jobs=1,
+        fixed_groups=frozenset({"embedding@global"}),
+    )
+    assert {r["group_id"] for r in rows} == {"attn_q@early"}
+    assert base["fixed_skipped"] == ["embedding@global"]
+
+
+def test_fixed_groups_logged_proxy_table(tmp_path):
+    from sensitivity import build_sensitivity_table
+
+    result, rows = build_sensitivity_table(
+        model_ref="t", out_dir=tmp_path / "s",
+        catalog=_two_group_catalog(), mode="proxy",
+        probe_types=["Q4_K"],
+        fixed_groups=frozenset({"embedding@global"}),
+    )
+    assert {r["group_id"] for r in rows} == {"attn_q@early"}
+    assert any("4c" in line for line in result.steps_log)

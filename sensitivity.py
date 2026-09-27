@@ -242,23 +242,51 @@ def group_probe_grid(
     return [q for q in grid if q.upper() in ladder]
 
 
+def _check_fixed_groups(
+    catalog: dict[str, Any], fixed_groups: frozenset[str] | None
+) -> frozenset[str]:
+    """Validate probe-time --fixed-groups (same semantics as optimize).
+
+    Fixed groups are kept at source precision and accounted in the budget
+    at optimize time — probing them is meaningless (llama-quantize may
+    not even touch their tensors, tripping the probe-effect assert).
+    Unknown names are rejected loudly (likely a typo).
+    """
+    fixed = frozenset(fixed_groups or ())
+    if not fixed:
+        return fixed
+    known = set((catalog.get("groups") or {}))
+    unknown = sorted(fixed - known)
+    if unknown:
+        raise ValueError(
+            f"--fixed-groups names unknown groups: {unknown}. "
+            f"Known: {sorted(known)}"
+        )
+    return fixed
+
+
 def probe_groups_proxy(
     catalog: dict[str, Any],
     *,
     probe_types: list[str] | None = None,
     baseline_type: str = BASELINE_TYPE,
     imatrix_groups: dict[str, Any] | None = None,
+    fixed_groups: frozenset[str] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Return sensitivity rows for all quantizable groups × probe types,
     with the grid intersected per group (see group_probe_grid).
+    Fixed groups are skipped (accounted at optimize time instead).
     """
+    fixed = _check_fixed_groups(catalog, fixed_groups)
     probe_types = probe_types or list(DEFAULT_PROBE_TYPES)
     tensors = catalog.get("tensors") or {}
     rows: list[dict[str, Any]] = []
     grid_skipped = 0
 
     for gid, g, n_elem in _qualifying_groups(catalog):
+        if gid in fixed:
+            continue
         kept = group_probe_grid(g, probe_types, start_type=baseline_type)
         grid_skipped += len(probe_types) - len(kept)
         if not kept:
@@ -340,10 +368,12 @@ def probe_groups_llama(
     llama_perplexity: str | Path | None = None,
     imatrix: str | Path | None = None,
     perplexity_args: list[str] | None = None,
+    fixed_groups: frozenset[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Measure (quantizable group, probe type) with real tools, where each
     group's types are the global grid intersected with its own candidate
     ladder (see group_probe_grid) — above-ladder probes are skipped, not run.
+    Fixed groups are skipped (accounted at optimize time instead).
 
     Trial GGUF: everything at ``baseline_type`` except the group's tensors
     at the probe type. KL is measured vs the step-11 search-split base.
@@ -354,6 +384,7 @@ def probe_groups_llama(
 
     from llama_probe import measure_column
 
+    fixed = _check_fixed_groups(catalog, fixed_groups)
     probe_types = probe_types or list(DEFAULT_PROBE_TYPES)
     tensors = catalog.get("tensors") or {}
     work = Path(work_dir)
@@ -377,6 +408,8 @@ def probe_groups_llama(
     targets: list[tuple[str, dict[str, Any], str]] = []
     grid_skipped = 0
     for gid, g, n_elem in _qualifying_groups(catalog):
+        if gid in fixed:
+            continue
         kept = group_probe_grid(g, probe_types, start_type=baseline_type)
         grid_skipped += len(probe_types) - len(kept)
         if not kept:
@@ -457,6 +490,8 @@ def probe_groups_llama(
         # Columns skipped by per-group grids (above-ladder types the DP
         # could never choose) — GPU probes not spent.
         "grid_skipped": grid_skipped,
+        # Fixed groups skipped at probe time (accounted at optimize time).
+        "fixed_skipped": sorted(fixed),
     }
     return rows, baseline_absolute
 
@@ -481,6 +516,7 @@ def build_sensitivity_table(
     llama_perplexity: str | Path | None = None,
     imatrix_gguf: str | Path | None = None,
     perplexity_args: list[str] | None = None,
+    fixed_groups: frozenset[str] | None = None,
 ) -> tuple[SensitivityResult, list[dict[str, Any]]]:
     """
     Write sensitivity.json (+ summary). Returns (result, rows).
@@ -521,11 +557,13 @@ def build_sensitivity_table(
             llama_perplexity=llama_perplexity,
             imatrix=imatrix_gguf,
             perplexity_args=perplexity_args,
+            fixed_groups=fixed_groups,
         )
         method = "llama_probe"
         log.append(
             f"4. Measured groups={len({r['group_id'] for r in rows})} "
             f"rows={len(rows)} grid_skipped={baseline_absolute['grid_skipped']} "
+            f"fixed_skipped={baseline_absolute['fixed_skipped']} "
             f"baseline_mean={baseline_absolute['kld_mean']:.4f} "
             f"baseline_p99={baseline_absolute['kld_tail_1pct']:.4f}"
         )
@@ -562,11 +600,16 @@ def build_sensitivity_table(
         probe_types=probe_types,
         baseline_type=baseline_type,
         imatrix_groups=imatrix_groups,
+        fixed_groups=fixed_groups,
     )
-    grid_skipped = (
-        len(_qualifying_groups(catalog)) * len(probe_types) - len(rows)
+    n_probed_groups = len(
+        [1 for _g in _qualifying_groups(catalog)
+         if _g[0] not in _check_fixed_groups(catalog, fixed_groups)]
     )
+    grid_skipped = n_probed_groups * len(probe_types) - len(rows)
     log.append(f"4b. Per-group grids skipped {grid_skipped} above-ladder probes")
+    if fixed_groups:
+        log.append(f"4c. Fixed groups skipped at probe time: {sorted(fixed_groups)}")
     return _finish_table(
         model_ref=model_ref, out_dir=out_dir, catalog=catalog,
         gguf_sha256=gguf_sha256, search_path=search_path,

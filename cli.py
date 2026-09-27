@@ -347,6 +347,14 @@ def main(argv: list[str] | None = None) -> int:
         metavar="TYPES",
         help="Comma-separated probe grid override (default: from --quant profile)",
     )
+    p_sens.add_argument(
+        "--fixed-groups",
+        default=None,
+        metavar="GIDS",
+        help="Comma-separated group ids kept at source precision (e.g. tensors "
+        "llama-quantize cannot quantize). Skipped at probe time; accounted "
+        "toward every budget at optimize time (pass the same flag there).",
+    )
     p_sens.add_argument("--no-explain", action="store_true")
 
     # --- optimize (step 13) ---
@@ -2589,6 +2597,18 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     input_data["perplexity_args"] = sens_perplexity_args
+    sens_fixed_groups = frozenset(
+        g.strip() for g in str(getattr(args, "fixed_groups", None) or "").split(",")
+        if g.strip()
+    )
+    input_data["fixed_groups"] = sorted(sens_fixed_groups)
+    # Trial quants benefit from the run's imatrix.gguf (importance-weighted
+    # K-quants); without it K-means fall back to dumb rounding and every
+    # measured column is pessimistic. Mirrors the cmd_reband pattern.
+    imatrix_gguf = store.step_path(meta.run_id, "imatrix") / "imatrix.gguf"
+    input_data["imatrix_gguf"] = (
+        str(imatrix_gguf) if imatrix_gguf.is_file() else None
+    )
 
     try:
         step_dir = store.begin_step(
@@ -2616,6 +2636,8 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
                 llama_quantize=args.llama_quantize,
                 llama_perplexity=args.llama_perplexity,
                 perplexity_args=sens_perplexity_args,
+                imatrix_gguf=input_data["imatrix_gguf"],
+                fixed_groups=sens_fixed_groups,
             )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "sensitivity", str(exc))
