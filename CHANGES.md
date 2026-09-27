@@ -32,13 +32,15 @@ grid and optimized mean KLD only.
   probed cost matrix, 1 MiB ceil bins (conservative: binned-feasible always
   fits the true budget). Full Pareto frontier falls out of one solve.
   Infeasible budgets fail loudly with minimum size + largest group.
-- **P99 guardrail** (`optimizer.py`, `--tail-cap TAU`): measured-rematch
+- **P99 guardrail, automatic** (`optimizer.py`, no flag): measured-rematch
   finding — a *summed* P99 is not a whole-model percentile and misranks
-  allocations, while mean KLD is approximately additive. So the recommended
-  shape is mean objective plus a per-group worst-1% cap: cap-violating
-  columns are deleted pre-DP (needs measured tails; hard-errors on proxy
-  rows; loud error if a group is emptied). DP, Pareto, and certificate run
-  unchanged on the restricted problem.
+  allocations, while mean KLD is approximately additive. So under the mean
+  objective the optimizer runs two passes: pass 1 solves mean-only, takes
+  the worst per-group P99 of that allocation as T*, and pass 2 re-solves
+  mean subject to every group staying at or below T* (provably feasible;
+  needs measured tails, hard-errors on proxy rows). T*, both pass means,
+  and the removal count land in recipe/manifest. DP, Pareto, and
+  certificate run unchanged on the restricted problem.
 - **Size-estimate margin** (`optimizer.py`, hard-coded `SIZE_ESTIMATE_MARGIN`
   = 1.09): real exports run ~8–9% over estimates (single 270M-model
   calibration; replace with an empirically derived value or a better
@@ -50,7 +52,7 @@ grid and optimized mean KLD only.
   batches (re-solve/re-price between probes) so early rounds don't degenerate
   into a full sweep.
 - **CLI** (`cli.py`): `--optimizer {greedy,dp_mckp}` (default `dp_mckp`),
-  `--kld-objective {tail_1pct,mean}`, `--tail-cap`,
+  `--kld-objective {tail_1pct,mean}`,
   `--certificate {bounded,exhaustive}`,
   `--lipschitz`, `--jobs`, `--pareto-ratios`, `--probe-types`.
   All existing flags preserved.
@@ -66,9 +68,8 @@ on a real sweep per the spec. Default is now `dp_mckp`.
 
 ## Test summary
 
-`python3 -m pytest tests/ -q` — 84 passed (4 new: guardrail optimality vs
-brute force, cap-too-tight error, cap-vs-proxy hard error, margin
-inflation). No new dependencies (`numpy`
+`python3 -m pytest tests/ -q` — 86 passed (2 new: auto-cap two-pass vs
+brute force, auto-cap proxy refusal). No new dependencies (`numpy`
 only; the log parser is stdlib).
 
 ## Deviations from Spec.md

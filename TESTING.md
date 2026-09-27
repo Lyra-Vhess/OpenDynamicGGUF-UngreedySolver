@@ -149,10 +149,11 @@ python3 cli.py optimize --budget-ratio 0.72 --optimizer dp_mckp --force
 python3 cli.py optimize --budget-ratio 0.72 --optimizer greedy --force
 ```
 
-Recommended rematch (mean objective with P99 guardrail — see below):
+Recommended rematch (mean objective with automatic P99 guardrail — no
+flag; the optimizer derives the cap from its own first pass):
 
 ```
-python3 cli.py optimize --budget-mb 270 --kld-objective mean --tail-cap 0.76
+python3 cli.py optimize --budget-mb 270 --kld-objective mean
 python3 cli.py optimize --budget-mb 270 --optimizer greedy
 ```
 
@@ -165,9 +166,10 @@ Compare `totals.kld_mean` / `totals.kld_tail` (DP) vs
 files. DP is guaranteed optimal over the probed cost matrix, but note: the
 *tail* objective minimizes a sum of per-group P99s, which is not a
 whole-model percentile and can fairly lose to greedy on measured mean, P99,
-and same-top. The mean + `--tail-cap` shape is the recommended comparison.
-Pick the cap from the measured P99 column of the sensitivity table (median
-to 75th percentile is a sane starting range).
+and same-top. The mean objective plus the automatic guardrail (pass 1 solves
+mean-only, pass 2 re-solves mean with every group's P99 capped at the worst
+P99 of the pass-1 allocation) is the recommended comparison — there is no
+cap to pick by hand.
 
 ## 6. Troubleshooting
 

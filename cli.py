@@ -367,14 +367,6 @@ def main(argv: list[str] | None = None) -> int:
         metavar="RATIOS",
         help="Comma-separated budget ratios (default: 0.55,0.65,0.72,0.80,0.90,1.0)",
     )
-    p_opt.add_argument(
-        "--tail-cap",
-        type=float,
-        default=None,
-        metavar="KLD",
-        help="P99 guardrail: drop (group, type) candidates whose measured tail "
-        "exceeds KLD, under either objective (default: no guardrail)",
-    )
     p_opt.add_argument("--no-explain", action="store_true")
 
     # --- export (step 14) ---
@@ -2463,7 +2455,6 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         "lipschitz": getattr(args, "lipschitz", None),
         "jobs": getattr(args, "jobs", 1),
         "pareto_ratios": getattr(args, "pareto_ratios", None),
-        "tail_cap": getattr(args, "tail_cap", None),
     }
 
     pareto_ratios = None
@@ -2510,7 +2501,6 @@ def cmd_optimize(args: argparse.Namespace) -> int:
                 jobs=int(getattr(args, "jobs", 1) or 1),
                 pareto_ratios=pareto_ratios,
                 imatrix_groups=imatrix_groups,
-                tail_cap=getattr(args, "tail_cap", None),
             )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "optimize", str(exc))
@@ -2533,6 +2523,7 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         "optimizer": result.optimizer,
         "kld_objective": result.kld_objective,
         "tail_cap": result.tail_cap,
+        "auto_cap": result.auto_cap,
         "total_tail_kld": result.total_tail_kld,
         "total_mean_kld": result.total_mean_kld,
         "certificate": result.certificate,

@@ -33,6 +33,10 @@ class OptimizeResult:
     certificate: dict[str, Any] | None = None
     cost_matrix: dict[str, Any] | None = None
     tail_cap: float | None = None
+    auto_cap: bool = False
+    pass1_mean_kld: float | None = None
+    pass1_tail_kld: float | None = None
+    cap_removed_columns: int = 0
 
     def summary_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -287,7 +291,7 @@ def _candidate_ladder(
     return candidates, floors
 
 
-def dp_mckp_optimize(
+def _dp_mckp_optimize_once(
     *,
     catalog: dict[str, Any],
     sensitivity_rows: list[dict[str, Any]],
@@ -330,6 +334,12 @@ def dp_mckp_optimize(
         start_type=start_type, pins=pins, use_pins=use_pins,
     )
     groups = sorted(candidates)
+    if not groups:
+        raise ValueError(
+            "dp_mckp_optimize got an empty candidate set — the catalog has "
+            "no quantizable groups (check you passed the real catalog, e.g. "
+            "tensor_catalog.json, not a step summary)."
+        )
     row_index = _build_row_index(sensitivity_rows)
 
     cap_removed = 0
@@ -430,10 +440,71 @@ def dp_mckp_optimize(
     result["start_type"] = start_type.upper()
     result["floors"] = eff_floors
     result["tail_cap"] = tail_cap
+    result["auto_cap"] = False
+    result["pass1_mean_kld"] = None
+    result["pass1_tail_kld"] = None
     result["cap_removed_columns"] = cap_removed
     result["size_margin"] = size_margin
     result["meets_budget"] = result["total_bytes"] <= budget_bytes
     return result
+
+
+def dp_mckp_optimize(
+    *,
+    catalog: dict[str, Any],
+    sensitivity_rows: list[dict[str, Any]],
+    budget_bytes: int,
+    start_type: str = "Q6_K",
+    pins: dict[str, str] | None = None,
+    use_pins: bool = True,
+    imatrix_groups: dict[str, Any] | None = None,
+    lipschitz_L: float | None = None,
+    certificate_mode: str = "bounded",
+    delta_bins: int = 16,
+    batch_size: int = 1,
+    objective: str = "tail",
+    tail_cap: float | None = None,
+    auto_cap: bool = True,
+    size_margin: float = SIZE_ESTIMATE_MARGIN,
+) -> dict[str, Any]:
+    """Optimize via column generation + DP MCKP; see _dp_mckp_optimize_once.
+
+    Under the mean objective with ``tail_cap`` unset and ``auto_cap`` on
+    (the default), a two-pass guardrail runs automatically: pass 1 solves
+    mean-only, T* is the worst per-group measured P99 inside the pass-1
+    allocation, and pass 2 re-solves the mean subject to every group
+    P99 <= T*. Pass 2 is provably feasible (the pass-1 allocation itself
+    satisfies the cap). An explicit ``tail_cap`` overrides (manual single
+    pass); the tail objective always runs a single pass. Auto-cap needs
+    measured tails — proxy tables raise loudly.
+    """
+    kwargs: dict[str, Any] = dict(
+        catalog=catalog, sensitivity_rows=sensitivity_rows,
+        budget_bytes=budget_bytes, start_type=start_type, pins=pins,
+        use_pins=use_pins, imatrix_groups=imatrix_groups,
+        lipschitz_L=lipschitz_L, certificate_mode=certificate_mode,
+        delta_bins=delta_bins, batch_size=batch_size, objective=objective,
+        size_margin=size_margin,
+    )
+    if tail_cap is not None or objective != "mean" or not auto_cap:
+        return _dp_mckp_optimize_once(tail_cap=tail_cap, **kwargs)
+    first = _dp_mckp_optimize_once(tail_cap=None, **kwargs)
+    entries = {(e["group"], e["type"]): e for e in first["cost_matrix"]["entries"]}
+    worst = 0.0
+    for gid, q in first["allocation"].items():
+        t = entries[(gid, q)].get("kld_tail")
+        if t is None:
+            raise ValueError(
+                "auto-cap needs a measured kld_tail_1pct for every group in "
+                f"the pass-1 allocation, but ({gid}, {q}) has none. Run "
+                "step 12 with --mode llama so every column is measured."
+            )
+        worst = max(worst, float(t))
+    second = _dp_mckp_optimize_once(tail_cap=worst, **kwargs)
+    second["auto_cap"] = True
+    second["pass1_mean_kld"] = first["total_mean_kld"]
+    second["pass1_tail_kld"] = first["total_tail_kld"]
+    return second
 
 
 def _yaml_escape(s: str) -> str:
@@ -616,6 +687,7 @@ def _optimize_dp_mckp(
     pareto_ratios: list[float] | None,
     imatrix_groups: dict[str, Any] | None,
     tail_cap: float | None = None,
+    auto_cap: bool = True,
     size_margin: float = SIZE_ESTIMATE_MARGIN,
 ) -> OptimizeResult:
     """DP-MCKP path (Spec 2.3/2.4/2.6): colgen master + DP Pareto + certificate."""
@@ -640,8 +712,8 @@ def _optimize_dp_mckp(
     log.append(
         f"3. DP-MCKP column generation from Q6_K with role pins "
         f"(objective={kld_objective}, certificate={certificate_mode}, "
-        f"lipschitz={'auto' if lipschitz_L is None else lipschitz_L}, jobs={jobs}, "
-        f"tail_cap={tail_cap}, size_margin={size_margin})"
+         f"lipschitz={'auto' if lipschitz_L is None else lipschitz_L}, jobs={jobs}, "
+         f"tail_cap={tail_cap}, auto_cap={auto_cap}, size_margin={size_margin})"
     )
     notes.append(
         f"jobs={jobs}: process-level probe parallelism (each probe is a "
@@ -660,6 +732,7 @@ def _optimize_dp_mckp(
         certificate_mode=certificate_mode,
         objective=obj,
         tail_cap=tail_cap,
+        auto_cap=auto_cap,
         size_margin=size_margin,
     )
     alloc: dict[str, str] = dp["allocation"]
@@ -786,14 +859,30 @@ def _optimize_dp_mckp(
         "optimizer": "dp_mckp",
         "kld_metric": kld_metric,
         "guardrail": {
-            "tail_cap": tail_cap,
+            "mode": (
+                "auto"
+                if dp.get("auto_cap")
+                else ("manual" if dp.get("tail_cap") is not None else "none")
+            ),
+            "tail_cap": dp.get("tail_cap"),
             "removed_columns": dp.get("cap_removed_columns", 0),
+            "pass1_mean_kld": dp.get("pass1_mean_kld"),
+            "pass1_tail_kld": dp.get("pass1_tail_kld"),
             "note": (
-                "Per-group P99 ceiling: candidates violating the cap are "
-                "deleted pre-DP under either objective; the certificate "
-                "covers the restricted problem (Pareto points inherit it)."
-                if tail_cap is not None
-                else "No P99 guardrail (tail_cap null)."
+                "Two-pass auto-cap: pass 1 minimizes the additive mean, T* "
+                "is the worst per-group measured P99 inside that allocation, "
+                "pass 2 re-minimizes the mean subject to every group "
+                "P99 <= T*. Percentiles don't add, so the summed P99 is "
+                "reported, never optimized; the certificate covers the "
+                "restricted problem (Pareto points inherit it)."
+                if dp.get("auto_cap")
+                else (
+                    "Per-group P99 ceiling: candidates violating the cap are "
+                    "deleted pre-DP under either objective; the certificate "
+                    "covers the restricted problem (Pareto points inherit it)."
+                    if dp.get("tail_cap") is not None
+                    else "No P99 guardrail."
+                )
             ),
         },
         "size_margin": size_margin,
@@ -852,7 +941,10 @@ def _optimize_dp_mckp(
                     "meets_budget": dp["total_bytes"] <= budget_bytes,
                     "optimizer": "dp_mckp",
                     "kld_objective": kld_objective,
-                    "tail_cap": tail_cap,
+                    "tail_cap": dp.get("tail_cap"),
+                    "auto_cap": dp.get("auto_cap", False),
+                    "pass1_mean_kld": dp.get("pass1_mean_kld"),
+                    "pass1_tail_kld": dp.get("pass1_tail_kld"),
                     "size_margin": size_margin,
                     "certificate": cert,
                     "rounds": dp["rounds"],
@@ -887,7 +979,11 @@ def _optimize_dp_mckp(
         total_mean_kld=total_mean,
         certificate=cert,
         cost_matrix=cost_matrix,
-        tail_cap=tail_cap,
+        tail_cap=dp.get("tail_cap"),
+        auto_cap=dp.get("auto_cap", False),
+        pass1_mean_kld=dp.get("pass1_mean_kld"),
+        pass1_tail_kld=dp.get("pass1_tail_kld"),
+        cap_removed_columns=int(dp.get("cap_removed_columns", 0)),
     )
 
 
@@ -912,6 +1008,7 @@ def optimize_recipes(
     pareto_ratios: list[float] | None = None,
     imatrix_groups: dict[str, Any] | None = None,
     tail_cap: float | None = None,
+    auto_cap: bool = True,
     size_margin: float = SIZE_ESTIMATE_MARGIN,
 ) -> OptimizeResult:
     log: list[str] = []
@@ -958,6 +1055,7 @@ def optimize_recipes(
             pareto_ratios=pareto_ratios,
             imatrix_groups=imatrix_groups,
             tail_cap=tail_cap,
+            auto_cap=auto_cap,
             size_margin=size_margin,
         )
     if optimizer != "greedy":

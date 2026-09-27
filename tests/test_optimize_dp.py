@@ -122,7 +122,7 @@ def test_dp_options_plumbed(tmp_path):
         model_ref="test", out_dir=tmp_path / "ex", catalog=catalog,
         sensitivity=tiny_sensitivity(catalog), budget_ratio=0.8,
         certificate_mode="exhaustive", kld_objective="mean",
-        pareto_ratios=[0.7, 1.0], jobs=2,
+        pareto_ratios=[0.7, 1.0], jobs=2, auto_cap=False,
     )
     assert res.kld_objective == "mean"
     assert res.certificate["mode"] == "exhaustive"
@@ -221,3 +221,58 @@ def test_size_margin_inflates_estimates():
         assign, groups, tensors, size_margin=SIZE_ESTIMATE_MARGIN) == int(
             base * SIZE_ESTIMATE_MARGIN)
     assert SIZE_ESTIMATE_MARGIN == pytest.approx(1.09)
+
+
+def test_auto_cap_two_pass_beats_nothing_and_respects_tstar():
+    """Auto-cap (default under mean): pass 1 mean-only, T* = worst P99 in
+    that allocation, pass 2 re-solves mean subject to P99 <= T* and equals
+    brute force over the T*-kept candidates."""
+    catalog = tiny_catalog()
+    sens, idx = _measured_index(catalog)
+    groups = sorted(catalog["groups"])
+    ladder = ["Q6_K", "Q5_K", "Q4_K", "Q3_K", "Q2_K"]
+    n_elem = {g: sum(catalog["tensors"][n].get("n_elements") or 0
+                     for n in catalog["groups"][g]["tensor_names"])
+              for g in groups}
+    size_b = {(g, q): estimate_group_nbytes(n_elem[g], q)
+              for g in groups for q in ladder}
+    mean_c = {(g, q): float(idx[(g, q)]["kld_mean"])
+              for g in groups for q in ladder}
+    tail_c = {(g, q): float(idx[(g, q)]["kld_tail_1pct"])
+              for g in groups for q in ladder}
+    # Generous budget: pass 1 lands on all-Q6 (min mean everywhere).
+    budget_bins = sum(bytes_to_bins(size_b[(g, "Q6_K")]) for g in groups)
+    res = dp_mckp_optimize(
+        catalog=catalog, sensitivity_rows=sens["rows"], objective="mean",
+        size_margin=1.0, budget_bytes=budget_bins * BIN_BYTES,
+    )
+    assert res["auto_cap"] is True
+    assert res["allocation"] == {g: "Q6_K" for g in groups}
+    tstar = max(tail_c[(g, "Q6_K")] for g in groups)
+    assert res["tail_cap"] == pytest.approx(tstar)
+    assert res["pass1_mean_kld"] == pytest.approx(res["total_mean_kld"])
+    # Brute force over T*-kept candidates must agree with pass 2.
+    kept = {g: [q for q in ladder if tail_c[(g, q)] <= tstar] for g in groups}
+    assert all(kept.values())
+    best, best_alloc = math.inf, None
+    for combo in itertools.product(*(kept[g] for g in groups)):
+        alloc = dict(zip(groups, combo))
+        s = sum(bytes_to_bins(size_b[(g, alloc[g])]) for g in groups)
+        c = sum(mean_c[(g, alloc[g])] for g in groups)
+        if s <= budget_bins and c < best:
+            best, best_alloc = c, alloc
+    assert res["allocation"] == best_alloc
+    assert res["total_mean_kld"] == pytest.approx(best)
+    for g, q in res["allocation"].items():
+        assert tail_c[(g, q)] <= tstar
+
+
+def test_auto_cap_refuses_proxy_tails():
+    """Auto-cap needs measured tails: proxy tables raise loudly."""
+    catalog = tiny_catalog()
+    sens = tiny_sensitivity(catalog)
+    with pytest.raises(ValueError, match="auto-cap needs a measured"):
+        dp_mckp_optimize(
+            catalog=catalog, sensitivity_rows=sens["rows"], objective="mean",
+            size_margin=1.0, budget_bytes=200 * BIN_BYTES,
+        )
