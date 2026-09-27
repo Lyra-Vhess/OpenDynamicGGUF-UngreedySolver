@@ -154,6 +154,9 @@ def classify_ref(user_ref: str) -> SourceKind:
     if path.exists() and path.is_dir():
         return SourceKind.LOCAL
 
+    if path.exists() and path.is_file() and path.suffix == ".gguf":
+        return SourceKind.LOCAL
+
     lower = ref.lower()
     if lower.endswith("-mlx") or lower.endswith(":mlx") or ":mlx" in lower or lower.startswith("mlx-community/"):
         return SourceKind.MLX
@@ -172,7 +175,7 @@ def classify_ref(user_ref: str) -> SourceKind:
     raise ValueError(
         f"Cannot classify model reference {user_ref!r}. "
         "Use an HF id (google/...), Ollama tag (functiongemma:latest), "
-        "MLX id, or a local directory of safetensors."
+        "MLX id, a local directory of safetensors, or a local .gguf file."
     )
 
 # --- from resolve/local.py ---
@@ -611,6 +614,8 @@ def resolve_model(
 
 def _resolve_local(user_ref: str, log: list[str]) -> ResolvedModel:
     path = Path(user_ref).expanduser().resolve()
+    if path.is_file():
+        return _resolve_local_gguf(user_ref, path, log)
     log.append(f"2. Inspecting local directory {path}")
     desc, full_prec = inspect_local_dir(path)
     if not full_prec:
@@ -628,6 +633,52 @@ def _resolve_local(user_ref: str, log: list[str]) -> ResolvedModel:
         source_sha256=None,
         descriptor=desc,
         source_is_quantized=False,
+        steps_log=log,
+    )
+
+
+def _resolve_local_gguf(user_ref: str, path: Path, log: list[str]) -> ResolvedModel:
+    """Resolve a local .gguf file (e.g. a frozen BF16 from Step 09).
+
+    Lets a run switch to GGUF-native tensor names by re-resolving the frozen
+    artifact: downstream steps then use the pipeline's regular GGUF path
+    (the same one Ollama-blob sources use).
+    """
+    from load import open_gguf  # local import: load.py does not import resolve
+
+    log.append(f"2. Inspecting local GGUF file {path}")
+    try:
+        info = open_gguf(path)
+    except Exception as exc:
+        raise ValueError(f"Local file is not a readable GGUF: {path} ({exc})")
+    mix = info.get("dtype_summary") or {}
+    quantized = any(
+        str(k).startswith("Q") or str(k).startswith("IQ") for k in mix
+    )
+    desc = ArchitectureDescriptor(
+        family=info.get("architecture"),
+        layer_count=info.get("layer_count"),
+        embedding_length=info.get("embedding_length"),
+        parameter_count=info.get("parameter_count"),
+        notes=[f"local GGUF source, dtype mix={dict(mix)}"],
+    )
+    if quantized:
+        desc.notes.append(
+            "GGUF holds quantized weights — Step 02 indexes without "
+            "dequantizing into BF16 RAM."
+        )
+        log.append("3. GGUF source is quantized — using as source anyway")
+    else:
+        log.append("3. Local GGUF looks full-precision — using as source")
+    return ResolvedModel(
+        user_ref=user_ref,
+        kind=SourceKind.LOCAL,
+        hf_repo_id=None,
+        local_path=str(path),
+        weights_ready=True,
+        source_sha256=None,
+        descriptor=desc,
+        source_is_quantized=quantized,
         steps_log=log,
     )
 

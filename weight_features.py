@@ -151,6 +151,41 @@ def _catalog_sha256(catalog: dict[str, Any]) -> str:
     return hashlib.sha256(blob).hexdigest()
 
 
+def _hf_tensor_index(path: Path) -> dict[str, Any]:
+    """Map tensor name → (file, dtype) for an HF safetensors directory.
+
+    Parses file headers only; no weight data is loaded here.
+    """
+    import struct
+
+    files = sorted(path.glob("*.safetensors"))
+    tensors: dict[str, tuple[str, str]] = {}
+    for f in files:
+        with f.open("rb") as fh:
+            header_len = struct.unpack("<Q", fh.read(8))[0]
+            header = json.loads(fh.read(header_len))
+        for key, meta in header.items():
+            if key == "__metadata__" or not isinstance(meta, dict):
+                continue
+            tensors[key] = (str(f), str(meta.get("dtype") or "unknown"))
+    return {"tensors": tensors, "n_files": len(files)}
+
+
+def _read_hf_tensor_f32(index: dict[str, Any], name: str) -> tuple["np.ndarray", str]:
+    """Read one tensor from an HF safetensors dir as float32 numpy."""
+    import torch
+
+    entry = (index.get("tensors") or {}).get(name)
+    if entry is None:
+        raise KeyError(name)
+    from safetensors import safe_open
+
+    file, dtype = entry
+    with safe_open(file, framework="pt") as fh:
+        arr = fh.get_slice(name)[:].to(torch.float32).numpy()
+    return np.asarray(arr, dtype=np.float32), dtype
+
+
 def compute_catalog_weight_features(
     catalog: dict[str, Any],
     *,
@@ -164,14 +199,27 @@ def compute_catalog_weight_features(
     """
     log: list[str] = []
     path = Path(source_path or catalog.get("source_path") or "")
-    if not path.is_file():
-        raise FileNotFoundError(f"GGUF source not found: {path}")
-
-    log.append(f"1. Opening GGUF for weight reads: {path}")
-    gmap = gguf_tensor_map(path)
-    data_offset = gmap["data_offset"]
-    index = gmap["tensors"]
-    log.append(f"2. Tensor index ready (data_offset={data_offset}, n={len(index)})")
+    use_hf_dir = path.is_dir() and bool(sorted(path.glob("*.safetensors")))
+    gmap: dict[str, Any] | None = None
+    hf_index: dict[str, Any] | None = None
+    data_offset = 0
+    if use_hf_dir:
+        log.append(f"1. Opening HF safetensors dir for weight reads: {path}")
+        hf_index = _hf_tensor_index(path)
+        index = hf_index["tensors"]
+        log.append(
+            f"2. Tensor index ready (files={hf_index['n_files']}, n={len(index)})"
+        )
+    elif path.is_file():
+        log.append(f"1. Opening GGUF for weight reads: {path}")
+        gmap = gguf_tensor_map(path)
+        data_offset = gmap["data_offset"]
+        index = gmap["tensors"]
+        log.append(f"2. Tensor index ready (data_offset={data_offset}, n={len(index)})")
+    else:
+        raise FileNotFoundError(
+            f"Weight source not found (need GGUF file or HF safetensors dir): {path}"
+        )
 
     tensors = catalog.get("tensors") or {}
     groups = catalog.get("groups") or {}
@@ -190,9 +238,15 @@ def compute_catalog_weight_features(
             t["weight_features"] = None
             continue
         try:
-            arr = read_tensor_f32(path, info, data_offset)
-            feats = compute_weight_features(arr, shape=list(t.get("shape") or info["shape"]))
-            feats["dtype_source"] = info["dtype"]
+            if hf_index is not None:
+                arr, dtype_source = _read_hf_tensor_f32(hf_index, name)
+                feats = compute_weight_features(arr, shape=list(t.get("shape") or arr.shape))
+            else:
+                assert gmap is not None
+                arr = read_tensor_f32(path, info, data_offset)
+                feats = compute_weight_features(arr, shape=list(t.get("shape") or info["shape"]))
+                dtype_source = info["dtype"]
+            feats["dtype_source"] = dtype_source
             feats["from_quantized_source"] = bool(catalog.get("source_is_quantized"))
             t["weight_features"] = feats
             n_with += 1
