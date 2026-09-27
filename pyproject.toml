@@ -59,6 +59,7 @@ py-modules = [
   "catalog",
   "weight_features",
   "corpus",
+  "dp_mckp",
   "activation_features",
   "freeze",
   "imatrix",
