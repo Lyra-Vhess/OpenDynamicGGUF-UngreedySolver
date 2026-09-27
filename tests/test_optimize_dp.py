@@ -414,3 +414,68 @@ def test_fixed_groups_greedy_skips_and_counts():
     fixed_nb = sum(catalog["tensors"][n].get("nbytes") or 0
                    for n in catalog["groups"]["ffn_down@late"]["tensor_names"])
     assert res["estimated_bytes"] >= fixed_nb
+
+
+def _catalog_with_kept_norm(extra_nbytes=1_500_000):
+    catalog = tiny_catalog()
+    catalog["tensors"]["norm.weight"] = {
+        "n_elements": extra_nbytes // 2, "nbytes": extra_nbytes,
+        "group_id": "norm@global", "quantizable": False,
+    }
+    return catalog, extra_nbytes
+
+
+def test_kept_nonquant_bytes_counted_and_subtracted():
+    """Non-quantizable tensors shrink the solve budget and ride in totals."""
+    from optimizer import dp_mckp_optimize
+
+    catalog, kept = _catalog_with_kept_norm()
+    sens = tiny_measured_sensitivity(catalog)
+    res = dp_mckp_optimize(
+        catalog=catalog, sensitivity_rows=sens["rows"], objective="mean",
+        size_margin=1.0, budget_bytes=500 * BIN_BYTES,
+        auto_cap=False, certificate_mode="exhaustive",
+    )
+    assert res["kept_bytes_total"] == kept
+    assert res["total_bytes"] >= kept
+    # Kept bytes alone exceeding the budget fail loudly, naming the cause.
+    with pytest.raises(ValueError, match="Non-DP bytes alone"):
+        dp_mckp_optimize(
+            catalog=catalog, sensitivity_rows=sens["rows"], objective="mean",
+            budget_bytes=kept - 1, auto_cap=False,
+            certificate_mode="exhaustive",
+        )
+
+
+def test_file_overhead_subtracted_and_recorded():
+    """file_overhead_bytes counts toward the budget on both paths."""
+    from optimizer import dp_mckp_optimize, greedy_optimize
+
+    catalog = tiny_catalog()
+    sens = tiny_measured_sensitivity(catalog)
+    # Generous but bin-safe: 10**15 bytes would be billions of 256 KiB
+    # bins (OOM); 200k bins still leaves every allocation feasible.
+    big = 200_000 * BIN_BYTES
+    base = dp_mckp_optimize(
+        catalog=catalog, sensitivity_rows=sens["rows"], objective="mean",
+        budget_bytes=big, auto_cap=False, certificate_mode="exhaustive",
+    )
+    over = dp_mckp_optimize(
+        catalog=catalog, sensitivity_rows=sens["rows"], objective="mean",
+        budget_bytes=big, auto_cap=False, certificate_mode="exhaustive",
+        file_overhead_bytes=2_000_000,
+    )
+    assert over["file_overhead_bytes"] == 2_000_000
+    # Huge budget → identical allocation; totals differ by exactly overhead.
+    assert over["allocation"] == base["allocation"]
+    assert over["total_bytes"] - base["total_bytes"] == 2_000_000
+
+    gbase = greedy_optimize(
+        catalog=catalog, sensitivity_rows=tiny_sensitivity(catalog)["rows"],
+        budget_bytes=10**15,
+    )
+    gover = greedy_optimize(
+        catalog=catalog, sensitivity_rows=tiny_sensitivity(catalog)["rows"],
+        budget_bytes=10**15, file_overhead_bytes=2_000_000,
+    )
+    assert gover["estimated_bytes"] - gbase["estimated_bytes"] == 2_000_000

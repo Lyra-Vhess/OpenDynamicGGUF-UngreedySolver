@@ -39,6 +39,8 @@ class OptimizeResult:
     cap_removed_columns: int = 0
     fixed_groups: dict[str, Any] = field(default_factory=dict)
     fixed_bytes_total: int = 0
+    kept_bytes_total: int = 0
+    file_overhead_bytes: int = 0
 
     def summary_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -167,11 +169,14 @@ def greedy_optimize(
     use_pins: bool = True,
     size_margin: float = 1.0,
     fixed_groups: frozenset[str] | set[str] | None = None,
+    file_overhead_bytes: int = 0,
 ) -> dict[str, Any]:
     """
     Start high, greedily downgrade best efficiency until size ≤ budget.
-    Sizes are exact trial-file measurements where probed; `size_margin`
-    (default 1.0, no-op) scales estimates for never-probed columns only.
+    Sizes are BYTES_PER_ELEM estimates (this deprecated baseline predates
+    trial-file measurement; compare against DP accordingly). `size_margin`
+    (default 1.0, no-op) scales the estimate; `file_overhead_bytes`
+    (GGUF header/metadata) counts toward the budget like everywhere else.
 
     Groups in ``fixed_groups`` stay at source precision: they are never
     assigned or downgraded, and their catalog bytes ride along inside
@@ -211,7 +216,10 @@ def greedy_optimize(
                 assignments[gid] = floors[gid]
 
     def size_now() -> int:
-        return _estimate_total_bytes(assignments, groups, tensors, size_margin)
+        return (
+            _estimate_total_bytes(assignments, groups, tensors, size_margin)
+            + int(file_overhead_bytes or 0)
+        )
 
     history: list[dict[str, Any]] = []
     # Greedy loop
@@ -320,6 +328,7 @@ def _dp_mckp_optimize_once(
     tail_cap: float | None = None,
     size_margin: float = 1.0,
     fixed_groups: frozenset[str] | set[str] | None = None,
+    file_overhead_bytes: int = 0,
 ) -> dict[str, Any]:
     """Optimize via column generation + DP MCKP (Spec 2.3/2.4).
 
@@ -344,6 +353,13 @@ def _dp_mckp_optimize_once(
     their measured bytes (catalog nbytes fallback) are subtracted from
     the budget before solving and added back to every total, so
     ``--budget-mb`` keeps meaning actual file size. Unknown names raise.
+
+    Non-quantizable tensors (quantizable=False: kept norms etc.) are
+    counted the same way — catalog nbytes into every total, subtracted
+    from the solve budget. ``file_overhead_bytes`` (GGUF header + KV
+    metadata, measured from the source file by the caller) is likewise
+    subtracted pre-solve and added back to totals, so the user budget
+    means final file size on disk.
     """
     from colgen import run_column_generation
     from sensitivity import _proxy_delta_kld
@@ -389,13 +405,29 @@ def _dp_mckp_optimize_once(
             + ", ".join(f"{g}={b}" for g, b in sorted(fixed_bytes.items()))
             + f") exceed budget {budget_bytes} bytes. Raise the budget."
         )
+    # Kept bytes: non-quantizable catalog tensors ride along in the file
+    # untouched. They are NOT DP variables, but they occupy real bytes, so
+    # they shrink the solve budget exactly like fixed groups.
+    kept_bytes_total = sum(
+        int(t.get("nbytes") or 0)
+        for t in (tensors or {}).values()
+        if isinstance(t, dict) and not t.get("quantizable", True)
+    )
+    overhead = int(file_overhead_bytes or 0)
+    if fixed_total + kept_bytes_total + overhead > budget_bytes:
+        raise ValueError(
+            f"Non-DP bytes alone ({fixed_total} fixed + {kept_bytes_total} "
+            f"kept non-quantizable + {overhead} file overhead = "
+            f"{fixed_total + kept_bytes_total + overhead}) exceed budget "
+            f"{budget_bytes} bytes. Raise the budget."
+        )
     groups = sorted(candidates)
     if not groups:
         raise ValueError(
             "All candidate groups are fixed — nothing left to optimize. "
             "Remove --fixed-groups entries."
         )
-    solve_budget = budget_bytes - fixed_total
+    solve_budget = budget_bytes - fixed_total - kept_bytes_total - overhead
 
     cap_removed = 0
     if tail_cap is not None:
@@ -529,7 +561,11 @@ def _dp_mckp_optimize_once(
         for gid, b in sorted(fixed_bytes.items())
     }
     result["fixed_bytes_total"] = fixed_total
-    result["total_bytes"] = int(result["total_bytes"]) + fixed_total
+    result["kept_bytes_total"] = kept_bytes_total
+    result["file_overhead_bytes"] = overhead
+    result["total_bytes"] = (
+        int(result["total_bytes"]) + fixed_total + kept_bytes_total + overhead
+    )
     result["meets_budget"] = result["total_bytes"] <= budget_bytes
     return result
 
@@ -552,6 +588,7 @@ def dp_mckp_optimize(
     auto_cap: bool = True,
     size_margin: float = 1.0,
     fixed_groups: frozenset[str] | set[str] | None = None,
+    file_overhead_bytes: int = 0,
 ) -> dict[str, Any]:
     """Optimize via column generation + DP MCKP; see _dp_mckp_optimize_once.
 
@@ -571,6 +608,7 @@ def dp_mckp_optimize(
         lipschitz_L=lipschitz_L, certificate_mode=certificate_mode,
         delta_bins=delta_bins, batch_size=batch_size, objective=objective,
         size_margin=size_margin, fixed_groups=fixed_groups,
+        file_overhead_bytes=file_overhead_bytes,
     )
     if tail_cap is not None or objective != "mean" or not auto_cap:
         return _dp_mckp_optimize_once(tail_cap=tail_cap, **kwargs)
@@ -776,6 +814,7 @@ def _optimize_dp_mckp(
     auto_cap: bool = True,
     size_margin: float = 1.0,
     fixed_groups: frozenset[str] | set[str] | None = None,
+    file_overhead_bytes: int = 0,
 ) -> OptimizeResult:
     """DP-MCKP path (Spec 2.3/2.4/2.6): colgen master + DP Pareto + certificate."""
     from dp_mckp import InfeasibleBudget, solve_mckp
@@ -823,10 +862,13 @@ def _optimize_dp_mckp(
         auto_cap=auto_cap,
         size_margin=size_margin,
         fixed_groups=fixed_groups,
+        file_overhead_bytes=file_overhead_bytes,
     )
     alloc: dict[str, str] = dp["allocation"]
     fixed_info: dict[str, dict[str, Any]] = dp.get("fixed_groups", {})
     fixed_total: int = int(dp.get("fixed_bytes_total", 0))
+    kept_total: int = int(dp.get("kept_bytes_total", 0))
+    overhead: int = int(dp.get("file_overhead_bytes", 0))
     if fixed_info:
         notes.append(
             "Fixed groups stay at source precision (excluded from candidates "
@@ -919,7 +961,7 @@ def _optimize_dp_mckp(
         for g, info in sorted(dp.get("fixed_groups", {}).items())
     ]
     for i, b in enumerate(pareto_targets):
-        b_adj = b - fixed_total
+        b_adj = b - fixed_total - kept_total - overhead
         if b_adj < 0:
             pareto_summary.append({"budget_bytes": b, "feasible": False})
             pareto_points.append({
@@ -939,7 +981,7 @@ def _optimize_dp_mckp(
                 "allocation_hash": None, "feasible": False,
             })
             continue
-        alt_total = int(alt["total_bytes"]) + fixed_total
+        alt_total = int(alt["total_bytes"]) + fixed_total + kept_total + overhead
         ahash = allocation_hash(alt["allocation"])
         name = f"pareto-{i:02d}-{b // 1024}k.yaml"
         alt_mean = sum(p_mean[(g, alt["allocation"][g])] for g in p_groups)
@@ -1073,9 +1115,23 @@ def _optimize_dp_mckp(
                     "auto_cap": dp.get("auto_cap", False),
                     "pass1_mean_kld": dp.get("pass1_mean_kld"),
                     "pass1_tail_kld": dp.get("pass1_tail_kld"),
-                    "size_margin": size_margin,
+        "size_margin": size_margin,
+        "budget": {
+            "target_bytes": budget_bytes,
+            "file_overhead_bytes": overhead,
+            "kept_nonquant_bytes": kept_total,
+            "fixed_bytes": fixed_total,
+            "note": (
+                "Non-DP bytes (fixed groups, kept non-quantizable "
+                "tensors, GGUF header/metadata overhead) are subtracted "
+                "from the target before solving and added back to every "
+                "total, so the budget means final file size on disk."
+            ),
+        },
                     "fixed_groups": dp.get("fixed_groups", {}),
                     "fixed_bytes_total": dp.get("fixed_bytes_total", 0),
+                    "kept_bytes_total": dp.get("kept_bytes_total", 0),
+                    "file_overhead_bytes": dp.get("file_overhead_bytes", 0),
                     "certificate": cert,
                     "rounds": dp["rounds"],
                     "floors": dp.get("floors"),
@@ -1116,6 +1172,8 @@ def _optimize_dp_mckp(
         cap_removed_columns=int(dp.get("cap_removed_columns", 0)),
         fixed_groups=dp.get("fixed_groups", {}),
         fixed_bytes_total=int(dp.get("fixed_bytes_total", 0)),
+        kept_bytes_total=int(dp.get("kept_bytes_total", 0)),
+        file_overhead_bytes=int(dp.get("file_overhead_bytes", 0)),
     )
 
 
@@ -1143,6 +1201,7 @@ def optimize_recipes(
     auto_cap: bool = True,
     size_margin: float = 1.0,
     fixed_groups: frozenset[str] | set[str] | None = None,
+    file_overhead_bytes: int = 0,
 ) -> OptimizeResult:
     log: list[str] = []
     notes: list[str] = []
@@ -1191,6 +1250,7 @@ def optimize_recipes(
             auto_cap=auto_cap,
             size_margin=size_margin,
             fixed_groups=fixed_groups,
+            file_overhead_bytes=file_overhead_bytes,
         )
     if optimizer != "greedy":
         raise ValueError(f"Unknown optimizer: {optimizer!r}")
@@ -1206,6 +1266,7 @@ def optimize_recipes(
         use_pins=use_pins,
         size_margin=size_margin,
         fixed_groups=fixed_groups,
+        file_overhead_bytes=file_overhead_bytes,
     )
     log.append(
         f"4. Primary recipe size={primary['estimated_bytes']} "
@@ -1257,6 +1318,7 @@ def optimize_recipes(
             start_type="Q6_K",
             use_pins=use_pins,
             fixed_groups=fixed_groups,
+            file_overhead_bytes=file_overhead_bytes,
         )
         name = f"pareto-{i:02d}-{b // 1024}k.yaml"
         y = render_recipe_yaml(

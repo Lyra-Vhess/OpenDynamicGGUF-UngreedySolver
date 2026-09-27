@@ -2709,6 +2709,25 @@ def cmd_optimize(args: argparse.Namespace) -> int:
     imatrix_out = store.read_step_output(meta.run_id, "imatrix") or {}
     corpus_out = store.read_step_output(meta.run_id, "corpus") or {}
 
+    # File overhead (GGUF header + KV metadata) is measured from the source
+    # GGUF's data offset, plus 4 KiB safety for the small KV delta export
+    # adds (~512 B observed). It is subtracted from the budget pre-solve so
+    # --budget-mb means final file size on disk. Falls back to 0 (recorded)
+    # when no source GGUF is available.
+    file_overhead_bytes = 0
+    _freeze_gguf = freeze_out.get("gguf_path")
+    if _freeze_gguf and Path(_freeze_gguf).is_file():
+        try:
+            from gguf_tensors import gguf_tensor_map
+
+            file_overhead_bytes = (
+                int(gguf_tensor_map(Path(_freeze_gguf))["data_offset"]) + 4096
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"WARNING: cannot read GGUF overhead: {exc}; using 0",
+                  file=sys.stderr)
+            file_overhead_bytes = 0
+
     budget_bytes = None
     if args.budget_mb is not None:
         budget_bytes = int(float(args.budget_mb) * 1024 * 1024)
@@ -2736,6 +2755,7 @@ def cmd_optimize(args: argparse.Namespace) -> int:
             for g in str(getattr(args, "fixed_groups", None) or "").split(",")
             if g.strip()
         ),
+        "file_overhead_bytes": file_overhead_bytes,
     }
 
     pareto_ratios = None
@@ -2788,6 +2808,7 @@ def cmd_optimize(args: argparse.Namespace) -> int:
                 pareto_ratios=pareto_ratios,
                 imatrix_groups=imatrix_groups,
                 fixed_groups=fixed_groups,
+                file_overhead_bytes=file_overhead_bytes,
             )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "optimize", str(exc))
