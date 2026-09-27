@@ -307,6 +307,42 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Disable default role pins (embd/lm_head Q8, attn_v Q5)",
     )
+    p_opt.add_argument(
+        "--optimizer",
+        choices=("greedy", "dp_mckp"),
+        default="dp_mckp",
+        help="Recipe optimizer (default: dp_mckp; greedy kept for A/B comparison)",
+    )
+    p_opt.add_argument(
+        "--kld-objective",
+        choices=("tail_1pct", "mean"),
+        default="tail_1pct",
+        help="Optimizer objective: mean tail-KLD over worst 1%% of tokens (default) or mean",
+    )
+    p_opt.add_argument(
+        "--certificate",
+        choices=("bounded", "exhaustive"),
+        default="bounded",
+        help="bounded: prune via Lipschitz bound (default); exhaustive: probe all columns",
+    )
+    p_opt.add_argument(
+        "--lipschitz",
+        type=float,
+        default=None,
+        help="Lipschitz bound L (default: auto-calibrated x2 margin from probed data)",
+    )
+    p_opt.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="Process-level probe parallelism (default: 1)",
+    )
+    p_opt.add_argument(
+        "--pareto-ratios",
+        default=None,
+        metavar="RATIOS",
+        help="Comma-separated budget ratios (default: 0.55,0.65,0.72,0.80,0.90,1.0)",
+    )
     p_opt.add_argument("--no-explain", action="store_true")
 
     # --- export (step 14) ---
@@ -2365,7 +2401,29 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         "quant_format": fmt.id,
         "no_pins": bool(args.no_pins),
         "gguf_sha256": freeze_out.get("gguf_sha256"),
+        "optimizer": getattr(args, "optimizer", "dp_mckp"),
+        "kld_objective": getattr(args, "kld_objective", "tail_1pct"),
+        "certificate": getattr(args, "certificate", "bounded"),
+        "lipschitz": getattr(args, "lipschitz", None),
+        "jobs": getattr(args, "jobs", 1),
+        "pareto_ratios": getattr(args, "pareto_ratios", None),
     }
+
+    pareto_ratios = None
+    if getattr(args, "pareto_ratios", None):
+        try:
+            pareto_ratios = [float(r) for r in str(args.pareto_ratios).split(",")]
+        except ValueError:
+            print(f"ERROR: bad --pareto-ratios: {args.pareto_ratios}", file=sys.stderr)
+            return 1
+
+    imatrix_groups = None
+    imatrix_proxy = store.step_path(meta.run_id, "imatrix") / "imatrix_proxy.json"
+    if imatrix_proxy.is_file():
+        try:
+            imatrix_groups = (json.loads(imatrix_proxy.read_text()) or {}).get("groups")
+        except (OSError, ValueError):
+            imatrix_groups = None
 
     try:
         step_dir = store.begin_step(
@@ -2388,6 +2446,13 @@ def cmd_optimize(args: argparse.Namespace) -> int:
                 imatrix_sha256=imatrix_out.get("imatrix_sha256"),
                 corpus_id=corpus_out.get("corpus_id"),
                 use_pins=not args.no_pins,
+                optimizer=getattr(args, "optimizer", "dp_mckp"),
+                kld_objective=getattr(args, "kld_objective", "tail_1pct"),
+                certificate_mode=getattr(args, "certificate", "bounded"),
+                lipschitz_L=getattr(args, "lipschitz", None),
+                jobs=int(getattr(args, "jobs", 1) or 1),
+                pareto_ratios=pareto_ratios,
+                imatrix_groups=imatrix_groups,
             )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "optimize", str(exc))
@@ -2407,6 +2472,11 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         "tensor_type_file": result.tensor_type_file,
         "n_pareto": len(result.pareto_paths),
         "assignments": result.assignments,
+        "optimizer": result.optimizer,
+        "kld_objective": result.kld_objective,
+        "total_tail_kld": result.total_tail_kld,
+        "total_mean_kld": result.total_mean_kld,
+        "certificate": result.certificate,
         "steps_log": result.steps_log,
         "notes": result.notes,
     }
@@ -3569,6 +3639,16 @@ def _explain_optimize(result) -> None:
             ("Predicted ΔKLD", f"{result.predicted_delta_kld:.6g}"),
             ("Groups", result.n_groups),
         ]
+        + (
+            [
+                ("Tail KLD", f"{result.total_tail_kld:.6g}"),
+                ("Certificate", f"{result.certificate['mode']} "
+                 f"(probed={result.certificate['probed_columns']} "
+                 f"excluded={result.certificate['excluded_columns']})"),
+            ]
+            if result.certificate
+            else []
+        )
     )
     ui.notes(result.notes)
     ui.next_step("Step 14 — export candidate GGUF.")

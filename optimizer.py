@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from typing import Any
+import hashlib
 import json
 from pathlib import Path
 from sensitivity import BYTES_PER_ELEM, estimate_group_nbytes
@@ -24,6 +25,13 @@ class OptimizeResult:
     assignments: dict[str, str]
     steps_log: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    # Additive DP/colgen fields (Spec 2.6); None on the greedy path.
+    optimizer: str = "greedy"
+    kld_objective: str = "mean"
+    total_tail_kld: float | None = None
+    total_mean_kld: float | None = None
+    certificate: dict[str, Any] | None = None
+    cost_matrix: dict[str, Any] | None = None
 
     def summary_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -282,6 +290,7 @@ def dp_mckp_optimize(
     certificate_mode: str = "bounded",
     delta_bins: int = 16,
     batch_size: int = 1,
+    objective: str = "tail",
 ) -> dict[str, Any]:
     """Optimize via column generation + DP MCKP (Spec 2.3/2.4).
 
@@ -338,7 +347,7 @@ def dp_mckp_optimize(
         probe_fn=probe_fn, budget_bytes=budget_bytes,
         imatrix_scores=imatrix_scores, lipschitz_L=lipschitz_L,
         delta_bins=delta_bins, mode=certificate_mode, batch_size=batch_size,
-        floor_of=floors,
+        floor_of=floors, objective=objective,
     )
     result["start_type"] = start_type.upper()
     result["floors"] = floors
@@ -350,6 +359,52 @@ def _yaml_escape(s: str) -> str:
     if any(c in s for c in ":#{}[]|&*!?>'%@`,"):
         return json.dumps(s)
     return s
+
+
+def _yaml_scalar(v: Any) -> str:
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, float):
+        return repr(v)
+    if isinstance(v, str):
+        return _yaml_escape(v)
+    return str(v)
+
+
+def _render_yaml_lines(obj: Any, indent: int) -> list[str]:
+    """Minimal YAML emitter for additive recipe sections (Spec 2.6)."""
+    pad = " " * indent
+    if isinstance(obj, dict):
+        if not obj:
+            return [f"{pad}{{}}"]
+        lines: list[str] = []
+        for k, v in obj.items():
+            if isinstance(v, (dict, list)):
+                lines.append(f"{pad}{k}:")
+                lines.extend(_render_yaml_lines(v, indent + 2))
+            else:
+                lines.append(f"{pad}{k}: {_yaml_scalar(v)}")
+        return lines
+    if isinstance(obj, list):
+        if not obj:
+            return [f"{pad}[]"]
+        lines = []
+        for item in obj:
+            if isinstance(item, (dict, list)):
+                sub = _render_yaml_lines(item, indent + 2)
+                lines.append(f"{pad}- {sub[0].strip()}")
+                lines.extend(sub[1:])
+            else:
+                lines.append(f"{pad}- {_yaml_scalar(item)}")
+        return lines
+    return [f"{pad}{_yaml_scalar(obj)}"]
+
+
+def allocation_hash(assignments: dict[str, str]) -> str:
+    blob = json.dumps(sorted(assignments.items()), separators=(",", ":"))
+    return hashlib.sha1(blob.encode()).hexdigest()[:16]
 
 
 def render_recipe_yaml(
@@ -366,6 +421,7 @@ def render_recipe_yaml(
     estimated_bytes: int,
     predicted_delta_kld: float,
     method: str,
+    extras: dict[str, Any] | None = None,
 ) -> str:
     overrides_lines = []
     for gid, q in sorted(assignments.items()):
@@ -404,8 +460,10 @@ def render_recipe_yaml(
         f"  predicted_mean_delta_kld: {predicted_delta_kld:.6f}",
         f"  method: {method}",
         "validation: {}",
-        "",
     ]
+    if extras:
+        lines.extend(_render_yaml_lines(extras, 0))
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -451,6 +509,276 @@ def default_budget_bytes(catalog: dict[str, Any], *, ratio: float = 0.72) -> int
     return max(1, max(target, int(floor_bytes * 1.02)))
 
 
+DEFAULT_PARETO_RATIOS = (0.55, 0.65, 0.72, 0.80, 0.90, 1.0)
+
+
+def _optimize_dp_mckp(
+    *,
+    model_ref: str,
+    out_dir: Path,
+    catalog: dict[str, Any],
+    sensitivity: dict[str, Any],
+    budget_bytes: int,
+    hf_repo_id: str | None,
+    gguf_sha256: str | None,
+    imatrix_sha256: str | None,
+    corpus_id: str | None,
+    use_pins: bool,
+    kld_objective: str,
+    certificate_mode: str,
+    lipschitz_L: float | None,
+    jobs: int,
+    pareto_ratios: list[float] | None,
+    imatrix_groups: dict[str, Any] | None,
+) -> OptimizeResult:
+    """DP-MCKP path (Spec 2.3/2.4/2.6): colgen master + DP Pareto + certificate."""
+    from dp_mckp import InfeasibleBudget, solve_mckp
+
+    log: list[str] = []
+    notes: list[str] = []
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pareto_dir = out_dir / "pareto"
+    pareto_dir.mkdir(exist_ok=True)
+
+    rows = sensitivity.get("rows") or []
+    if not rows:
+        raise ValueError("sensitivity table has no rows")
+    if kld_objective not in ("tail_1pct", "mean"):
+        raise ValueError(f"Unknown kld_objective: {kld_objective!r}")
+    obj = "mean" if kld_objective == "mean" else "tail"
+
+    log.append(f"1. Budget → {budget_bytes} bytes ({budget_bytes / (1024**2):.1f} MiB)")
+    log.append(f"2. Sensitivity rows={len(rows)} method={sensitivity.get('method')}")
+    log.append(
+        f"3. DP-MCKP column generation from Q6_K with role pins "
+        f"(objective={kld_objective}, certificate={certificate_mode}, "
+        f"lipschitz={'auto' if lipschitz_L is None else lipschitz_L}, jobs={jobs})"
+    )
+    notes.append(
+        f"jobs={jobs}: process-level probe parallelism (each probe is a "
+        f"llama-quantize + llama-perplexity subprocess; OS-scheduled, "
+        f"hardware-agnostic). Proxy-mode probes are in-process."
+    )
+
+    dp = dp_mckp_optimize(
+        catalog=catalog,
+        sensitivity_rows=rows,
+        budget_bytes=budget_bytes,
+        start_type="Q6_K",
+        use_pins=use_pins,
+        imatrix_groups=imatrix_groups,
+        lipschitz_L=lipschitz_L,
+        certificate_mode=certificate_mode,
+        objective=obj,
+    )
+    alloc: dict[str, str] = dp["allocation"]
+    cert = dp["certificate"]
+    cost_matrix = dp["cost_matrix"]
+    total_tail = float(dp["total_tail_kld"])
+    total_mean = float(dp["total_mean_kld"])
+    groups = catalog.get("groups") or {}
+    method = "dp_mckp_colgen_v1"
+    log.append(
+        f"4. Primary recipe size={dp['total_bytes']} "
+        f"tail={total_tail:.4f} mean={total_mean:.4f} "
+        f"rounds={dp['rounds']} probed={cert['probed_columns']} "
+        f"excluded={cert['excluded_columns']} lambda={cert['shadow_price_lambda']:.6g}"
+    )
+
+    entry_index = {(e["group"], e["type"]): e for e in cost_matrix["entries"]}
+    ntok = next(
+        (e["n_tokens"] for e in cost_matrix["entries"] if e.get("n_tokens") is not None),
+        None,
+    )
+    kld_metric = {
+        "objective": kld_objective,
+        "reported": ["tail_1pct", "mean"],
+        "n_tokens": ntok,
+    }
+    allocation_list = [
+        {
+            "group": g,
+            "type": alloc[g],
+            "bytes": entry_index[(g, alloc[g])]["bytes"],
+            "kld_tail": entry_index[(g, alloc[g])]["kld_tail"],
+        }
+        for g in sorted(alloc)
+    ]
+    totals = {"bytes": dp["total_bytes"], "kld_mean": total_mean, "kld_tail": total_tail}
+
+    # Pareto: DP re-solves over probed columns only (free, no new probes;
+    # the termination certificate strictly covers the primary budget).
+    ratios = list(pareto_ratios) if pareto_ratios else list(DEFAULT_PARETO_RATIOS)
+    q6_size = default_budget_bytes(catalog, ratio=1.0)
+    pareto_targets = sorted({int(q6_size * r) for r in ratios} | {budget_bytes})
+    p_groups = sorted(cost_matrix["groups"])
+    p_cand = {
+        g: sorted({e["type"] for e in cost_matrix["entries"] if e["group"] == g and e["probed"]})
+        for g in p_groups
+    }
+    p_size = {(e["group"], e["type"]): int(e["bytes"]) for e in cost_matrix["entries"] if e["probed"]}
+    p_cost = {
+        (e["group"], e["type"]): float(e["kld_mean"] if obj == "mean" else e["kld_tail"])
+        for e in cost_matrix["entries"]
+        if e["probed"]
+    }
+    p_mean = {(e["group"], e["type"]): float(e["kld_mean"]) for e in cost_matrix["entries"] if e["probed"]}
+    p_tail = {(e["group"], e["type"]): float(e["kld_tail"]) for e in cost_matrix["entries"] if e["probed"]}
+    pareto_paths: list[str] = []
+    pareto_summary = []
+    pareto_points = []
+    for i, b in enumerate(pareto_targets):
+        try:
+            alt = solve_mckp(
+                groups=p_groups, candidates=p_cand, size_bytes=p_size,
+                cost_tail=p_cost, budget_bytes=b,
+            )
+        except InfeasibleBudget:
+            pareto_summary.append({"budget_bytes": b, "feasible": False})
+            pareto_points.append({
+                "budget_bytes": b, "kld_tail": None,
+                "allocation_hash": None, "feasible": False,
+            })
+            continue
+        ahash = allocation_hash(alt["allocation"])
+        name = f"pareto-{i:02d}-{b // 1024}k.yaml"
+        alt_mean = sum(p_mean[(g, alt["allocation"][g])] for g in p_groups)
+        alt_tail = float(alt["total_tail_kld"]) if obj == "tail" else sum(
+            p_tail[(g, alt["allocation"][g])] for g in p_groups
+        )
+        y = render_recipe_yaml(
+            model_ref=model_ref,
+            hf_repo_id=hf_repo_id,
+            gguf_sha256=gguf_sha256,
+            imatrix_sha256=imatrix_sha256,
+            corpus_id=corpus_id,
+            budget_bytes=b,
+            base_type="Q6_K",
+            assignments=alt["allocation"],
+            groups=groups,
+            estimated_bytes=alt["total_bytes"],
+            predicted_delta_kld=alt_mean,
+            method=method,
+            extras={
+                "optimizer": "dp_mckp",
+                "kld_metric": kld_metric,
+                "totals": {"bytes": alt["total_bytes"], "kld_mean": alt_mean, "kld_tail": alt_tail},
+                "allocation": [
+                    {"group": g, "type": alt["allocation"][g],
+                     "bytes": p_size[(g, alt["allocation"][g])],
+                     "kld_tail": p_tail[(g, alt["allocation"][g])]}
+                    for g in p_groups
+                ],
+            },
+        )
+        p = pareto_dir / name
+        p.write_text(y, encoding="utf-8")
+        pareto_paths.append(str(p))
+        pareto_summary.append({
+            "path": str(p), "budget_bytes": b, "estimated_bytes": alt["total_bytes"],
+            "predicted_tail_kld": alt_tail, "predicted_mean_kld": alt_mean,
+            "allocation_hash": ahash, "feasible": True,
+        })
+        pareto_points.append({
+            "budget_bytes": b, "kld_tail": alt_tail,
+            "allocation_hash": ahash, "feasible": True,
+        })
+
+    extras = {
+        "optimizer": "dp_mckp",
+        "kld_metric": kld_metric,
+        "cost_matrix": cost_matrix,
+        "allocation": allocation_list,
+        "totals": totals,
+        "certificate": cert,
+        "pareto": pareto_points,
+        "discretization": {"bin_bytes": dp["bin_bytes"], "rounding": dp["rounding"]},
+    }
+    recipe_yaml = render_recipe_yaml(
+        model_ref=model_ref,
+        hf_repo_id=hf_repo_id,
+        gguf_sha256=gguf_sha256,
+        imatrix_sha256=imatrix_sha256,
+        corpus_id=corpus_id,
+        budget_bytes=budget_bytes,
+        base_type="Q6_K",
+        assignments=alloc,
+        groups=groups,
+        estimated_bytes=dp["total_bytes"],
+        predicted_delta_kld=total_mean,
+        method=method,
+        extras=extras,
+    )
+    recipe_path = out_dir / "recipe.yaml"
+    recipe_path.write_text(recipe_yaml, encoding="utf-8")
+
+    tt = render_tensor_type_file(alloc, groups)
+    tt_path = out_dir / "recipe.tt"
+    tt_path.write_text(tt, encoding="utf-8")
+
+    log.append(f"5. Wrote recipe.yaml + recipe.tt + {len(pareto_paths)} Pareto recipes")
+    notes.append(
+        "Allocation is DP-optimal over the probed cost matrix (tail-KLD "
+        "objective unless --kld-objective mean). Pareto points re-solve the "
+        "DP over probed columns only — no new probes; the termination "
+        "certificate strictly covers the primary budget."
+    )
+    notes.append(
+        "Assignments from sensitivity table (proxy or measured). "
+        "Export with Step 14 using recipe.tt."
+    )
+    if dp["total_bytes"] > budget_bytes:
+        notes.append("Primary allocation exceeds budget — raise the budget.")
+
+    (out_dir / "optimize_manifest.json").write_text(
+        json.dumps(
+            {
+                "primary": {
+                    "assignments": alloc,
+                    "estimated_bytes": dp["total_bytes"],
+                    "predicted_delta_kld": total_mean,
+                    "total_tail_kld": total_tail,
+                    "total_mean_kld": total_mean,
+                    "meets_budget": dp["total_bytes"] <= budget_bytes,
+                    "optimizer": "dp_mckp",
+                    "kld_objective": kld_objective,
+                    "certificate": cert,
+                    "rounds": dp["rounds"],
+                    "floors": dp.get("floors"),
+                },
+                "pareto": pareto_summary,
+                "budget_bytes": budget_bytes,
+                "jobs": jobs,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    return OptimizeResult(
+        model_ref=model_ref,
+        method=method,
+        budget_bytes=budget_bytes,
+        estimated_bytes=dp["total_bytes"],
+        predicted_delta_kld=total_mean,
+        n_groups=len(alloc),
+        recipe_path=str(recipe_path),
+        tensor_type_file=str(tt_path),
+        pareto_paths=pareto_paths,
+        assignments=alloc,
+        steps_log=log,
+        notes=notes,
+        optimizer="dp_mckp",
+        kld_objective=kld_objective,
+        total_tail_kld=total_tail,
+        total_mean_kld=total_mean,
+        certificate=cert,
+        cost_matrix=cost_matrix,
+    )
+
+
 def optimize_recipes(
     *,
     model_ref: str,
@@ -464,6 +792,13 @@ def optimize_recipes(
     imatrix_sha256: str | None = None,
     corpus_id: str | None = None,
     use_pins: bool = True,
+    optimizer: str = "dp_mckp",
+    kld_objective: str = "tail_1pct",
+    certificate_mode: str = "bounded",
+    lipschitz_L: float | None = None,
+    jobs: int = 1,
+    pareto_ratios: list[float] | None = None,
+    imatrix_groups: dict[str, Any] | None = None,
 ) -> OptimizeResult:
     log: list[str] = []
     notes: list[str] = []
@@ -487,6 +822,28 @@ def optimize_recipes(
             f"1. Budget fixed → {budget_bytes} bytes "
             f"({budget_bytes / (1024**2):.1f} MiB)"
         )
+
+    if optimizer == "dp_mckp":
+        return _optimize_dp_mckp(
+            model_ref=model_ref,
+            out_dir=out_dir,
+            catalog=catalog,
+            sensitivity=sensitivity,
+            budget_bytes=budget_bytes,
+            hf_repo_id=hf_repo_id,
+            gguf_sha256=gguf_sha256,
+            imatrix_sha256=imatrix_sha256,
+            corpus_id=corpus_id,
+            use_pins=use_pins,
+            kld_objective=kld_objective,
+            certificate_mode=certificate_mode,
+            lipschitz_L=lipschitz_L,
+            jobs=jobs,
+            pareto_ratios=pareto_ratios,
+            imatrix_groups=imatrix_groups,
+        )
+    if optimizer != "greedy":
+        raise ValueError(f"Unknown optimizer: {optimizer!r}")
 
     log.append(f"2. Sensitivity rows={len(rows)} method={sensitivity.get('method')}")
     log.append("3. Greedy downgrade from Q6_K with role pins")
@@ -534,7 +891,7 @@ def optimize_recipes(
     pareto_targets = sorted(
         {
             int(q6_size * r)
-            for r in (0.55, 0.65, 0.72, 0.80, 0.90, 1.0)
+            for r in DEFAULT_PARETO_RATIOS
         }
         | {budget_bytes}
     )

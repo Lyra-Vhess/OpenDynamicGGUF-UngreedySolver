@@ -202,7 +202,7 @@ The pipeline is split into 16 small steps, each with its own design doc. Start a
 | 10 | Build imatrix | [doc](docs/steps/10-build-imatrix.md) | `odg imatrix` | ✅ Implemented (proxy; llama-imatrix optional) |
 | 11 | Cache reference logits | [doc](docs/steps/11-cache-reference-logits.md) | `odg reference-logits` | ✅ Implemented (proxy; llama-perplexity optional) |
 | 12 | Sensitivity probe | [doc](docs/steps/12-sensitivity-probe.md) | `odg sensitivity` | ✅ Implemented (proxy table; llama probes TBD) |
-| 13 | Optimize recipe | [doc](docs/steps/13-optimize-recipe.md) | `odg optimize` | ✅ Implemented (greedy + Pareto) |
+| 13 | Optimize recipe | [doc](docs/steps/13-optimize-recipe.md) | `odg optimize` | ✅ Implemented (dp_mckp + greedy + Pareto) |
 | 14 | Export GGUF | [doc](docs/steps/14-export-gguf.md) | `odg export` | ✅ Implemented (dry-run; llama-quantize optional) |
 | 15 | Validate & release | [doc](docs/steps/15-validate-and-release.md) | `odg validate` | ✅ Implemented (proxy gates + report) |
 
@@ -706,6 +706,16 @@ Bit assignment under a byte budget is (approximately) a **knapsack problem**:
 v1 deliberately skips Bayesian optimization and evolutionary search: each objective evaluation costs a quantize + eval pass, and the published evidence says greedy-plus-refinement captures what matters. Fancier search is a later experiment, not a prerequisite.
 
 **Failure prevented:** a single opaque config. Emitting the whole frontier lets the user pick the trade-off and keeps every choice auditable.
+
+#### DP-MCKP optimizer (default)
+
+`odg optimize` now solves bit assignment exactly as a **Multiple-Choice Knapsack Problem via dynamic programming** (`--optimizer dp_mckp`, the default), replacing greedy search with a provably optimal allocation over the probed cost matrix:
+
+- **Tail-KLD objective** — minimizes mean KLD over the worst 1% of tokens (`--kld-objective tail_1pct`, default); mean KLD is still reported alongside. Use `--kld-objective mean` for the legacy objective.
+- **Column generation** — probes only the `(group, quant)` columns needed to certify optimality (floor type per group first, then attractive columns by upper-bound gain per byte), instead of a full sweep. `--certificate exhaustive` probes everything for an unconditional certificate.
+- **Termination certificate** — every recipe records which columns were probed, which were excluded, and the bound model (monotonicity + Lipschitz `L`, auto-calibrated unless `--lipschitz` is given). Check `attractive_at_termination: []` to verify certification.
+- **Pareto frontier** — falls out of the DP table for free; `pareto/*.yaml` covers the standard ratios plus any `--pareto-ratios` values.
+- **A/B comparison** — `--optimizer greedy` keeps the legacy optimizer; `--jobs N` sets process-level probe parallelism.
 
 ### Stage 8 — Reproducible export
 

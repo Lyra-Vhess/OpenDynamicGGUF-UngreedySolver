@@ -194,12 +194,17 @@ def run_column_generation(
     floor_of: dict[str, str] | None = None,
     max_rounds: int | None = None,
     batch_size: int = 1,
+    objective: str = "tail",
 ) -> dict[str, Any]:
     """Pricing loop around the DP master. Returns allocation + certificate.
 
     probe_fn(group, quant) -> {"kld_mean", "kld_tail_1pct", "n_tokens"}.
     mode "bounded" prices via the bound model (conditional certificate);
     mode "exhaustive" probes every column (unconditional certificate).
+    objective "tail" minimizes kld_tail_1pct (default, Spec 2.1);
+    "mean" minimizes kld_mean instead (the same monotonicity/Lipschitz
+    bound model is assumed to hold for means; cost_matrix still records
+    both metrics for every probed column).
 
     Granularity note (Spec 2.4 "iteration"): each pass solves the master,
     reprices every unprobed column, and probes the top `batch_size`
@@ -214,6 +219,8 @@ def run_column_generation(
     """
     if mode not in ("bounded", "exhaustive"):
         raise ValueError(f"Unknown certificate mode: {mode!r}")
+    if objective not in ("tail", "mean"):
+        raise ValueError(f"Unknown objective: {objective!r}")
     groups = sorted(groups)
     floors: dict[str, str] = {}
     for g in groups:
@@ -228,6 +235,8 @@ def run_column_generation(
     tails: dict[tuple[str, str], float] = {}
     means: dict[tuple[str, str], float] = {}
     ntoks: dict[tuple[str, str], Any] = {}
+    # DP objective cost: tail KLD by default, mean KLD under --kld-objective mean.
+    obj = means if objective == "mean" else tails
     probed: dict[str, list[str]] = {g: [] for g in groups}
     n_probed = 0
 
@@ -255,7 +264,7 @@ def run_column_generation(
         """Score unprobed columns; returns [(ub_per_byte, g, q)] attractive-only."""
         nonlocal L
         if auto_L:
-            L = calibrate_lipschitz(tails, probed, scales)
+            L = calibrate_lipschitz(obj, probed, scales)
         LL = L
         ranked: list[tuple[float, str, str]] = []
         for g in groups:
@@ -264,7 +273,7 @@ def run_column_generation(
                     continue
                 extra = size_bytes[(g, q)] - size_bytes[(g, floors[g])]
                 ub = upper_bound_gain(
-                    group=g, quant=q, floor=floors[g], tails=tails,
+                    group=g, quant=q, floor=floors[g], tails=obj,
                     probed=probed, scales=scales, lipschitz_L=LL,
                 )
                 if extra <= 0:
@@ -278,7 +287,7 @@ def run_column_generation(
 
     while True:
         master_cand = {g: list(probed[g]) for g in groups}
-        cost = {(g, q): tails[(g, q)] for g in groups for q in probed[g]}
+        cost = {(g, q): obj[(g, q)] for g in groups for q in probed[g]}
         try:
             solution = solve_mckp(
                 groups=groups, candidates=master_cand, size_bytes=size_bytes,
@@ -349,6 +358,7 @@ def run_column_generation(
     alloc = solution["allocation"]
     return {
         "allocation": alloc,
+        "objective": objective,
         "total_tail_kld": solution["total_tail_kld"],
         "total_mean_kld": sum(means[(g, alloc[g])] for g in groups),
         "total_bytes": solution["total_bytes"],
