@@ -52,7 +52,7 @@ grid and optimized mean KLD only.
   batches (re-solve/re-price between probes) so early rounds don't degenerate
   into a full sweep.
 - **CLI** (`cli.py`): `--optimizer {greedy,dp_mckp}` (default `dp_mckp`),
-  `--kld-objective {tail_1pct,mean}`,
+  `--kld-objective {tail_1pct,mean}` (default `mean`),
   `--certificate {bounded,exhaustive}`,
   `--lipschitz`, `--jobs`, `--pareto-ratios`, `--probe-types`.
   All existing flags preserved.

@@ -340,8 +340,8 @@ def main(argv: list[str] | None = None) -> int:
     p_opt.add_argument(
         "--kld-objective",
         choices=("tail_1pct", "mean"),
-        default="tail_1pct",
-        help="Optimizer objective: mean tail-KLD over worst 1%% of tokens (default) or mean",
+        default="mean",
+        help="Optimizer objective: mean KLD (default, with automatic P99 guardrail) or tail_1pct",
     )
     p_opt.add_argument(
         "--certificate",
@@ -2450,7 +2450,7 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         "no_pins": bool(args.no_pins),
         "gguf_sha256": freeze_out.get("gguf_sha256"),
         "optimizer": getattr(args, "optimizer", "dp_mckp"),
-        "kld_objective": getattr(args, "kld_objective", "tail_1pct"),
+        "kld_objective": getattr(args, "kld_objective", "mean"),
         "certificate": getattr(args, "certificate", "bounded"),
         "lipschitz": getattr(args, "lipschitz", None),
         "jobs": getattr(args, "jobs", 1),
@@ -2495,7 +2495,7 @@ def cmd_optimize(args: argparse.Namespace) -> int:
                 corpus_id=corpus_out.get("corpus_id"),
                 use_pins=not args.no_pins,
                 optimizer=getattr(args, "optimizer", "dp_mckp"),
-                kld_objective=getattr(args, "kld_objective", "tail_1pct"),
+                kld_objective=getattr(args, "kld_objective", "mean"),
                 certificate_mode=getattr(args, "certificate", "bounded"),
                 lipschitz_L=getattr(args, "lipschitz", None),
                 jobs=int(getattr(args, "jobs", 1) or 1),

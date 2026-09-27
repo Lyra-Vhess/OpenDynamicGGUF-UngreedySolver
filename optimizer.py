@@ -1001,7 +1001,7 @@ def optimize_recipes(
     corpus_id: str | None = None,
     use_pins: bool = True,
     optimizer: str = "dp_mckp",
-    kld_objective: str = "tail_1pct",
+    kld_objective: str = "mean",
     certificate_mode: str = "bounded",
     lipschitz_L: float | None = None,
     jobs: int = 1,

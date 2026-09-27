@@ -99,6 +99,7 @@ def test_dp_tail_refuses_proxy_rows(tmp_path):
         optimize_recipes(
             model_ref="test", out_dir=tmp_path / "refuse", catalog=catalog,
             sensitivity=tiny_sensitivity(catalog), budget_ratio=0.8,
+            kld_objective="tail_1pct",
         )
 
 

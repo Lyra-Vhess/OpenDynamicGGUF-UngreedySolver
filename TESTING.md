@@ -194,8 +194,9 @@ finite-difference window (currently 16 MiB bins in `colgen.py`) or smooth
 that invalidates the bound. If oscillation persists, run `--certificate
 exhaustive` for an unconditional result.
 
-**Tail metric looks noisy across runs.** Expected: the worst-1% mean is
-noisier than the overall mean. Keep `--kld-objective tail_1pct` for the
-optimizer but cross-check `kld_mean` in the recipe; if they disagree
-sharply on which allocation wins, enlarge the search split before trusting
-the tail.
+**Tail metric looks noisy across runs.** Expected: the worst-1% P99 is
+noisier than the overall mean. The default mean objective with the automatic
+guardrail already handles this (the cap constrains per-group worst-1% while
+the mean decides); cross-check `kld_mean` against the `guardrail` block in
+the recipe, and if they disagree sharply on which allocation wins, enlarge
+the search split before trusting the tail.
