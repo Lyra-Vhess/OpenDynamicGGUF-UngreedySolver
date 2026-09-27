@@ -2348,7 +2348,13 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
         if not probe_types:
             raise ValueError("--probe-types was empty")
     else:
-        probe_types = list(fmt.probe_types)
+        from sensitivity import default_probe_grid
+
+        # Profile grid plus every ladder type any group needs (e.g. Q8
+        # for Q8-pinned groups); per-group filtering keeps it tight.
+        probe_types = default_probe_grid(
+            catalog, list(fmt.probe_types), start_type=baseline,
+        )
 
     input_data = {
         "from_steps": ["reference_logits", "imatrix", "corpus"],

@@ -160,3 +160,32 @@ def test_per_group_grids_drop_above_ladder():
     import pytest as _pt
     with _pt.raises(ValueError, match="covers nothing"):
         probe_groups_proxy(catalog, probe_types=["Q4_K"], baseline_type="Q6_K")
+
+
+def test_default_grid_covers_pinned_ladders():
+    from sensitivity import default_probe_grid
+
+    catalog = {
+        "tensors": {
+            "token_embd.weight": {"n_elements": 1000},
+            "blk.0.attn_q.weight": {"n_elements": 1000},
+        },
+        "groups": {
+            "embedding@global": {
+                "role": "embedding", "depth": "global", "quantizable": True,
+                "n_tensors": 1, "tensor_names": ["token_embd.weight"],
+            },
+            "attn_q@early": {
+                "role": "attn_q", "depth": "early", "quantizable": True,
+                "n_tensors": 1, "tensor_names": ["blk.0.attn_q.weight"],
+            },
+        },
+    }
+    # Bare profile grid (Q3-Q6): covers nothing on embedding's Q8 ladder.
+    grid = default_probe_grid(catalog, ["Q3_K", "Q4_K", "Q5_K", "Q6_K"])
+    assert grid == ["Q8_0", "Q6_K", "Q5_K", "Q4_K", "Q3_K", "Q2_K"]
+    # Every group's per-group grid is non-empty under the default.
+    from sensitivity import group_probe_grid
+
+    for gid, g in catalog["groups"].items():
+        assert group_probe_grid(g, grid), gid

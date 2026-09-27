@@ -179,6 +179,50 @@ def _qualifying_groups(
     return out
 
 
+def _pins_ladder(
+    group: dict[str, Any],
+    *,
+    start_type: str = BASELINE_TYPE,
+) -> list[str]:
+    """Pins-only candidate ladder for a group, high precision first.
+
+    Hints only ever *narrow* ladders at solve time, so this is a superset
+    of the final candidate set. Groups whose floor sits above the start
+    (e.g. embedding at Q8) keep just the floor.
+    """
+    from optimizer import DEFAULT_PINS, LADDER, _ladder_index
+
+    pins = dict(DEFAULT_PINS)
+    floor = pins.get(str(group.get("role") or ""), "Q2_K").upper()
+    lo = _ladder_index(start_type.upper())
+    hi = _ladder_index(floor)
+    return [floor] if hi < lo else LADDER[lo : hi + 1]
+
+
+def default_probe_grid(
+    catalog: dict[str, Any],
+    profile_types: list[str],
+    *,
+    start_type: str = BASELINE_TYPE,
+) -> list[str]:
+    """Default grid: profile grid plus every type any group's pins-only
+    ladder needs.
+
+    A bare profile grid (e.g. Q3–Q6) covers nothing on ladders entirely
+    above the baseline (e.g. embedding pinned at Q8) — that used to fail
+    loudly at solve time. Unioning in ladder types fixes the default while
+    per-group filtering keeps it tight; explicit --probe-types bypasses
+    this (DP firewall stays as backstop). Ordered by ladder, high first.
+    """
+    from optimizer import LADDER
+
+    want = {t.upper() for t in profile_types}
+    for _, g, _ in _qualifying_groups(catalog):
+        want.update(_pins_ladder(g, start_type=start_type))
+    order = {q: i for i, q in enumerate(LADDER)}
+    return sorted(want, key=lambda q: order.get(q, len(LADDER)))
+
+
 def group_probe_grid(
     group: dict[str, Any],
     grid: list[str],
@@ -194,13 +238,7 @@ def group_probe_grid(
     Above-ladder types (e.g. Q8 for an unpinned group) are dropped: the DP
     could never choose them, so measuring them is pure GPU waste.
     """
-    from optimizer import DEFAULT_PINS, LADDER, _ladder_index
-
-    pins = dict(DEFAULT_PINS)
-    floor = pins.get(str(group.get("role") or ""), "Q2_K").upper()
-    lo = _ladder_index(start_type.upper())
-    hi = _ladder_index(floor)
-    ladder = [floor] if hi < lo else LADDER[lo : hi + 1]
+    ladder = _pins_ladder(group, start_type=start_type)
     return [q for q in grid if q.upper() in ladder]
 
 
