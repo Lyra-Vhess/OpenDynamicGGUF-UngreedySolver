@@ -37,6 +37,8 @@ class OptimizeResult:
     pass1_mean_kld: float | None = None
     pass1_tail_kld: float | None = None
     cap_removed_columns: int = 0
+    fixed_groups: dict[str, Any] = field(default_factory=dict)
+    fixed_bytes_total: int = 0
 
     def summary_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -164,11 +166,16 @@ def greedy_optimize(
     pins: dict[str, str] | None = None,
     use_pins: bool = True,
     size_margin: float = 1.0,
+    fixed_groups: frozenset[str] | set[str] | None = None,
 ) -> dict[str, Any]:
     """
     Start high, greedily downgrade best efficiency until size ≤ budget.
     Sizes are exact trial-file measurements where probed; `size_margin`
     (default 1.0, no-op) scales estimates for never-probed columns only.
+
+    Groups in ``fixed_groups`` stay at source precision: they are never
+    assigned or downgraded, and their catalog bytes ride along inside
+    ``_estimate_total_bytes`` (unassigned tensors keep catalog nbytes).
     """
     pins = dict(DEFAULT_PINS) if use_pins else {}
     groups = catalog.get("groups") or {}
@@ -181,6 +188,8 @@ def greedy_optimize(
     for gid, g in groups.items():
         if not g.get("quantizable", True):
             continue
+        if fixed_groups and gid in fixed_groups:
+            continue  # fixed at source precision; bytes ride along below
         role = str(g.get("role") or "")
         q = start_type.upper()
         floor = pins.get(role)
@@ -310,6 +319,7 @@ def _dp_mckp_optimize_once(
     objective: str = "tail",
     tail_cap: float | None = None,
     size_margin: float = 1.0,
+    fixed_groups: frozenset[str] | set[str] | None = None,
 ) -> dict[str, Any]:
     """Optimize via column generation + DP MCKP (Spec 2.3/2.4).
 
@@ -327,6 +337,13 @@ def _dp_mckp_optimize_once(
     tails everywhere it filters — same hard error as the tail objective.
     ``size_margin`` (default 1.0) scales estimates for never-probed
     columns; probed columns use exact trial-file sizes.
+
+    ``fixed_groups`` names groups that stay at source precision (e.g.
+    tensors llama-quantize cannot quantize: arch-unknown 2-D tensors,
+    1-D norms). They are excluded from candidates AND from the recipe;
+    their measured bytes (catalog nbytes fallback) are subtracted from
+    the budget before solving and added back to every total, so
+    ``--budget-mb`` keeps meaning actual file size. Unknown names raise.
     """
     from colgen import run_column_generation
     from sensitivity import _proxy_delta_kld
@@ -345,6 +362,40 @@ def _dp_mckp_optimize_once(
             "tensor_catalog.json, not a step summary)."
         )
     row_index = _build_row_index(sensitivity_rows)
+
+    fixed = set(fixed_groups or ())
+    unknown_fixed = fixed - set(candidates)
+    if unknown_fixed:
+        raise ValueError(
+            f"--fixed-groups names unknown groups: {sorted(unknown_fixed)}. "
+            f"Valid group ids: {groups}."
+        )
+    fixed_bytes: dict[str, int] = {}
+    for gid in sorted(fixed):
+        # Kept size is ALWAYS the catalog source size: fixed groups stay at
+        # source precision, so measured rows (counterfactual quants that
+        # will never happen) must not leak in via max(). Catalog nbytes is
+        # exact for source dtypes.
+        fixed_bytes[gid] = sum(
+            int((tensors.get(n) or {}).get("nbytes") or 0)
+            for n in (groups_t.get(gid) or {}).get("tensor_names") or []
+        )
+        candidates.pop(gid, None)
+        floors.pop(gid, None)
+    fixed_total = sum(fixed_bytes.values())
+    if fixed and fixed_total > budget_bytes:
+        raise ValueError(
+            f"Fixed groups alone ({fixed_total} bytes: "
+            + ", ".join(f"{g}={b}" for g, b in sorted(fixed_bytes.items()))
+            + f") exceed budget {budget_bytes} bytes. Raise the budget."
+        )
+    groups = sorted(candidates)
+    if not groups:
+        raise ValueError(
+            "All candidate groups are fixed — nothing left to optimize. "
+            "Remove --fixed-groups entries."
+        )
+    solve_budget = budget_bytes - fixed_total
 
     cap_removed = 0
     if tail_cap is not None:
@@ -458,7 +509,7 @@ def _dp_mckp_optimize_once(
 
     result = run_column_generation(
         groups=groups, candidates=candidates, size_bytes=size_bytes,
-        probe_fn=probe_fn, budget_bytes=budget_bytes,
+        probe_fn=probe_fn, budget_bytes=solve_budget,
         imatrix_scores=imatrix_scores, lipschitz_L=lipschitz_L,
         delta_bins=delta_bins, mode=certificate_mode, batch_size=batch_size,
         floor_of=eff_floors, objective=objective,
@@ -473,6 +524,12 @@ def _dp_mckp_optimize_once(
     result["pass1_tail_kld"] = None
     result["cap_removed_columns"] = cap_removed
     result["size_margin"] = size_margin
+    result["fixed_groups"] = {
+        gid: {"bytes": b, "type": "source", "kld_tail": 0.0, "kld_mean": 0.0}
+        for gid, b in sorted(fixed_bytes.items())
+    }
+    result["fixed_bytes_total"] = fixed_total
+    result["total_bytes"] = int(result["total_bytes"]) + fixed_total
     result["meets_budget"] = result["total_bytes"] <= budget_bytes
     return result
 
@@ -494,6 +551,7 @@ def dp_mckp_optimize(
     tail_cap: float | None = None,
     auto_cap: bool = True,
     size_margin: float = 1.0,
+    fixed_groups: frozenset[str] | set[str] | None = None,
 ) -> dict[str, Any]:
     """Optimize via column generation + DP MCKP; see _dp_mckp_optimize_once.
 
@@ -512,7 +570,7 @@ def dp_mckp_optimize(
         use_pins=use_pins, imatrix_groups=imatrix_groups,
         lipschitz_L=lipschitz_L, certificate_mode=certificate_mode,
         delta_bins=delta_bins, batch_size=batch_size, objective=objective,
-        size_margin=size_margin,
+        size_margin=size_margin, fixed_groups=fixed_groups,
     )
     if tail_cap is not None or objective != "mean" or not auto_cap:
         return _dp_mckp_optimize_once(tail_cap=tail_cap, **kwargs)
@@ -717,6 +775,7 @@ def _optimize_dp_mckp(
     tail_cap: float | None = None,
     auto_cap: bool = True,
     size_margin: float = 1.0,
+    fixed_groups: frozenset[str] | set[str] | None = None,
 ) -> OptimizeResult:
     """DP-MCKP path (Spec 2.3/2.4/2.6): colgen master + DP Pareto + certificate."""
     from dp_mckp import InfeasibleBudget, solve_mckp
@@ -741,7 +800,8 @@ def _optimize_dp_mckp(
         f"3. DP-MCKP column generation from Q6_K with role pins "
         f"(objective={kld_objective}, certificate={certificate_mode}, "
          f"lipschitz={'auto' if lipschitz_L is None else lipschitz_L}, jobs={jobs}, "
-         f"tail_cap={tail_cap}, auto_cap={auto_cap}, size_margin={size_margin})"
+         f"tail_cap={tail_cap}, auto_cap={auto_cap}, size_margin={size_margin}, "
+         f"fixed_groups={sorted(fixed_groups) if fixed_groups else []})"
     )
     notes.append(
         f"jobs={jobs}: process-level probe parallelism (each probe is a "
@@ -762,8 +822,19 @@ def _optimize_dp_mckp(
         tail_cap=tail_cap,
         auto_cap=auto_cap,
         size_margin=size_margin,
+        fixed_groups=fixed_groups,
     )
     alloc: dict[str, str] = dp["allocation"]
+    fixed_info: dict[str, dict[str, Any]] = dp.get("fixed_groups", {})
+    fixed_total: int = int(dp.get("fixed_bytes_total", 0))
+    if fixed_info:
+        notes.append(
+            "Fixed groups stay at source precision (excluded from candidates "
+            "and recipe.tt; export default applies, which keeps them): "
+            + ", ".join(f"{g}={v['bytes']}" for g, v in sorted(fixed_info.items()))
+            + f". Fixed total {fixed_total} bytes subtracted from every "
+            "budget before solving, added back to every total."
+        )
     cert = dp["certificate"]
     cost_matrix = dp["cost_matrix"]
     total_tail = dp["total_tail_kld"]
@@ -799,6 +870,15 @@ def _optimize_dp_mckp(
             "kld_tail": entry_index[(g, alloc[g])]["kld_tail"],
         }
         for g in sorted(alloc)
+    ] + [
+        {
+            "group": g,
+            "type": "source",
+            "bytes": info["bytes"],
+            "kld_tail": 0.0,
+            "fixed": True,
+        }
+        for g, info in sorted(fixed_info.items())
     ]
     totals = {"bytes": dp["total_bytes"], "kld_mean": total_mean, "kld_tail": total_tail}
 
@@ -827,11 +907,30 @@ def _optimize_dp_mckp(
     pareto_paths: list[str] = []
     pareto_summary = []
     pareto_points = []
+    fixed_total = int(dp.get("fixed_bytes_total", 0))
+    fixed_list = [
+        {
+            "group": g,
+            "type": "source",
+            "bytes": info["bytes"],
+            "kld_tail": 0.0,
+            "fixed": True,
+        }
+        for g, info in sorted(dp.get("fixed_groups", {}).items())
+    ]
     for i, b in enumerate(pareto_targets):
+        b_adj = b - fixed_total
+        if b_adj < 0:
+            pareto_summary.append({"budget_bytes": b, "feasible": False})
+            pareto_points.append({
+                "budget_bytes": b, "kld_tail": None,
+                "allocation_hash": None, "feasible": False,
+            })
+            continue
         try:
             alt = solve_mckp(
                 groups=p_groups, candidates=p_cand, size_bytes=p_size,
-                cost_tail=p_cost, budget_bytes=b,
+                cost_tail=p_cost, budget_bytes=b_adj,
             )
         except InfeasibleBudget:
             pareto_summary.append({"budget_bytes": b, "feasible": False})
@@ -840,6 +939,7 @@ def _optimize_dp_mckp(
                 "allocation_hash": None, "feasible": False,
             })
             continue
+        alt_total = int(alt["total_bytes"]) + fixed_total
         ahash = allocation_hash(alt["allocation"])
         name = f"pareto-{i:02d}-{b // 1024}k.yaml"
         alt_mean = sum(p_mean[(g, alt["allocation"][g])] for g in p_groups)
@@ -855,26 +955,26 @@ def _optimize_dp_mckp(
             base_type="Q6_K",
             assignments=alt["allocation"],
             groups=groups,
-            estimated_bytes=alt["total_bytes"],
+            estimated_bytes=alt_total,
             predicted_delta_kld=alt_mean,
             method=method,
             extras={
                 "optimizer": "dp_mckp",
                 "kld_metric": kld_metric,
-                "totals": {"bytes": alt["total_bytes"], "kld_mean": alt_mean, "kld_tail": alt_tail},
+                "totals": {"bytes": alt_total, "kld_mean": alt_mean, "kld_tail": alt_tail},
                 "allocation": [
                     {"group": g, "type": alt["allocation"][g],
                      "bytes": p_size[(g, alt["allocation"][g])],
                      "kld_tail": p_tail[(g, alt["allocation"][g])]}
                     for g in p_groups
-                ],
+                ] + [dict(e) for e in fixed_list],
             },
         )
         p = pareto_dir / name
         p.write_text(y, encoding="utf-8")
         pareto_paths.append(str(p))
         pareto_summary.append({
-            "path": str(p), "budget_bytes": b, "estimated_bytes": alt["total_bytes"],
+            "path": str(p), "budget_bytes": b, "estimated_bytes": alt_total,
             "predicted_tail_kld": alt_tail, "predicted_mean_kld": alt_mean,
             "allocation_hash": ahash, "feasible": True,
         })
@@ -974,6 +1074,8 @@ def _optimize_dp_mckp(
                     "pass1_mean_kld": dp.get("pass1_mean_kld"),
                     "pass1_tail_kld": dp.get("pass1_tail_kld"),
                     "size_margin": size_margin,
+                    "fixed_groups": dp.get("fixed_groups", {}),
+                    "fixed_bytes_total": dp.get("fixed_bytes_total", 0),
                     "certificate": cert,
                     "rounds": dp["rounds"],
                     "floors": dp.get("floors"),
@@ -1012,6 +1114,8 @@ def _optimize_dp_mckp(
         pass1_mean_kld=dp.get("pass1_mean_kld"),
         pass1_tail_kld=dp.get("pass1_tail_kld"),
         cap_removed_columns=int(dp.get("cap_removed_columns", 0)),
+        fixed_groups=dp.get("fixed_groups", {}),
+        fixed_bytes_total=int(dp.get("fixed_bytes_total", 0)),
     )
 
 
@@ -1038,6 +1142,7 @@ def optimize_recipes(
     tail_cap: float | None = None,
     auto_cap: bool = True,
     size_margin: float = 1.0,
+    fixed_groups: frozenset[str] | set[str] | None = None,
 ) -> OptimizeResult:
     log: list[str] = []
     notes: list[str] = []
@@ -1085,6 +1190,7 @@ def optimize_recipes(
             tail_cap=tail_cap,
             auto_cap=auto_cap,
             size_margin=size_margin,
+            fixed_groups=fixed_groups,
         )
     if optimizer != "greedy":
         raise ValueError(f"Unknown optimizer: {optimizer!r}")
@@ -1099,6 +1205,7 @@ def optimize_recipes(
         start_type="Q6_K",
         use_pins=use_pins,
         size_margin=size_margin,
+        fixed_groups=fixed_groups,
     )
     log.append(
         f"4. Primary recipe size={primary['estimated_bytes']} "
@@ -1149,6 +1256,7 @@ def optimize_recipes(
             budget_bytes=b,
             start_type="Q6_K",
             use_pins=use_pins,
+            fixed_groups=fixed_groups,
         )
         name = f"pareto-{i:02d}-{b // 1024}k.yaml"
         y = render_recipe_yaml(

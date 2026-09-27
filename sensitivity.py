@@ -358,6 +358,10 @@ def probe_groups_llama(
     tensors = catalog.get("tensors") or {}
     work = Path(work_dir)
     work.mkdir(parents=True, exist_ok=True)
+    # Drop stale trial GGUFs (e.g. from a previous catalog's groups);
+    # logs and .tt files are kept for audit. Current trials are rewritten.
+    for stale in work.glob("trial-*.gguf"):
+        stale.unlink(missing_ok=True)
 
     log_ctx = {
         "model_gguf": model_gguf, "search_txt": search_txt,
@@ -436,6 +440,9 @@ def probe_groups_llama(
                 # Actual group payload bytes from the trial file's own
                 # metadata (exact); None when the probe predates measurement.
                 "bytes_measured": m.get("group_bytes_measured"),
+                # 1-D tensors the probe legitimately skipped (llama.cpp
+                # never quantizes flat tensors); empty in the normal case.
+                "probe_exempt_tensors": m.get("probe_exempt_tensors", []),
                 "top_token_agree": max(0.0, 1.0 - 2.5 * delta_kld),
                 "efficiency": score,
                 "decision_hint": hint,

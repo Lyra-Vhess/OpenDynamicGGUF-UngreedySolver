@@ -133,3 +133,45 @@ def test_measure_column_appends_perplexity_args(tmp_path, monkeypatch):
     assert pcmd[0][-2:] == ["-ngl", "99"]
     assert out["kld_mean"] == pytest.approx(0.2432)
     assert out["kld_tail_1pct"] == pytest.approx(3.937)
+
+
+def _tmap(entries):
+    # entries: list of (name, dtype, shape)
+    return {n: {"dtype": d, "shape": s} for n, d, s in entries}
+
+
+def test_assert_probe_applied_ok_and_baseline_skip():
+    from llama_probe import assert_probe_applied
+
+    tmap = _tmap([
+        ("blk.0.attn_q.weight", "Q2_K", [640, 640]),
+        ("blk.0.norm.weight", "F32", [640]),
+    ])
+    # probe == baseline: no check at all
+    assert assert_probe_applied(
+        tmap, ["blk.0.attn_q.weight"], "Q6_K", "Q6_K", tag="t") == []
+    # 2-D tensor at probe type passes
+    assert assert_probe_applied(
+        tmap, ["blk.0.attn_q.weight"], "Q2_K", "Q6_K", tag="t") == []
+    # 1-D tensor exempt even though it stayed F32
+    assert assert_probe_applied(
+        tmap, ["blk.0.norm.weight"], "Q2_K", "Q6_K", tag="t") == [
+            "blk.0.norm.weight"]
+
+
+def test_assert_probe_applied_silent_no_match_raises():
+    from llama_probe import assert_probe_applied
+
+    tmap = _tmap([("blk.0.ffn_up.weight", "BF16", [640, 640])])
+    with pytest.raises(RuntimeError, match="did not take probe"):
+        assert_probe_applied(
+            tmap, ["blk.0.ffn_up.weight"], "Q2_K", "Q6_K",
+            tag="other@global-Q2_K",
+        )
+
+
+def test_assert_probe_applied_missing_tensor_raises():
+    from llama_probe import assert_probe_applied
+
+    with pytest.raises(RuntimeError, match="missing from trial"):
+        assert_probe_applied({}, ["blk.0.missing.weight"], "Q2_K", "Q6_K")

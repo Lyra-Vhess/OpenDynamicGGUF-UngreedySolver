@@ -77,6 +77,15 @@ grid and optimized mean KLD only.
   `cost_matrix`, `allocation`, `totals`, `certificate`, `pareto`,
   `discretization` sections. Greedy output is byte-identical to before.
 - **Docs**: README DP-MCKP subsection; `TESTING.md` (this branch).
+- **Fixed groups** (`--fixed-groups`, `optimizer.py`, `llama_probe.py`):
+  groups that must stay at source precision (tensors llama-quantize
+  cannot quantize, e.g. arch-unknown 2-D projections) are excluded from
+  candidates and the recipe; their catalog bytes are subtracted from every
+  budget before solving and added back to every total, so `--budget-mb`
+  keeps meaning actual file size. Probes now assert every non-flat group
+  tensor actually took the probe type in the trial file — the old silent
+  no-match (bogus zero-delta rows) is a hard error instead. Stale
+  trial-*.gguf files are cleared when probing starts.
 
 ## Deprecated (not removed)
 
@@ -85,9 +94,9 @@ on a real sweep per the spec. Default is now `dp_mckp`.
 
 ## Test summary
 
-`python3 -m pytest tests/ -q` — 102 passed (4 new: passthrough parsing,
-forwarding through imatrix/logits/probe runners). No new dependencies
-(`numpy` only; the log parser is stdlib).
+`python3 -m pytest tests/ -q` — 109 passed (7 new: probe-effect assert
+×3, fixed-group DP/greedy accounting ×4). No new dependencies (`numpy`
+only; the log parser is stdlib).
 
 ## Deviations from Spec.md
 

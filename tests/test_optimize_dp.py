@@ -61,6 +61,7 @@ def tiny_measured_sensitivity(catalog):
             c = copy.deepcopy(r)
             c["probe"] = q
             c["delta_kld"] = float(r["delta_kld"]) * mult
+            c["kld_mean"] = float(r.get("kld_mean", r["delta_kld"])) * mult
             extra.append(c)
     sens["rows"] = sens["rows"] + extra
     for r in sens["rows"]:
@@ -322,3 +323,94 @@ def test_auto_cap_refuses_proxy_tails():
             catalog=catalog, sensitivity_rows=sens["rows"], objective="mean",
             size_margin=1.0, budget_bytes=200 * BIN_BYTES,
         )
+
+
+def _fixed_bytes(catalog, sens, gid):
+    # Fixed groups stay at source precision: catalog nbytes, never measured.
+    return sum(catalog["tensors"][n].get("nbytes") or 0
+               for n in catalog["groups"][gid]["tensor_names"])
+
+
+def test_fixed_groups_excluded_but_counted_dp():
+    from optimizer import dp_mckp_optimize
+
+    catalog = tiny_catalog()
+    sens = tiny_measured_sensitivity(catalog)
+    fixed = {"ffn_down@late"}
+    fixed_b = _fixed_bytes(catalog, sens, "ffn_down@late")
+    # Brute force over the remaining groups with the reduced budget.
+    groups = sorted(g for g in catalog["groups"] if g not in fixed)
+    ladder = ["Q6_K", "Q5_K", "Q4_K", "Q3_K", "Q2_K"]
+    idx = {(r["group_id"], r["probe"]): r for r in sens["rows"]}
+    n_elem = {g: sum(catalog["tensors"][n].get("n_elements") or 0
+                     for n in catalog["groups"][g]["tensor_names"])
+              for g in groups}
+    size_b = {(g, q): estimate_group_nbytes(n_elem[g], q)
+              for g in groups for q in ladder}
+    mean_c = {(g, q): float(idx[(g, q)]["kld_mean"])
+              for g in groups for q in ladder}
+    budget = 500 * BIN_BYTES
+    best, best_alloc = math.inf, None
+    for combo in itertools.product(*(ladder for _ in groups)):
+        alloc = dict(zip(groups, combo))
+        s = sum(bytes_to_bins(size_b[(g, alloc[g])]) for g in groups)
+        c = sum(mean_c[(g, alloc[g])] for g in groups)
+        if s <= bytes_to_bins(budget - fixed_b) and c < best:
+            best, best_alloc = c, alloc
+    assert best_alloc is not None
+    res = dp_mckp_optimize(
+        catalog=catalog, sensitivity_rows=sens["rows"], objective="mean",
+        size_margin=1.0, budget_bytes=budget, fixed_groups=fixed,
+        auto_cap=False, certificate_mode="exhaustive",
+    )
+    assert "ffn_down@late" not in res["allocation"]
+    assert res["allocation"] == best_alloc
+    assert res["total_mean_kld"] == pytest.approx(best)
+    assert res["fixed_groups"]["ffn_down@late"]["bytes"] == fixed_b
+    assert res["fixed_bytes_total"] == fixed_b
+    assert res["total_bytes"] <= budget
+    # Binned DP total plus fixed bytes brackets the exact byte sum
+    # (per-group ceil can only undershoot by < 1 bin each).
+    exact = sum(size_b[(g, res["allocation"][g])] for g in groups) + fixed_b
+    assert res["total_bytes"] <= exact
+    assert res["total_bytes"] > exact - len(groups) * BIN_BYTES
+
+
+def test_fixed_groups_unknown_name_rejected():
+    from optimizer import dp_mckp_optimize
+
+    catalog = tiny_catalog()
+    sens = tiny_measured_sensitivity(catalog)
+    with pytest.raises(ValueError, match="unknown groups"):
+        dp_mckp_optimize(
+            catalog=catalog, sensitivity_rows=sens["rows"], objective="mean",
+            budget_bytes=200 * BIN_BYTES, fixed_groups={"nope@nowhere"},
+        )
+
+
+def test_fixed_groups_over_budget_rejected():
+    from optimizer import dp_mckp_optimize
+
+    catalog = tiny_catalog()
+    sens = tiny_measured_sensitivity(catalog)
+    with pytest.raises(ValueError, match="exceed budget"):
+        dp_mckp_optimize(
+            catalog=catalog, sensitivity_rows=sens["rows"], objective="mean",
+            budget_bytes=1, fixed_groups={"ffn_down@late"},
+        )
+
+
+def test_fixed_groups_greedy_skips_and_counts():
+    from optimizer import greedy_optimize
+
+    catalog = tiny_catalog()
+    sens = tiny_sensitivity(catalog)
+    res = greedy_optimize(
+        catalog=catalog, sensitivity_rows=sens["rows"],
+        budget_bytes=10**15, fixed_groups={"ffn_down@late"},
+    )
+    assert "ffn_down@late" not in res["assignments"]
+    # catalog nbytes for the fixed group still ride along in the total
+    fixed_nb = sum(catalog["tensors"][n].get("nbytes") or 0
+                   for n in catalog["groups"]["ffn_down@late"]["tensor_names"])
+    assert res["estimated_bytes"] >= fixed_nb

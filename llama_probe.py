@@ -19,6 +19,55 @@ from typing import Any
 from kld import parse_llama_perplexity_kl
 
 
+def assert_probe_applied(
+    trial_tensors: dict[str, Any],
+    group_tensors: list[str],
+    probe_type: str,
+    baseline_type: str,
+    *,
+    tag: str = "",
+) -> list[str]:
+    """Verify the trial actually quantized the group (hard error if not).
+
+    llama.cpp silently keeps tensors it cannot quantize (1-D tensors, and
+    arch-unknown tensors like custom multimodal projections) at source
+    precision even when a ``--tensor-type`` override names them — the probe
+    then measures a no-op and records a bogus zero-delta row. For every
+    non-flat group tensor (more than one dim > 1), require the trial dtype
+    to equal the probe type whenever probe != baseline. Flat (1-D) tensors
+    are exempt — llama.cpp never quantizes those, by design — and returned
+    so callers can audit them. Missing tensors also raise (mapping corrupt).
+    """
+    if probe_type.upper() == baseline_type.upper():
+        return []
+    exempt: list[str] = []
+    bad: list[tuple[str, str]] = []
+    for name in group_tensors:
+        info = trial_tensors.get(name)
+        if info is None:
+            raise RuntimeError(
+                f"Trial {tag}: group tensor {name!r} missing from trial GGUF "
+                f"metadata. Mapping corrupt?"
+            )
+        shape = info.get("shape") or []
+        if sum(1 for d in shape if d and d > 1) <= 1:
+            exempt.append(name)  # flat tensors stay F32 by design
+            continue
+        actual = str(info.get("dtype") or "").upper()
+        if actual != probe_type.upper():
+            bad.append((name, actual))
+    if bad:
+        shown = ", ".join(f"{n}={a}" for n, a in bad[:5])
+        raise RuntimeError(
+            f"Trial {tag}: {len(bad)} group tensor(s) did not take probe "
+            f"type {probe_type} (e.g. {shown}). llama-quantize silently "
+            f"ignores overrides for tensors outside its architecture map — "
+            f"this group cannot be probed meaningfully. Exclude it as a "
+            f"fixed group instead of recording a zero-delta row."
+        )
+    return exempt
+
+
 def _run(cmd: list[str], *, what: str) -> str:
     proc = subprocess.run(cmd, capture_output=True, text=True)
     log = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
@@ -114,6 +163,9 @@ def measure_column(
                 f"Trial {tag}: {len(missing)} group tensor(s) missing from "
                 f"trial GGUF metadata ({missing[0]!r}...). Mapping corrupt?"
             )
+        measured["probe_exempt_tensors"] = assert_probe_applied(
+            tmap, group_tensors, probe_type, baseline_type, tag=tag,
+        )
         measured["group_bytes_measured"] = int(
             sum(int(tmap[n]["nbytes"]) for n in group_tensors)
         )

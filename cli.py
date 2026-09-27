@@ -417,6 +417,14 @@ def main(argv: list[str] | None = None) -> int:
         metavar="RATIOS",
         help="Comma-separated budget ratios (default: 0.55,0.65,0.72,0.80,0.90,1.0)",
     )
+    p_opt.add_argument(
+        "--fixed-groups",
+        default=None,
+        metavar="GIDS",
+        help="Comma-separated group ids kept at source precision (e.g. tensors "
+        "llama-quantize cannot quantize). Excluded from candidates and recipe; "
+        "their measured bytes count toward every budget.",
+    )
     p_opt.add_argument("--no-explain", action="store_true")
 
     # --- export (step 14) ---
@@ -2434,6 +2442,26 @@ def cmd_reference_logits(args: argparse.Namespace) -> int:
     return 0
 
 
+#: Canonical catalog resolution order for every step that consumes probe
+#: groups (sensitivity, optimize, export). The rebanded catalog MUST win
+#: wherever it exists: group_ids are only meaningful within one catalog,
+#: and sizing/probing/exporting against different catalogs in one run
+#: silently mis-maps groups to tensor sets (caught once by the measured-
+#: size sanity check in optimize — never again by construction).
+PROBE_CATALOG_ORDER = (
+    "reband", "activation_features", "weight_features", "catalog",
+)
+
+
+def resolve_probe_catalog(store, run_id):
+    """Return (catalog_dict, source_step) or (None, None)."""
+    for step_id in PROBE_CATALOG_ORDER:
+        cpath = store.step_path(run_id, step_id) / "tensor_catalog.json"
+        if cpath.is_file():
+            return json.loads(cpath.read_text()), step_id
+    return None, None
+
+
 def cmd_sensitivity(args: argparse.Namespace) -> int:
     from sensitivity import build_sensitivity_table
     from store import StepAlreadyDone
@@ -2479,14 +2507,7 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
         )
         return 0
 
-    catalog = None
-    catalog_source = None
-    for step_id in ("reband", "activation_features", "weight_features", "catalog"):
-        cpath = store.step_path(meta.run_id, step_id) / "tensor_catalog.json"
-        if cpath.is_file():
-            catalog = json.loads(cpath.read_text())
-            catalog_source = step_id
-            break
+    catalog, catalog_source = resolve_probe_catalog(store, meta.run_id)
     if not catalog:
         print("ERROR: tensor_catalog.json not found", file=sys.stderr)
         return 1
@@ -2678,12 +2699,7 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         return 1
     sensitivity = json.loads(sens_path.read_text())
 
-    catalog = None
-    for step_id in ("activation_features", "weight_features", "catalog"):
-        cpath = store.step_path(meta.run_id, step_id) / "tensor_catalog.json"
-        if cpath.is_file():
-            catalog = json.loads(cpath.read_text())
-            break
+    catalog, _catalog_source = resolve_probe_catalog(store, meta.run_id)
     if not catalog:
         print("ERROR: tensor_catalog.json not found", file=sys.stderr)
         return 1
@@ -2715,6 +2731,11 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         "lipschitz": getattr(args, "lipschitz", None),
         "jobs": getattr(args, "jobs", 1),
         "pareto_ratios": getattr(args, "pareto_ratios", None),
+        "fixed_groups": sorted(
+            g.strip()
+            for g in str(getattr(args, "fixed_groups", None) or "").split(",")
+            if g.strip()
+        ),
     }
 
     pareto_ratios = None
@@ -2724,6 +2745,11 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         except ValueError:
             print(f"ERROR: bad --pareto-ratios: {args.pareto_ratios}", file=sys.stderr)
             return 1
+
+    fixed_groups = frozenset(
+        g.strip() for g in str(getattr(args, "fixed_groups", None) or "").split(",")
+        if g.strip()
+    )
 
     imatrix_groups = None
     imatrix_proxy = store.step_path(meta.run_id, "imatrix") / "imatrix_proxy.json"
@@ -2761,6 +2787,7 @@ def cmd_optimize(args: argparse.Namespace) -> int:
                 jobs=int(getattr(args, "jobs", 1) or 1),
                 pareto_ratios=pareto_ratios,
                 imatrix_groups=imatrix_groups,
+                fixed_groups=fixed_groups,
             )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "optimize", str(exc))
@@ -3007,12 +3034,10 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 "assignments"
             ) or {}
 
-    catalog = None
-    for step_id in ("activation_features", "weight_features", "catalog"):
-        cpath = store.step_path(meta.run_id, step_id) / "tensor_catalog.json"
-        if cpath.is_file():
-            catalog = json.loads(cpath.read_text())
-            break
+    catalog, _catalog_source = resolve_probe_catalog(store, meta.run_id)
+    if not catalog:
+        print("ERROR: tensor_catalog.json not found", file=sys.stderr)
+        return 1
 
     input_data = {
         "from_step": "export",
