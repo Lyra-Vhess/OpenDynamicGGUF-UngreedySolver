@@ -1,7 +1,28 @@
 # Testing the DP-MCKP optimizer
 
-Target hardware: single 16 GB GPU, 128 GB RAM. All unit tests run anywhere
-with `python3 -m pytest tests/ -q` (no GPU, no models, no llama.cpp).
+Target hardware: single 16 GB GPU, 128 GB RAM.
+
+## Setup (no venv, `odg` not installed)
+
+This checkout is not a virtualenv and the package is not installed, so
+there is no `odg` command. Everything below works with the system Python
+directly — all runtime dependencies (`numpy`, `rich`, `huggingface_hub`)
+and `pytest` are already installed. Just `cd` to the repo root:
+
+```
+cd /home/lyra/AI/OpenCode/OpenDynamicGGUF
+```
+
+Then substitute `python3 cli.py` for every `odg` in this guide, e.g.
+`odg optimize ...` becomes:
+
+```
+python3 cli.py optimize ...
+```
+
+(Optional: `pip install -e .` creates a real `odg` command from this
+checkout. On this machine pip requires the `--break-system-packages`
+flag. Not needed for any test below.)
 
 ## 0. Unit tests (no hardware needed)
 
@@ -21,11 +42,12 @@ Expect 77 passed. The DP-specific tests:
 
 ## 1. Small-scale end-to-end (VRAM-light)
 
-Use the 270M test model with proxy sensitivity (no trial quants, no GPU):
+Use the 270M test model with proxy sensitivity (no trial quants, no GPU).
+All commands run from the repo root with `python3 cli.py` (see Setup):
 
 ```
-odg run --model functiongemma:latest --quant q4_k_m --no-ask --quiet
-odg optimize --budget-mb 180
+python3 cli.py run --model functiongemma:latest --quant q4_k_m --no-ask --quiet
+python3 cli.py optimize --budget-mb 180
 ```
 
 Expected runtime: seconds for the optimize step (DP over ~25 groups x ~3 GiB
@@ -42,8 +64,8 @@ in the run's `steps/13_optimize/` directory:
 Then export and validate as usual:
 
 ```
-odg export --mode llama
-odg validate
+python3 cli.py export --mode llama
+python3 cli.py validate
 ```
 
 `validate` runs on the held-out split only; the tail metric is computed on
@@ -52,9 +74,9 @@ the search split during probing.
 ## 2. Real Gemma E4B sweep (bounded mode)
 
 ```
-odg run --model <gemma-e4b-ref> --quant q4_k_m --no-ask --until sensitivity
-odg sensitivity --mode llama --force
-odg optimize --budget-ratio 0.72 --jobs 2
+python3 cli.py run --model <gemma-e4b-ref> --quant q4_k_m --no-ask --until sensitivity
+python3 cli.py sensitivity --mode llama --force
+python3 cli.py optimize --budget-ratio 0.72 --jobs 2
 ```
 
 Notes:
@@ -76,7 +98,7 @@ Notes:
 ## 3. Exhaustive re-run (certified final recipe)
 
 ```
-odg optimize --budget-ratio 0.72 --certificate exhaustive --jobs 2 --force
+python3 cli.py optimize --budget-ratio 0.72 --certificate exhaustive --jobs 2 --force
 ```
 
 Probes every `(group, quant)` column; the emitted certificate is then
@@ -115,8 +137,8 @@ Checklist:
 Same budget, same sensitivity table, both optimizers:
 
 ```
-odg optimize --budget-ratio 0.72 --optimizer dp_mckp --force
-odg optimize --budget-ratio 0.72 --optimizer greedy --force
+python3 cli.py optimize --budget-ratio 0.72 --optimizer dp_mckp --force
+python3 cli.py optimize --budget-ratio 0.72 --optimizer greedy --force
 ```
 
 Compare `totals.kld_tail` (DP) vs `estimate.predicted_mean_delta_kld`
