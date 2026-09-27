@@ -39,17 +39,18 @@ grid and optimized mean KLD only.
   columns are deleted pre-DP (needs measured tails; hard-errors on proxy
   rows; loud error if a group is emptied). DP, Pareto, and certificate run
   unchanged on the restricted problem.
-- **Size-estimate margin** (`optimizer.py`, `--size-margin`, default 1.09):
-  real exports run ~8–9% over estimates (single 270M-model calibration, bake
-  in more models when available). Inherited by both optimizers and all
-  budget ratios; visible in recipe/manifest.
+- **Size-estimate margin** (`optimizer.py`, hard-coded `SIZE_ESTIMATE_MARGIN`
+  = 1.09): real exports run ~8–9% over estimates (single 270M-model
+  calibration; replace with an empirically derived value or a better
+  estimator when available). Inherited by both optimizers and all budget
+  ratios; visible in recipe/manifest.
 - **Column generation** (`colgen.py`, new): floor-first probes, shadow-price
   pricing, monotone + Lipschitz bound model, termination certificate, and
   `exhaustive` mode for unconditional certification. Adaptive single-column
   batches (re-solve/re-price between probes) so early rounds don't degenerate
   into a full sweep.
 - **CLI** (`cli.py`): `--optimizer {greedy,dp_mckp}` (default `dp_mckp`),
-  `--kld-objective {tail_1pct,mean}`, `--tail-cap`, `--size-margin`,
+  `--kld-objective {tail_1pct,mean}`, `--tail-cap`,
   `--certificate {bounded,exhaustive}`,
   `--lipschitz`, `--jobs`, `--pareto-ratios`, `--probe-types`.
   All existing flags preserved.

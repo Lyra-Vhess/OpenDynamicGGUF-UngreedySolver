@@ -375,14 +375,6 @@ def main(argv: list[str] | None = None) -> int:
         help="P99 guardrail: drop (group, type) candidates whose measured tail "
         "exceeds KLD, under either objective (default: no guardrail)",
     )
-    p_opt.add_argument(
-        "--size-margin",
-        type=float,
-        default=None,
-        metavar="FACTOR",
-        help="Safety factor on size estimates (default: 1.09; single-model "
-        "calibration, re-calibrate per family)",
-    )
     p_opt.add_argument("--no-explain", action="store_true")
 
     # --- export (step 14) ---
@@ -2472,7 +2464,6 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         "jobs": getattr(args, "jobs", 1),
         "pareto_ratios": getattr(args, "pareto_ratios", None),
         "tail_cap": getattr(args, "tail_cap", None),
-        "size_margin": getattr(args, "size_margin", None),
     }
 
     pareto_ratios = None
@@ -2500,9 +2491,6 @@ def cmd_optimize(args: argparse.Namespace) -> int:
 
     try:
         with ui.working('Optimizing quant recipe…', explain=print_explain):
-            from optimizer import SIZE_ESTIMATE_MARGIN
-
-            size_margin = getattr(args, "size_margin", None)
             result = optimize_recipes(
                 model_ref=meta.model_ref,
                 out_dir=step_dir,
@@ -2523,10 +2511,6 @@ def cmd_optimize(args: argparse.Namespace) -> int:
                 pareto_ratios=pareto_ratios,
                 imatrix_groups=imatrix_groups,
                 tail_cap=getattr(args, "tail_cap", None),
-                size_margin=(
-                    size_margin if size_margin is not None
-                    else SIZE_ESTIMATE_MARGIN
-                ),
             )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "optimize", str(exc))

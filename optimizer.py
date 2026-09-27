@@ -50,7 +50,7 @@ DEFAULT_PINS: dict[str, str] = {
 #: Safety margin multiplied onto BYTES_PER_ELEM size estimates. Measured
 #: exports run ~8-9% over the raw estimate on the 270M test model (GGUF
 #: headers, alignment, quant-block overhead). Single-model calibration:
-#: re-calibrate per model family; override per run with --size-margin.
+#: re-calibrate per model family once multi-model data exists.
 SIZE_ESTIMATE_MARGIN = 1.09
 
 

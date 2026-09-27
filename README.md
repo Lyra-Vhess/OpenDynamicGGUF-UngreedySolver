@@ -716,7 +716,7 @@ v1 deliberately skips Bayesian optimization and evolutionary search: each object
 - **Column generation** — probes only the `(group, quant)` columns needed to certify optimality (floor type per group first, then attractive columns by upper-bound gain per byte), instead of a full sweep. `--certificate exhaustive` probes everything for an unconditional certificate.
 - **Termination certificate** — every recipe records which columns were probed, which were excluded, and the bound model (monotonicity + Lipschitz `L`, auto-calibrated unless `--lipschitz` is given). Check `attractive_at_termination: []` to verify certification.
 - **Pareto frontier** — falls out of the DP table for free; `pareto/*.yaml` covers the standard ratios plus any `--pareto-ratios` values.
-- **Size margin** — all size estimates are scaled by `--size-margin` (default `SIZE_ESTIMATE_MARGIN = 1.09`, calibrated on one 270M model: real exports run ~8–9% over estimates). Both optimizers and all budget ratios inherit it; recalibrate over more models when available.
+- **Size margin** — all size estimates are scaled by the hard-coded `SIZE_ESTIMATE_MARGIN = 1.09` (calibrated on one 270M model: real exports run ~8–9% over estimates). Both optimizers and all budget ratios inherit it; replace with an empirically derived value or a better estimator when available.
 - **A/B comparison** — `--optimizer greedy` keeps the legacy optimizer; `--jobs N` sets process-level probe parallelism.
 
 ### Stage 8 — Reproducible export
