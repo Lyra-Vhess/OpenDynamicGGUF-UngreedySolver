@@ -27,7 +27,11 @@ grid and optimized mean KLD only.
   on the search split, parsed via `kld.py`. Thread-pool parallelism via
   `--jobs`; binaries from PATH or `--llama-quantize`/`--llama-perplexity`.
   Verified on a 2-group x 2-type smoke test with monotonic, tail-above-mean
-  results.
+  results. The grid is per-group: each group is probed only at the types on
+  its own pins-aware ladder, so above-ladder types the DP could never choose
+  (Q8 for unpinned groups, below-floor types for pinned ones) are skipped
+  before any GPU work — 132 probes to 97 on the 270M pilot. A grid covering
+  nothing on some group's ladder is a hard error naming the group.
 - **DP MCKP solver** (`dp_mckp.py`, new): exact dynamic programming over the
   probed cost matrix, 1 MiB ceil bins (conservative: binned-feasible always
   fits the true budget). Full Pareto frontier falls out of one solve.
@@ -68,8 +72,8 @@ on a real sweep per the spec. Default is now `dp_mckp`.
 
 ## Test summary
 
-`python3 -m pytest tests/ -q` — 86 passed (2 new: auto-cap two-pass vs
-brute force, auto-cap proxy refusal). No new dependencies (`numpy`
+`python3 -m pytest tests/ -q` — 87 passed (1 new: per-group grids drop
+above-ladder probes, empty grid raises). No new dependencies (`numpy`
 only; the log parser is stdlib).
 
 ## Deviations from Spec.md

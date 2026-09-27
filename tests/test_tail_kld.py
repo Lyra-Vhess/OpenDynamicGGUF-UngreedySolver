@@ -127,3 +127,36 @@ def test_update_row_with_measured_kl():
     )
     assert row["kld_mean"] == pytest.approx(0.5)
     assert row["kld_tail_1pct"] == pytest.approx(3.0)
+
+
+def test_per_group_grids_drop_above_ladder():
+    from sensitivity import group_probe_grid, probe_groups_proxy
+
+    catalog = {
+        "tensors": {
+            "token_embd.weight": {"n_elements": 1000},
+            "blk.0.attn_q.weight": {"n_elements": 1000},
+        },
+        "groups": {
+            "embedding@global": {
+                "role": "embedding", "depth": "global", "quantizable": True,
+                "n_tensors": 1, "tensor_names": ["token_embd.weight"],
+            },
+            "attn_q@early": {
+                "role": "attn_q", "depth": "early", "quantizable": True,
+                "n_tensors": 1, "tensor_names": ["blk.0.attn_q.weight"],
+            },
+        },
+    }
+    grid = ["Q2_K", "Q4_K", "Q6_K", "Q8_0"]
+    emb = catalog["groups"]["embedding@global"]
+    assert group_probe_grid(emb, grid) == ["Q8_0"]  # floor above start
+    assert group_probe_grid(catalog["groups"]["attn_q@early"], grid) == [
+        "Q2_K", "Q4_K", "Q6_K"]  # Q8_0 dropped: DP could never choose it
+    rows = probe_groups_proxy(catalog, probe_types=grid, baseline_type="Q6_K")
+    assert len(rows) == 4  # 1 + 3, not 2 x 4
+    assert {r["probe"] for r in rows if r["group_id"] == "embedding@global"} == {"Q8_0"}
+
+    import pytest as _pt
+    with _pt.raises(ValueError, match="covers nothing"):
+        probe_groups_proxy(catalog, probe_types=["Q4_K"], baseline_type="Q6_K")

@@ -162,6 +162,48 @@ def tensor_type_regex(group: dict[str, Any]) -> str:
     return "(?:" + "|".join(re.escape(n) for n in names) + ")"
 
 
+def _qualifying_groups(
+    catalog: dict[str, Any],
+) -> list[tuple[str, dict[str, Any], int]]:
+    """(gid, group, n_elements) for quantizable non-empty groups, sorted."""
+    tensors = catalog.get("tensors") or {}
+    groups = catalog.get("groups") or {}
+    out = []
+    for gid, g in sorted(groups.items()):
+        if not g.get("quantizable", True):
+            continue
+        n_elem = _group_n_elements(g, tensors)
+        if n_elem <= 0:
+            continue
+        out.append((gid, g, n_elem))
+    return out
+
+
+def group_probe_grid(
+    group: dict[str, Any],
+    grid: list[str],
+    *,
+    start_type: str = BASELINE_TYPE,
+) -> list[str]:
+    """Intersect the global probe grid with the group's candidate ladder.
+
+    Pins only (no sensitivity-hint pass: hints only ever *narrow* ladders at
+    solve time, so the pins-only grid is a superset — over-probing, never
+    under-probing, and the DP firewall stays as backstop). Groups whose
+    floor sits above the start (e.g. embedding at Q8) keep just the floor.
+    Above-ladder types (e.g. Q8 for an unpinned group) are dropped: the DP
+    could never choose them, so measuring them is pure GPU waste.
+    """
+    from optimizer import DEFAULT_PINS, LADDER, _ladder_index
+
+    pins = dict(DEFAULT_PINS)
+    floor = pins.get(str(group.get("role") or ""), "Q2_K").upper()
+    lo = _ladder_index(start_type.upper())
+    hi = _ladder_index(floor)
+    ladder = [floor] if hi < lo else LADDER[lo : hi + 1]
+    return [q for q in grid if q.upper() in ladder]
+
+
 def probe_groups_proxy(
     catalog: dict[str, Any],
     *,
@@ -170,25 +212,28 @@ def probe_groups_proxy(
     imatrix_groups: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Return sensitivity rows for all quantizable groups × probe types.
+    Return sensitivity rows for all quantizable groups × probe types,
+    with the grid intersected per group (see group_probe_grid).
     """
     probe_types = probe_types or list(DEFAULT_PROBE_TYPES)
     tensors = catalog.get("tensors") or {}
-    groups = catalog.get("groups") or {}
     rows: list[dict[str, Any]] = []
+    grid_skipped = 0
 
-    for gid, g in sorted(groups.items()):
-        if not g.get("quantizable", True):
-            continue
-        n_elem = _group_n_elements(g, tensors)
-        if n_elem <= 0:
-            continue
+    for gid, g, n_elem in _qualifying_groups(catalog):
+        kept = group_probe_grid(g, probe_types, start_type=baseline_type)
+        grid_skipped += len(probe_types) - len(kept)
+        if not kept:
+            raise ValueError(
+                f"Probe grid {probe_types} covers nothing on {gid}'s ladder "
+                f"(role={g.get('role')}). Widen --probe-types."
+            )
         base_bytes = estimate_group_nbytes(n_elem, baseline_type)
         imp = None
         if imatrix_groups and gid in imatrix_groups:
             imp = float(imatrix_groups[gid].get("importance_mean") or 0.0)
 
-        for q in probe_types:
+        for q in kept:
             q_bytes = estimate_group_nbytes(n_elem, q)
             delta_bytes = base_bytes - q_bytes  # positive = smaller
             # If probing higher than baseline, bytes_saved may be negative
@@ -258,7 +303,9 @@ def probe_groups_llama(
     imatrix: str | Path | None = None,
     perplexity_args: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Measure every (quantizable group, probe type) with real tools.
+    """Measure (quantizable group, probe type) with real tools, where each
+    group's types are the global grid intersected with its own candidate
+    ladder (see group_probe_grid) — above-ladder probes are skipped, not run.
 
     Trial GGUF: everything at ``baseline_type`` except the group's tensors
     at the probe type. KL is measured vs the step-11 search-split base.
@@ -271,7 +318,6 @@ def probe_groups_llama(
 
     probe_types = probe_types or list(DEFAULT_PROBE_TYPES)
     tensors = catalog.get("tensors") or {}
-    groups = catalog.get("groups") or {}
     work = Path(work_dir)
     work.mkdir(parents=True, exist_ok=True)
 
@@ -287,12 +333,16 @@ def probe_groups_llama(
     )
 
     targets: list[tuple[str, dict[str, Any], str]] = []
-    for gid, g in sorted(groups.items()):
-        if not g.get("quantizable", True):
-            continue
-        if _group_n_elements(g, tensors) <= 0:
-            continue
-        for q in probe_types:
+    grid_skipped = 0
+    for gid, g, n_elem in _qualifying_groups(catalog):
+        kept = group_probe_grid(g, probe_types, start_type=baseline_type)
+        grid_skipped += len(probe_types) - len(kept)
+        if not kept:
+            raise ValueError(
+                f"Probe grid {probe_types} covers nothing on {gid}'s ladder "
+                f"(role={g.get('role')}). Widen --probe-types."
+            )
+        for q in kept:
             targets.append((gid, g, q))
 
     measured: dict[tuple[str, str], dict[str, Any]] = {}
@@ -355,6 +405,9 @@ def probe_groups_llama(
     baseline_absolute = {
         "kld_mean": base["kld_mean"],
         "kld_tail_1pct": base["kld_tail_1pct"],
+        # Columns skipped by per-group grids (above-ladder types the DP
+        # could never choose) — GPU probes not spent.
+        "grid_skipped": grid_skipped,
     }
     return rows, baseline_absolute
 
@@ -423,7 +476,8 @@ def build_sensitivity_table(
         method = "llama_probe"
         log.append(
             f"4. Measured groups={len({r['group_id'] for r in rows})} "
-            f"rows={len(rows)} baseline_mean={baseline_absolute['kld_mean']:.4f} "
+            f"rows={len(rows)} grid_skipped={baseline_absolute['grid_skipped']} "
+            f"baseline_mean={baseline_absolute['kld_mean']:.4f} "
             f"baseline_p99={baseline_absolute['kld_tail_1pct']:.4f}"
         )
         notes.append(
@@ -460,6 +514,10 @@ def build_sensitivity_table(
         baseline_type=baseline_type,
         imatrix_groups=imatrix_groups,
     )
+    grid_skipped = (
+        len(_qualifying_groups(catalog)) * len(probe_types) - len(rows)
+    )
+    log.append(f"4b. Per-group grids skipped {grid_skipped} above-ladder probes")
     return _finish_table(
         model_ref=model_ref, out_dir=out_dir, catalog=catalog,
         gguf_sha256=gguf_sha256, search_path=search_path,

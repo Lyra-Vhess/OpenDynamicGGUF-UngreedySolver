@@ -102,6 +102,13 @@ Notes:
   `--jobs N` parallelizes probes; binaries resolve from PATH or
   `--llama-quantize` / `--llama-perplexity`. A missing `99.0% KLD` line in
   any probe log is a hard error, not a skipped column.
+- The probe grid is per-group, not global: each group is probed only at
+  the types on its own candidate ladder (pins included). Above-ladder
+  types the DP could never choose (e.g. Q8 for unpinned groups,
+  everything below floor for pinned ones) are skipped before any GPU work
+  — on the 270M pilot this cut 132 probes to 97. The step log reports the
+  skipped count; a grid that covers nothing on some group's ladder is a
+  hard error naming the group (widen `--probe-types`).
 
 ## 3. Exhaustive re-run (certified final recipe)
 
