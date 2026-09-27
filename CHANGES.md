@@ -86,6 +86,13 @@ grid and optimized mean KLD only.
   tensor actually took the probe type in the trial file — the old silent
   no-match (bogus zero-delta rows) is a hard error instead. Stale
   trial-*.gguf files are cleared when probing starts.
+- **Whole-file budget accounting** (`optimizer.py`, `cli.py`): `--budget-mb`
+  is actual file bytes. Kept non-quantizable catalog bytes are counted into
+  every total (previously omitted); file overhead (freeze GGUF `data_offset`
+  + 4 KiB safety for export-added KV, measured in `cmd_optimize`, 0 with a
+  warning on fallback) is subtracted from the budget pre-solve and added
+  back everywhere; recipe/manifest/`OptimizeResult` carry a `budget` block
+  and the new fields. Over-budget floors fail loudly itemizing the parts.
 
 ## Deprecated (not removed)
 
@@ -94,9 +101,9 @@ on a real sweep per the spec. Default is now `dp_mckp`.
 
 ## Test summary
 
-`python3 -m pytest tests/ -q` — 109 passed (7 new: probe-effect assert
-×3, fixed-group DP/greedy accounting ×4). No new dependencies (`numpy`
-only; the log parser is stdlib).
+`python3 -m pytest tests/ -q` — 111 passed (9 new: probe-effect assert
+×3, fixed-group DP/greedy accounting ×4, kept/overhead accounting ×2). No
+new dependencies (`numpy` only; the log parser is stdlib).
 
 ## Deviations from Spec.md
 

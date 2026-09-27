@@ -200,10 +200,10 @@ bigger machine. DP/colgen logic is unchanged; only the cost-matrix values
 differ.
 
 **DP reports infeasible.** The error states the minimum achievable size and
-the largest minimum-size group. Causes: budget below the pin floor
-(embeddings/lm_head at Q8, attn_v at Q5 minimum) — now quoted *with* the
-1.09 size margin and 1 MiB per-group ceil waste, so pad the budget ~10–15%
-above the raw estimate. Fixes in order: raise `--budget-mb`, or re-run
+itemizes fixed + kept + overhead parts. Causes: budget below the floor of
+measured sizes plus non-quantizable kept bytes plus GGUF header/metadata
+overhead (~16 MB on tokenizer-heavy models — measured automatically from
+the freeze file). Fixes in order: raise `--budget-mb`, or re-run
 with `--no-pins` (accepts quality risk on pinned roles — not recommended
 for release).
 
