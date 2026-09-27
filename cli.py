@@ -267,6 +267,24 @@ def main(argv: list[str] | None = None) -> int:
         help="Baseline type for Δbytes (default: from run --quant profile)",
     )
     p_sens.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="Parallel trial probes (default: 1; llama mode only)",
+    )
+    p_sens.add_argument(
+        "--llama-quantize",
+        type=Path,
+        default=None,
+        help="Path to llama-quantize for trial quants (or set LLAMA_CPP_DIR)",
+    )
+    p_sens.add_argument(
+        "--llama-perplexity",
+        type=Path,
+        default=None,
+        help="Path to llama-perplexity for KL probes (or set LLAMA_CPP_DIR)",
+    )
+    p_sens.add_argument(
         "--quant",
         "-q",
         default=None,
@@ -2249,6 +2267,18 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
     search_path = store.step_path(meta.run_id, "corpus") / "search.txt"
     imatrix_proxy = store.step_path(meta.run_id, "imatrix") / "imatrix_proxy.json"
 
+    # Llama-mode probe inputs: frozen model GGUF + step-11 search KL cache.
+    model_gguf = freeze_out.get("gguf_path")
+    kl_base_bin = None
+    logits_manifest = store.step_path(meta.run_id, "reference_logits") / "logits_manifest.json"
+    if logits_manifest.is_file():
+        try:
+            kl_base_bin = (json.loads(logits_manifest.read_text()) or {}).get(
+                "logits_search_path"
+            )
+        except (OSError, ValueError):
+            kl_base_bin = None
+
     # Prefer proxy mode when llama requested but unavailable path
     mode = args.mode
     if mode == "auto":
@@ -2266,6 +2296,7 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
         "gguf_sha256": freeze_out.get("gguf_sha256"),
         "search_path": str(search_path),
         "n_catalog_groups": len(catalog.get("groups") or {}),
+        "jobs": args.jobs,
     }
 
     try:
@@ -2287,6 +2318,12 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
                 mode=mode,
                 probe_types=probe_types,
                 baseline_type=baseline,
+                model_gguf=model_gguf,
+                kl_base_bin=kl_base_bin,
+                trials_dir=step_dir / "trials",
+                jobs=args.jobs,
+                llama_quantize=args.llama_quantize,
+                llama_perplexity=args.llama_perplexity,
             )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "sensitivity", str(exc))

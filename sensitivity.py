@@ -10,8 +10,6 @@ import json
 from pathlib import Path
 from typing import Any, Literal
 
-from kld import PROXY_TAIL_MULTIPLIER, proxy_tail_from_mean, update_row_with_kld_array
-
 
 # --- from sensitivity/types.py ---
 @dataclass
@@ -218,13 +216,11 @@ def probe_groups_proxy(
                     "bytes_probe": q_bytes,
                     "delta_bytes": delta_bytes,
                     "delta_kld": delta_kld,
-                    # Spec 2.1/2.2: every probe stores mean + tail-1% KLD.
-                    # Proxy mode has no per-token array; tail is the
-                    # provisional PROXY_TAIL_MULTIPLIER estimate (see kld.py).
-                    # Real llama probes overwrite these via
-                    # kld.update_row_with_kld_array(row, k_array).
+                    # kld_mean is a feature estimate; kld_tail_1pct is None
+                    # (no fake tail: the DP tail objective refuses unmeasured
+                    # columns loudly — run mode=llama for measured tails).
                     "kld_mean": delta_kld,
-                    "kld_tail_1pct": proxy_tail_from_mean(delta_kld),
+                    "kld_tail_1pct": None,
                     "n_tokens": None,
                     "top_token_agree": max(0.0, 1.0 - 2.5 * delta_kld),
                     "efficiency": score,
@@ -247,6 +243,122 @@ def _load_imatrix_groups(proxy_path: Path | None) -> dict[str, Any] | None:
     return data.get("groups")
 
 
+def probe_groups_llama(
+    catalog: dict[str, Any],
+    *,
+    model_gguf: str | Path,
+    search_txt: str | Path,
+    kl_base_bin: str | Path,
+    probe_types: list[str] | None = None,
+    baseline_type: str = BASELINE_TYPE,
+    work_dir: str | Path,
+    jobs: int = 1,
+    llama_quantize: str | Path | None = None,
+    llama_perplexity: str | Path | None = None,
+    imatrix: str | Path | None = None,
+    perplexity_args: list[str] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Measure every (quantizable group, probe type) with real tools.
+
+    Trial GGUF: everything at ``baseline_type`` except the group's tensors
+    at the probe type. KL is measured vs the step-11 search-split base.
+    Rows store *deltas* vs one all-baseline anchor run. Returns
+    ``(rows, baseline_absolute)``. Any tool failure raises (hard error).
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from llama_probe import measure_column
+
+    probe_types = probe_types or list(DEFAULT_PROBE_TYPES)
+    tensors = catalog.get("tensors") or {}
+    groups = catalog.get("groups") or {}
+    work = Path(work_dir)
+    work.mkdir(parents=True, exist_ok=True)
+
+    log_ctx = {
+        "model_gguf": model_gguf, "search_txt": search_txt,
+        "kl_base_bin": kl_base_bin, "baseline_type": baseline_type,
+        "work_dir": work, "llama_quantize": llama_quantize,
+        "llama_perplexity": llama_perplexity, "imatrix": imatrix,
+        "perplexity_args": perplexity_args,
+    }
+    base = measure_column(
+        group_regex=None, probe_type=baseline_type, tag="baseline", **log_ctx
+    )
+
+    targets: list[tuple[str, dict[str, Any], str]] = []
+    for gid, g in sorted(groups.items()):
+        if not g.get("quantizable", True):
+            continue
+        if _group_n_elements(g, tensors) <= 0:
+            continue
+        for q in probe_types:
+            targets.append((gid, g, q))
+
+    measured: dict[tuple[str, str], dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=max(1, int(jobs))) as ex:
+        futs = {
+            ex.submit(
+                measure_column,
+                group_regex=tensor_type_regex(g),
+                probe_type=q,
+                tag=f"{gid}-{q}".replace("@", "_").replace("/", "_"),
+                **log_ctx,
+            ): (gid, q)
+            for gid, g, q in targets
+        }
+        for fut in as_completed(futs):
+            gid, q = futs[fut]
+            measured[(gid, q)] = fut.result()  # raises on failure: hard error
+
+    rows: list[dict[str, Any]] = []
+    for gid, g, q in targets:
+        m = measured[(gid, q)]
+        n_elem = _group_n_elements(g, tensors)
+        base_bytes = estimate_group_nbytes(n_elem, baseline_type)
+        q_bytes = estimate_group_nbytes(n_elem, q)
+        delta_bytes = base_bytes - q_bytes
+        delta_kld = float(m["kld_mean"]) - float(base["kld_mean"])
+        delta_tail = float(m["kld_tail_1pct"]) - float(base["kld_tail_1pct"])
+        eps = 1e-6
+        score = (delta_bytes / max(delta_kld, eps)) if delta_bytes > 0 else 0.0
+        hint = "compress" if score > 5e7 and delta_kld < 0.03 else (
+            "pin_high" if delta_kld > 0.04 else "neutral"
+        )
+        rows.append(
+            {
+                "group_id": gid,
+                "role": g.get("role"),
+                "depth": g.get("depth"),
+                "probe": q,
+                "baseline": baseline_type,
+                "n_elements": n_elem,
+                "n_tensors": g.get("n_tensors"),
+                "bytes_baseline": base_bytes,
+                "bytes_probe": q_bytes,
+                "delta_bytes": delta_bytes,
+                "delta_kld": delta_kld,
+                "kld_mean": delta_kld,
+                "kld_tail_1pct": delta_tail,
+                "n_tokens": None,
+                "kld_p999": m.get("kld_p999"),
+                "same_top_p": m.get("same_top_p"),
+                "perplexity": m.get("perplexity"),
+                "top_token_agree": max(0.0, 1.0 - 2.5 * delta_kld),
+                "efficiency": score,
+                "decision_hint": hint,
+                "tensor_type_regex": tensor_type_regex(g),
+                "method": "llama_probe",
+                "split": "search",
+            }
+        )
+    baseline_absolute = {
+        "kld_mean": base["kld_mean"],
+        "kld_tail_1pct": base["kld_tail_1pct"],
+    }
+    return rows, baseline_absolute
+
+
 def build_sensitivity_table(
     *,
     model_ref: str,
@@ -258,6 +370,15 @@ def build_sensitivity_table(
     mode: Mode = "auto",
     probe_types: list[str] | None = None,
     baseline_type: str = BASELINE_TYPE,
+    # llama-mode inputs (required when mode="llama"):
+    model_gguf: str | Path | None = None,
+    kl_base_bin: str | Path | None = None,
+    trials_dir: str | Path | None = None,
+    jobs: int = 1,
+    llama_quantize: str | Path | None = None,
+    llama_perplexity: str | Path | None = None,
+    imatrix_gguf: str | Path | None = None,
+    perplexity_args: list[str] | None = None,
 ) -> tuple[SensitivityResult, list[dict[str, Any]]]:
     """
     Write sensitivity.json (+ summary). Returns (result, rows).
@@ -271,13 +392,50 @@ def build_sensitivity_table(
     log.append(f"1. Probe types={probe_types} baseline={baseline_type}")
     log.append("2. Split=search only (heldout forbidden)")
 
-    # Real llama probing is not implemented without binaries + logits caches;
-    # auto falls back to proxy (same as previous steps).
     if mode == "llama":
-        raise RuntimeError(
-            "llama probe mode requires llama-quantize + llama-perplexity + "
-            "logits-search.bin. Install llama.cpp, run reference-logits --mode llama, "
-            "then re-try. For now use --mode proxy or auto."
+        if model_gguf is None or not Path(model_gguf).is_file():
+            raise RuntimeError(
+                "llama probe mode needs the frozen GGUF (step 09). "
+                f"Got model_gguf={model_gguf!r}."
+            )
+        if kl_base_bin is None or not Path(kl_base_bin).is_file():
+            raise RuntimeError(
+                "llama probe mode needs logits-search.bin (step 11 --mode llama). "
+                f"Got kl_base_bin={kl_base_bin!r}."
+            )
+        if not search_path or not Path(search_path).is_file():
+            raise RuntimeError("llama probe mode needs search.txt (step 07).")
+        log.append("3. mode=llama — trial quant + perplexity per (group, type)")
+        rows, baseline_absolute = probe_groups_llama(
+            catalog,
+            model_gguf=model_gguf,
+            search_txt=search_path,
+            kl_base_bin=kl_base_bin,
+            probe_types=probe_types,
+            baseline_type=baseline_type,
+            work_dir=trials_dir or (out_dir / "trials"),
+            jobs=jobs,
+            llama_quantize=llama_quantize,
+            llama_perplexity=llama_perplexity,
+            imatrix=imatrix_gguf,
+            perplexity_args=perplexity_args,
+        )
+        method = "llama_probe"
+        log.append(
+            f"4. Measured groups={len({r['group_id'] for r in rows})} "
+            f"rows={len(rows)} baseline_mean={baseline_absolute['kld_mean']:.4f} "
+            f"baseline_p99={baseline_absolute['kld_tail_1pct']:.4f}"
+        )
+        notes.append(
+            "Measured per-group trial quants vs the step-11 search KL base; "
+            "rows are deltas vs the all-baseline anchor run."
+        )
+        return _finish_table(
+            model_ref=model_ref, out_dir=out_dir, catalog=catalog,
+            gguf_sha256=gguf_sha256, search_path=search_path,
+            probe_types=probe_types, baseline_type=baseline_type,
+            method=method, log=log, notes=notes, rows=rows,
+            baseline_absolute=baseline_absolute,
         )
 
     method = "proxy_from_features"
@@ -302,6 +460,37 @@ def build_sensitivity_table(
         baseline_type=baseline_type,
         imatrix_groups=imatrix_groups,
     )
+    return _finish_table(
+        model_ref=model_ref, out_dir=out_dir, catalog=catalog,
+        gguf_sha256=gguf_sha256, search_path=search_path,
+        probe_types=probe_types, baseline_type=baseline_type,
+        method=method, log=log, notes=notes, rows=rows,
+        baseline_absolute=None,
+        extra_notes=[
+            "proxy_from_features estimates ΔKLD — not measured. "
+            "Production needs llama-quantize trial + perplexity --kl-divergence on search.",
+            "Held-out must not be used in this step.",
+        ],
+    )
+
+
+def _finish_table(
+    *,
+    model_ref: str,
+    out_dir: Path,
+    catalog: dict[str, Any],
+    gguf_sha256: str | None,
+    search_path: str | Path | None,
+    probe_types: list[str],
+    baseline_type: str,
+    method: str,
+    log: list[str],
+    notes: list[str],
+    rows: list[dict[str, Any]],
+    baseline_absolute: dict[str, Any] | None,
+    extra_notes: list[str] | None = None,
+) -> tuple[SensitivityResult, list[dict[str, Any]]]:
+    """Rank rows, write sensitivity.json, build the result (shared tail)."""
     groups_probed = len({r["group_id"] for r in rows})
     log.append(f"5. Probed groups={groups_probed} rows={len(rows)}")
 
@@ -317,11 +506,10 @@ def build_sensitivity_table(
     ]
     pinned = sorted(pinned, key=lambda r: r["delta_kld"], reverse=True)[:10]
 
-    notes.append(
-        "proxy_from_features estimates ΔKLD — not measured. "
-        "Production needs llama-quantize trial + perplexity --kl-divergence on search."
-    )
-    notes.append("Held-out must not be used in this step.")
+    if extra_notes:
+        notes.extend(extra_notes)
+    else:
+        notes.append("Held-out must not be used in this step.")
 
     table = {
         "model_ref": model_ref,
@@ -337,6 +525,8 @@ def build_sensitivity_table(
         "pinned_hints": pinned,
         "notes": notes,
     }
+    if baseline_absolute is not None:
+        table["baseline_kl"] = baseline_absolute
     (out_dir / "sensitivity.json").write_text(
         json.dumps(table, indent=2) + "\n", encoding="utf-8"
     )

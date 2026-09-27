@@ -10,12 +10,24 @@ grid and optimized mean KLD only.
 
 ## What changed
 
-- **Tail-KLD objective** (`kld.py`, new): `kld_tail_1pct` = mean KLD over the
-  worst 1% of scored tokens via `numpy.partition` (no full sort); `kld_mean`
-  still reported. Every sensitivity row now stores `kld_mean`,
-  `kld_tail_1pct`, `n_tokens`. Proxy-mode rows use a provisional `mean x 8`
-  tail until per-token dumps land (needs a minimal `--kld-output` patch to
-  `llama-perplexity`, documented in `kld.py`).
+- **Tail-KLD objective** (`kld.py`, new): `kld_tail_1pct` = the `99.0% KLD`
+  percentile line of a stock `llama-perplexity --kl-divergence` run — the
+  threshold above which the worst 1% of tokens sit. No upstream C++ patch:
+  the spec's exact top-1% mean needs a per-token dump the stock binary does
+  not emit, and P99 targets the same tail conservatively (top-1% mean is
+  always >= P99). `kld_mean` still reported. Every sensitivity row stores
+  `kld_mean`, `kld_tail_1pct`, `n_tokens`. Proxy-mode rows carry
+  `kld_tail_1pct = None` (no estimate); the DP tail objective refuses them
+  with a hard error. A missing `99.0% KLD` line is likewise a hard error,
+  never a silent fallback.
+- **Measured per-group probes** (`llama_probe.py`, new; `sensitivity.py`):
+  `--mode llama` on step 12 now really measures: one trial quantize per
+  probed `(group, type)` (single-group `--tensor-type-file` override,
+  all-baseline anchor for deltas), perplexity against the step-11 KL base
+  on the search split, parsed via `kld.py`. Thread-pool parallelism via
+  `--jobs`; binaries from PATH or `--llama-quantize`/`--llama-perplexity`.
+  Verified on a 2-group x 2-type smoke test with monotonic, tail-above-mean
+  results.
 - **DP MCKP solver** (`dp_mckp.py`, new): exact dynamic programming over the
   probed cost matrix, 1 MiB ceil bins (conservative: binned-feasible always
   fits the true budget). Full Pareto frontier falls out of one solve.
@@ -40,8 +52,8 @@ on a real sweep per the spec. Default is now `dp_mckp`.
 
 ## Test summary
 
-`python3 -m pytest tests/ -q` — 77 passed (21 new: 8 tail-KLD, 5 DP,
-4 colgen, 4 optimize-integration). No new dependencies (`numpy` only).
+`python3 -m pytest tests/ -q` — 80 passed. No new dependencies (`numpy`
+only; the log parser is stdlib).
 
 ## Deviations from Spec.md
 

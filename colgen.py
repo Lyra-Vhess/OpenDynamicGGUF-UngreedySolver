@@ -243,11 +243,19 @@ def run_column_generation(
     def do_probe(g: str, q: str) -> None:
         nonlocal n_probed
         m = probe_fn(g, q)
-        tails[(g, q)] = float(m["kld_tail_1pct"])
-        means[(g, q)] = float(m["kld_mean"])
+        t = m.get("kld_tail_1pct")
+        tails[(g, q)] = None if t is None else float(t)
+        c = m.get("kld_mean")
+        means[(g, q)] = None if c is None else float(c)
         ntoks[(g, q)] = m.get("n_tokens")
         probed[g].append(q)
         n_probed += 1
+        if objective == "tail" and tails[(g, q)] is None:
+            raise ValueError(
+                f"tail objective needs a measured kld_tail_1pct for "
+                f"({g}, {q}); probe_fn returned None. Measure the column "
+                f"(step 12 --mode llama) instead of estimating it."
+            )
 
     # Initial columns: floor probe per group (mandatory baseline).
     for g in groups:
@@ -356,11 +364,13 @@ def run_column_generation(
         "attractive_at_termination": [],
     }
     alloc = solution["allocation"]
+    alloc_tails = [tails[(g, alloc[g])] for g in groups]
+    alloc_means = [means[(g, alloc[g])] for g in groups]
     return {
         "allocation": alloc,
         "objective": objective,
-        "total_tail_kld": solution["total_tail_kld"],
-        "total_mean_kld": sum(means[(g, alloc[g])] for g in groups),
+        "total_tail_kld": sum(alloc_tails) if all(t is not None for t in alloc_tails) else None,
+        "total_mean_kld": sum(alloc_means) if all(c is not None for c in alloc_means) else None,
         "total_bytes": solution["total_bytes"],
         "budget_bytes": budget_bytes,
         "bin_bytes": bin_bytes,

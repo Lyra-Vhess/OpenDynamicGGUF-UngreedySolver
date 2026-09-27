@@ -34,11 +34,38 @@ def tiny_sensitivity(catalog):
     return {"method": "proxy_from_features", "rows": rows}
 
 
+def tiny_measured_sensitivity(catalog):
+    """Proxy rows stamped with stand-in *measured* tails (as step 12
+    --mode llama would produce via update_row_with_measured_kl), extended
+    to the full Q6..Q2 ladder so the tail firewall is satisfied."""
+    import copy
+
+    sens = tiny_sensitivity(catalog)
+    have = {(r["group_id"], r["probe"]) for r in sens["rows"]}
+    extra = []
+    for r in sens["rows"]:
+        if r["probe"] != "Q4_K":
+            continue
+        for q, mult in (("Q3_K", 1.5), ("Q2_K", 2.5)):
+            if (r["group_id"], q) in have:
+                continue
+            c = copy.deepcopy(r)
+            c["probe"] = q
+            c["delta_kld"] = float(r["delta_kld"]) * mult
+            extra.append(c)
+    sens["rows"] = sens["rows"] + extra
+    for r in sens["rows"]:
+        r["kld_tail_1pct"] = float(r["delta_kld"]) * 8.0
+        r["n_tokens"] = 1000
+    sens["method"] = "llama_probe"
+    return sens
+
+
 def test_dp_is_default_and_emits_certificate(tmp_path):
     catalog = tiny_catalog()
     res = optimize_recipes(
         model_ref="test", out_dir=tmp_path / "dp", catalog=catalog,
-        sensitivity=tiny_sensitivity(catalog), budget_ratio=0.8,
+        sensitivity=tiny_measured_sensitivity(catalog), budget_ratio=0.8,
     )
     assert res.optimizer == "dp_mckp"
     assert res.method == "dp_mckp_colgen_v1"
@@ -55,6 +82,16 @@ def test_dp_is_default_and_emits_certificate(tmp_path):
     manifest = json.loads((tmp_path / "dp" / "optimize_manifest.json").read_text())
     assert manifest["primary"]["certificate"]["attractive_at_termination"] == []
     assert manifest["jobs"] == 1
+
+
+def test_dp_tail_refuses_proxy_rows(tmp_path):
+    """Tail objective hard-errors on unmeasured columns (user decision b)."""
+    catalog = tiny_catalog()
+    with pytest.raises(ValueError, match="measured kld_tail_1pct"):
+        optimize_recipes(
+            model_ref="test", out_dir=tmp_path / "refuse", catalog=catalog,
+            sensitivity=tiny_sensitivity(catalog), budget_ratio=0.8,
+        )
 
 
 def test_greedy_path_unchanged(tmp_path):
@@ -82,6 +119,8 @@ def test_dp_options_plumbed(tmp_path):
     assert res.kld_objective == "mean"
     assert res.certificate["mode"] == "exhaustive"
     assert res.certificate["excluded_columns"] == 0
+    assert res.total_tail_kld is None  # proxy rows carry no measured tail
+    assert res.total_mean_kld is not None
     manifest = json.loads((tmp_path / "ex" / "optimize_manifest.json").read_text())
     assert manifest["jobs"] == 2
     assert len(manifest["pareto"]) == 3  # 0.7, 1.0 + primary budget

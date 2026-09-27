@@ -90,10 +90,18 @@ Notes:
   role per depth band, plus global embedding/lm_head). Bounded mode probes
   ~|G| floor columns first, then only attractive columns — far fewer than
   the full |G| x |Q| sweep.
-- Per-token KLD requires a `llama-perplexity` build with the minimal
-  `--kld-output <file>` patch (dumps the internal `kld_values` array; see
-  `kld.py` header). Without it, rows carry the provisional proxy tail
-  (`mean x 8`) and `n_tokens` is null — good for plumbing, not for release.
+- No patched binaries needed: the stock `llama-perplexity --kl-divergence`
+  run prints a `99.0% KLD` percentile line, and that is the tail metric
+  (the threshold above which the worst 1% of tokens sit; see `kld.py`).
+  Proxy-mode rows carry no tail (`kld_tail_1pct` is null) and the DP tail
+  objective refuses them with a hard error pointing at
+  `sensitivity --mode llama` — there is no silent estimate anywhere.
+- Step 12 in llama mode quantizes one trial GGUF per probed
+  `(group, type)` and runs perplexity against the step-11 KL base on the
+  search split. Trials land under the step directory (`trials/`).
+  `--jobs N` parallelizes probes; binaries resolve from PATH or
+  `--llama-quantize` / `--llama-perplexity`. A missing `99.0% KLD` line in
+  any probe log is a hard error, not a skipped column.
 
 ## 3. Exhaustive re-run (certified final recipe)
 

@@ -295,11 +295,12 @@ def dp_mckp_optimize(
     """Optimize via column generation + DP MCKP (Spec 2.3/2.4).
 
     Sizes come from the catalog (no probe needed); KLD comes from
-    sensitivity rows when present, else the same proxy estimator the
-    rows themselves use (proxy scaffolding until llama probes land).
+    sensitivity rows. Hard rule: the tail objective needs a *measured*
+    ``kld_tail_1pct`` on every column it touches — proxy rows (tail None)
+    raise loudly instead of being silently invented. The mean objective
+    still accepts proxy ``kld_mean`` estimates for missing rows.
     """
     from colgen import run_column_generation
-    from kld import proxy_tail_from_mean
     from sensitivity import _proxy_delta_kld
 
     groups_t = catalog.get("groups") or {}
@@ -324,10 +325,23 @@ def dp_mckp_optimize(
                 "kld_tail_1pct": float(row["kld_tail_1pct"]),
                 "n_tokens": row.get("n_tokens"),
             }
+        if objective != "mean":
+            have = "a proxy row with no measured tail" if row is not None else "no row at all"
+            raise ValueError(
+                f"tail-KLD objective needs a measured kld_tail_1pct for "
+                f"({gid}, {q}) but there is {have}. Run step 12 with "
+                f"--mode llama (trial quant + perplexity on the search split) "
+                f"so every column is measured; proxy estimates are refused."
+            )
+        if row is not None:
+            return {
+                "kld_mean": float(row.get("kld_mean", row.get("delta_kld") or 0.0)),
+                "kld_tail_1pct": None,
+                "n_tokens": row.get("n_tokens"),
+            }
         g = groups_t.get(gid) or {}
         mean = _proxy_delta_kld(g, tensors, q, imatrix_group_importance=imatrix_imp(gid))
-        return {"kld_mean": mean, "kld_tail_1pct": proxy_tail_from_mean(mean),
-                "n_tokens": None}
+        return {"kld_mean": mean, "kld_tail_1pct": None, "n_tokens": None}
 
     size_bytes = {
         (gid, q): estimate_group_nbytes(_group_n_elements(groups_t[gid], tensors), q)
@@ -575,13 +589,17 @@ def _optimize_dp_mckp(
     alloc: dict[str, str] = dp["allocation"]
     cert = dp["certificate"]
     cost_matrix = dp["cost_matrix"]
-    total_tail = float(dp["total_tail_kld"])
-    total_mean = float(dp["total_mean_kld"])
+    total_tail = dp["total_tail_kld"]
+    total_mean = dp["total_mean_kld"]
     groups = catalog.get("groups") or {}
     method = "dp_mckp_colgen_v1"
+
+    def _fmt(v: Any) -> str:
+        return "None" if v is None else f"{float(v):.4f}"
+
     log.append(
         f"4. Primary recipe size={dp['total_bytes']} "
-        f"tail={total_tail:.4f} mean={total_mean:.4f} "
+        f"tail={_fmt(total_tail)} mean={_fmt(total_mean)} "
         f"rounds={dp['rounds']} probed={cert['probed_columns']} "
         f"excluded={cert['excluded_columns']} lambda={cert['shadow_price_lambda']:.6g}"
     )
@@ -624,7 +642,11 @@ def _optimize_dp_mckp(
         if e["probed"]
     }
     p_mean = {(e["group"], e["type"]): float(e["kld_mean"]) for e in cost_matrix["entries"] if e["probed"]}
-    p_tail = {(e["group"], e["type"]): float(e["kld_tail"]) for e in cost_matrix["entries"] if e["probed"]}
+    p_tail = {
+        (e["group"], e["type"]): (None if e["kld_tail"] is None else float(e["kld_tail"]))
+        for e in cost_matrix["entries"]
+        if e["probed"]
+    }
     pareto_paths: list[str] = []
     pareto_summary = []
     pareto_points = []
@@ -644,9 +666,8 @@ def _optimize_dp_mckp(
         ahash = allocation_hash(alt["allocation"])
         name = f"pareto-{i:02d}-{b // 1024}k.yaml"
         alt_mean = sum(p_mean[(g, alt["allocation"][g])] for g in p_groups)
-        alt_tail = float(alt["total_tail_kld"]) if obj == "tail" else sum(
-            p_tail[(g, alt["allocation"][g])] for g in p_groups
-        )
+        alt_tails = [p_tail[(g, alt["allocation"][g])] for g in p_groups]
+        alt_tail = sum(alt_tails) if all(t is not None for t in alt_tails) else None
         y = render_recipe_yaml(
             model_ref=model_ref,
             hf_repo_id=hf_repo_id,
