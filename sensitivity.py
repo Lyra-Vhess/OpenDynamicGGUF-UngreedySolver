@@ -10,6 +10,8 @@ import json
 from pathlib import Path
 from typing import Any, Literal
 
+from kld import PROXY_TAIL_MULTIPLIER, proxy_tail_from_mean, update_row_with_kld_array
+
 
 # --- from sensitivity/types.py ---
 @dataclass
@@ -216,6 +218,14 @@ def probe_groups_proxy(
                     "bytes_probe": q_bytes,
                     "delta_bytes": delta_bytes,
                     "delta_kld": delta_kld,
+                    # Spec 2.1/2.2: every probe stores mean + tail-1% KLD.
+                    # Proxy mode has no per-token array; tail is the
+                    # provisional PROXY_TAIL_MULTIPLIER estimate (see kld.py).
+                    # Real llama probes overwrite these via
+                    # kld.update_row_with_kld_array(row, k_array).
+                    "kld_mean": delta_kld,
+                    "kld_tail_1pct": proxy_tail_from_mean(delta_kld),
+                    "n_tokens": None,
                     "top_token_agree": max(0.0, 1.0 - 2.5 * delta_kld),
                     "efficiency": score,
                     "decision_hint": hint,
