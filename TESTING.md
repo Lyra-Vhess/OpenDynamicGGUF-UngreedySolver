@@ -75,6 +75,7 @@ the search split during probing.
 
 ```
 python3 cli.py run --model <gemma-e4b-ref> --quant q4_k_m --no-ask --until sensitivity
+python3 cli.py reband
 python3 cli.py sensitivity --mode llama --force
 python3 cli.py optimize --budget-ratio 0.72 --jobs 2
 ```
@@ -97,6 +98,11 @@ Notes:
   role per depth band, plus global embedding/lm_head). Bounded mode probes
   ~|G| floor columns first, then only attractive columns — far fewer than
   the full |G| x |Q| sweep.
+- `odg reband` (step 11b) re-cuts each role's layers into bands on
+  measured importance cliffs (exact Fisher-Jenks segmentation over real
+  `imatrix.gguf` per-channel stats, proxy fallback) instead of hard
+  thirds — same band count, only boundaries move. `sensitivity` uses the
+  rebanded catalog automatically when present and warns if it went stale.
 - No patched binaries needed: the stock `llama-perplexity --kl-divergence`
   run prints a `99.0% KLD` percentile line, and that is the tail metric
   (the threshold above which the worst 1% of tokens sit; see `kld.py`).

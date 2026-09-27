@@ -275,6 +275,22 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_lg.add_argument("--no-explain", action="store_true")
 
+    # --- reband (step 11b) ---
+    p_reband = sub.add_parser(
+        "reband",
+        help="Step 11b: re-cut depth bands by imatrix importance (Fisher-Jenks)",
+    )
+    p_reband.add_argument("--model", "-m", default=None)
+    p_reband.add_argument("--run", default=None)
+    p_reband.add_argument("--force", action="store_true")
+    p_reband.add_argument(
+        "--bands-per-role",
+        type=int,
+        default=3,
+        help="Contiguous bands per role (default 3, same count as thirds)",
+    )
+    p_reband.add_argument("--no-explain", action="store_true")
+
     # --- sensitivity (step 12) ---
     p_sens = sub.add_parser(
         "sensitivity",
@@ -668,6 +684,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_imatrix(args)
     if args.command == "reference-logits":
         return cmd_reference_logits(args)
+    if args.command == "reband":
+        return cmd_reband(args)
     if args.command == "sensitivity":
         return cmd_sensitivity(args)
     if args.command == "optimize":
@@ -755,6 +773,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         ("activation_features", cmd_activation_features),
         ("freeze_gguf", cmd_freeze_gguf),
         ("imatrix", cmd_imatrix),
+        ("reband", cmd_reband),
         ("reference_logits", cmd_reference_logits),
         ("sensitivity", cmd_sensitivity),
         ("optimize", cmd_optimize),
@@ -838,6 +857,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             # shared mode knobs
             mode="auto",
             max_docs=32,
+            bands_per_role=3,
             convert_script=None,
             require_bf16=False,
             llama_imatrix=None,
@@ -2124,6 +2144,154 @@ def cmd_imatrix(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reband(args: argparse.Namespace) -> int:
+    from reband import BANDS_PER_ROLE, reband_catalog
+    from store import StepAlreadyDone
+
+    print_explain = not args.no_explain
+    store = _store(args)
+
+    try:
+        meta = _require_run(store, model=args.model, run_id=args.run)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if not store.is_step_done(meta.run_id, "imatrix"):
+        print(
+            "ERROR: Step 10 (imatrix) is not done.\n"
+            f"  Run: odg imatrix --model {meta.model_ref}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if print_explain:
+        ui.step_banner(
+            11,
+            "Imatrix re-banding (11b)",
+            model=meta.model_ref,
+            run_id=meta.run_id,
+            root=str(meta.root),
+            goal="Re-cut role@depth bands on measured importance cliffs.",
+            bullets=[
+                "Reads tensor_catalog.json + imatrix_proxy.json.",
+                "Same band count per role as thirds; only boundaries move.",
+            ],
+            explain=True,
+        )
+
+    if store.is_step_done(meta.run_id, "reband") and not args.force:
+        out = store.read_step_output(meta.run_id, "reband")
+        ui.already_done(
+            11,
+            "reband",
+            run_id=meta.run_id,
+            path=store.step_path(meta.run_id, "reband"),
+            output=out,
+            summary=store.summary(meta.run_id) if print_explain else None,
+            explain=print_explain,
+        )
+        return 0
+
+    catalog = None
+    for step_id in ("activation_features", "weight_features", "catalog"):
+        cpath = store.step_path(meta.run_id, step_id) / "tensor_catalog.json"
+        if cpath.is_file():
+            catalog = json.loads(cpath.read_text())
+            break
+    if not catalog:
+        print("ERROR: tensor_catalog.json not found", file=sys.stderr)
+        return 1
+    proxy_path = store.step_path(meta.run_id, "imatrix") / "imatrix_proxy.json"
+    if not proxy_path.is_file():
+        print(f"ERROR: missing {proxy_path}", file=sys.stderr)
+        return 1
+    proxy = json.loads(proxy_path.read_text())
+    if not (proxy.get("tensors") or {}):
+        print(
+            "ERROR: imatrix_proxy.json has no per-tensor importance; "
+            "reband needs per-tensor scores.",
+            file=sys.stderr,
+        )
+        return 1
+
+    bands = int(getattr(args, "bands_per_role", None) or BANDS_PER_ROLE)
+    if bands < 1:
+        print("ERROR: --bands-per-role must be >= 1", file=sys.stderr)
+        return 1
+
+    # Real per-channel stats preferred; proxy per-tensor fallback inside.
+    imatrix_gguf = store.step_path(meta.run_id, "imatrix") / "imatrix.gguf"
+    imatrix_gguf_arg = str(imatrix_gguf) if imatrix_gguf.is_file() else None
+
+    input_data = {
+        "from_steps": ["imatrix", "activation_features"],
+        "bands_per_role": bands,
+        "imatrix_gguf": imatrix_gguf_arg,
+        "n_groups_before": len(catalog.get("groups") or {}),
+    }
+    try:
+        step_dir = store.begin_step(
+            meta.run_id, "reband", input_data, force=args.force
+        )
+    except StepAlreadyDone:
+        return cmd_reband(args)
+
+    try:
+        with ui.working('Re-banding depth groups…', explain=print_explain):
+            new_catalog, report = reband_catalog(
+                catalog, proxy, bands_per_role=bands,
+                imatrix_gguf=imatrix_gguf_arg,
+            )
+    except Exception as exc:  # noqa: BLE001
+        store.fail_step(meta.run_id, "reband", str(exc))
+        ui.error(11, "reband", exc, store.step_path(meta.run_id, "reband"))
+        return 1
+
+    (step_dir / "tensor_catalog.json").write_text(
+        json.dumps(new_catalog, indent=2) + "\n", encoding="utf-8"
+    )
+    (step_dir / "reband_report.json").write_text(
+        json.dumps(report, indent=2) + "\n", encoding="utf-8"
+    )
+    payload = {
+        "n_groups_before": report["n_groups_before"],
+        "n_groups_after": report["n_groups_after"],
+        "score_source": report["score_source"],
+        "roles_rebanded": report["roles_rebanded"],
+        "skipped_roles": report["skipped_roles"],
+        "boundaries": report["boundaries"],
+        "catalog_sha256": report["catalog_sha256"],
+    }
+    log_text = (
+        f"rebanded {report['n_groups_before']} -> "
+        f"{report['n_groups_after']} groups "
+        f"({len(report['roles_rebanded'])} roles)\n"
+    )
+    store.complete_step(
+        meta.run_id, "reband", payload, log_text=log_text,
+        extra_artifacts={
+            "tensor_catalog.json": json.dumps(new_catalog, indent=2).encode()
+            + b"\n",
+            "reband_report.json": json.dumps(report, indent=2).encode()
+            + b"\n",
+        },
+    )
+    if print_explain:
+        ui.checkpoint_saved(
+            run_id=meta.run_id,
+            step_dir=step_dir,
+            files=("output.json", "tensor_catalog.json", "reband_report.json",
+                   "status.json", "log.txt"),
+            explain=True,
+        )
+        ui.run_summary(store.summary(meta.run_id))
+        ui.json_panel(payload, title="reband summary")
+    else:
+        print(json.dumps(payload, indent=2))
+    return 0
+
+
 def cmd_reference_logits(args: argparse.Namespace) -> int:
     from logits import cache_reference_logits
     from store import StepAlreadyDone
@@ -2312,14 +2480,38 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
         return 0
 
     catalog = None
-    for step_id in ("activation_features", "weight_features", "catalog"):
+    catalog_source = None
+    for step_id in ("reband", "activation_features", "weight_features", "catalog"):
         cpath = store.step_path(meta.run_id, step_id) / "tensor_catalog.json"
         if cpath.is_file():
             catalog = json.loads(cpath.read_text())
+            catalog_source = step_id
             break
     if not catalog:
         print("ERROR: tensor_catalog.json not found", file=sys.stderr)
         return 1
+    if catalog_source == "reband":
+        # Warn if the rebanded catalog predates the current features: the
+        # reband embeds the input catalog sha in its report.
+        rep_path = store.step_path(meta.run_id, "reband") / "reband_report.json"
+        cur_path = (
+            store.step_path(meta.run_id, "activation_features") / "tensor_catalog.json"
+        )
+        try:
+            rep = json.loads(rep_path.read_text()) if rep_path.is_file() else {}
+            cur = json.loads(cur_path.read_text()) if cur_path.is_file() else {}
+            if (
+                rep.get("prev_sha256")
+                and cur.get("catalog_sha256")
+                and rep["prev_sha256"] != cur["catalog_sha256"]
+            ):
+                print(
+                    "WARNING: rebanded catalog was cut from an older features "
+                    "catalog; re-run: odg reband --force",
+                    file=sys.stderr,
+                )
+        except (OSError, ValueError):
+            pass
 
     freeze_out = store.read_step_output(meta.run_id, "freeze_gguf") or {}
     search_path = store.step_path(meta.run_id, "corpus") / "search.txt"
@@ -2365,6 +2557,7 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
         "gguf_sha256": freeze_out.get("gguf_sha256"),
         "search_path": str(search_path),
         "n_catalog_groups": len(catalog.get("groups") or {}),
+        "catalog_source": catalog_source,
         "jobs": args.jobs,
     }
     try:

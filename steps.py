@@ -25,6 +25,10 @@ STEPS: list[StepDef] = [
     StepDef("activation_features", 8, "Activation features", "08_activation_features"),
     StepDef("freeze_gguf", 9, "Freeze BF16 GGUF", "09_freeze_gguf"),
     StepDef("imatrix", 10, "Build imatrix", "10_imatrix"),
+    # Reband shares display number 11 with reference-logits (number is only
+    # used in run-pipeline error panels alongside the step id); its dir
+    # sorts before 11_reference_logits. No existing step is renumbered.
+    StepDef("reband", 11, "Imatrix re-banding", "11b_reband"),
     StepDef("reference_logits", 11, "Cache reference logits", "11_reference_logits"),
     StepDef("sensitivity", 12, "Sensitivity probe", "12_sensitivity"),
     StepDef("optimize", 13, "Optimize recipe", "13_optimize"),

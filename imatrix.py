@@ -82,6 +82,27 @@ def build_proxy_importance(
         out_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         return payload
 
+    import math
+
+    # Sanitize: a single non-finite raw score (e.g. rope_freqs spectral
+    # blowup → inf) would poison normalization — score/inf = 0 zeroes the
+    # entire file. Exclude such tensors and normalize by max finite.
+    excluded = sorted(name for name, s in raw if not math.isfinite(s))
+    raw = [(name, s) for name, s in raw if math.isfinite(s)]
+
+    if not raw:
+        payload = {
+            "method": "proxy_importance",
+            "gguf_sha256": gguf_sha256,
+            "calib_path": calib_path,
+            "n_tensors": 0,
+            "tensors": {},
+            "note": "No finite proxy scores (all excluded as non-finite)",
+            "excluded_nonfinite": excluded,
+        }
+        out_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        return payload
+
     mx = max(s for _, s in raw) or 1.0
     for name, score in raw:
         t = tensors[name]
@@ -122,9 +143,17 @@ def build_proxy_importance(
         "groups": group_scores,
         "top_important": ranked[:15],
         "least_important": list(reversed(ranked[-10:])),
+        "excluded_nonfinite": excluded,
         "note": (
             "Proxy only — not usable as llama-quantize --imatrix. "
             "Install llama-imatrix and re-run with --mode llama."
+        )
+        + (
+            f" Excluded {len(excluded)} non-finite tensor(s): "
+            + ", ".join(excluded[:10])
+            + "."
+            if excluded
+            else ""
         ),
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)

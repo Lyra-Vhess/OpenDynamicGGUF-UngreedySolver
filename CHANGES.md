@@ -33,7 +33,7 @@ grid and optimized mean KLD only.
   before any GPU work — 132 probes to 97 on the 270M pilot. A grid covering
   nothing on some group's ladder is a hard error naming the group.
 - **DP MCKP solver** (`dp_mckp.py`, new): exact dynamic programming over the
-  probed cost matrix, 1 MiB ceil bins (conservative: binned-feasible always
+  probed cost matrix, 256 KiB ceil bins (conservative: binned-feasible always
   fits the true budget). Full Pareto frontier falls out of one solve.
   Infeasible budgets fail loudly with minimum size + largest group.
 - **P99 guardrail, automatic** (`optimizer.py`, no flag): measured-rematch
@@ -45,11 +45,13 @@ grid and optimized mean KLD only.
   needs measured tails, hard-errors on proxy rows). T*, both pass means,
   and the removal count land in recipe/manifest. DP, Pareto, and
   certificate run unchanged on the restricted problem.
-- **Size-estimate margin** (`optimizer.py`, hard-coded `SIZE_ESTIMATE_MARGIN`
-  = 1.09): real exports run ~8–9% over estimates (single 270M-model
-  calibration; replace with an empirically derived value or a better
-  estimator when available). Inherited by both optimizers and all budget
-  ratios; visible in recipe/manifest.
+- **Measured sizes, no margin** (`llama_probe.py`, `optimizer.py`):
+  probed columns use exact group bytes read from trial-file GGUF metadata
+  (`bytes_measured`, audited per entry); never-probed columns fall back to
+  bytes-per-element estimates flagged `measured: false`. The old 1.09
+  constant is deleted (defaults are a neutral 1.0). A dual-threshold sanity
+  check (absolute dev > 256 KiB AND relative dev > 15%) aborts the optimize
+  naming the corrupt column instead of solving on it.
 - **Column generation** (`colgen.py`, new): floor-first probes, shadow-price
   pricing, monotone + Lipschitz bound model, termination certificate, and
   `exhaustive` mode for unconditional certification. Adaptive single-column
@@ -63,6 +65,14 @@ grid and optimized mean KLD only.
   (imatrix): verbatim passthrough to llama.cpp binaries, e.g. `"-ngl 99"`
   for GPU offload on any backend (CUDA/Vulkan/Metal/ROCm) with no rebuild.
   All existing flags preserved.
+- **Reband** (`reband.py`, new; step 11b `odg reband`, in `odg run` after
+  imatrix): replaces thirds banding with exact Fisher-Jenks segmentation
+  per role over real `imatrix.gguf` per-channel stats (proxy fallback);
+  roles with no band structure keep thirds (elbow guard); unscored layers
+  join the nearest band explicitly. Same group count, boundaries move.
+- **Proxy inf fix** (`imatrix.py`): non-finite raw scores (e.g. rope_freqs
+  spectral blowup → inf, which had zeroed the whole file via /inf) are
+  excluded and audited instead of normalizing everything to 0.
 - **Recipe** (`optimizer.py`): additive `optimizer`, `kld_metric`,
   `cost_matrix`, `allocation`, `totals`, `certificate`, `pareto`,
   `discretization` sections. Greedy output is byte-identical to before.
@@ -75,7 +85,7 @@ on a real sweep per the spec. Default is now `dp_mckp`.
 
 ## Test summary
 
-`python3 -m pytest tests/ -q` — 91 passed (4 new: passthrough parsing,
+`python3 -m pytest tests/ -q` — 102 passed (4 new: passthrough parsing,
 forwarding through imatrix/logits/probe runners). No new dependencies
 (`numpy` only; the log parser is stdlib).
 

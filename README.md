@@ -160,7 +160,7 @@ odg catalog --model functiongemma:latest
 odg weight-features --model functiongemma:latest --only-quantizable
 odg corpus --model functiongemma:latest --target-tokens 300000
 odg activation-features --model functiongemma:latest
-# … freeze-gguf → imatrix → reference-logits → sensitivity → optimize → export → validate
+# … freeze-gguf → imatrix → reband → reference-logits → sensitivity → optimize → export → validate
 ```
 
 Artifacts land under `artifacts/runs/<run-id>/steps/<step>/`, each with its `input.json`, `output.json`, `status.json`, and a log. Re-running a completed step is a no-op unless you pass `--force`; `--new-run` starts a fresh run instead of resuming the current one.
@@ -201,6 +201,7 @@ The pipeline is split into 16 small steps, each with its own design doc. Start a
 | 09 | Freeze BF16 GGUF | [doc](docs/steps/09-freeze-bf16-gguf.md) | `odg freeze-gguf` | ✅ Implemented (promote; HF convert optional) |
 | 10 | Build imatrix | [doc](docs/steps/10-build-imatrix.md) | `odg imatrix` | ✅ Implemented (proxy; llama-imatrix optional) |
 | 11 | Cache reference logits | [doc](docs/steps/11-cache-reference-logits.md) | `odg reference-logits` | ✅ Implemented (proxy; llama-perplexity optional) |
+| 11b | Imatrix re-banding | — | `odg reband` | ✅ Implemented (Fisher-Jenks bands; runs in `odg run` after imatrix) |
 | 12 | Sensitivity probe | [doc](docs/steps/12-sensitivity-probe.md) | `odg sensitivity` | ✅ Implemented (proxy table; llama probes TBD) |
 | 13 | Optimize recipe | [doc](docs/steps/13-optimize-recipe.md) | `odg optimize` | ✅ Implemented (dp_mckp + greedy + Pareto) |
 | 14 | Export GGUF | [doc](docs/steps/14-export-gguf.md) | `odg export` | ✅ Implemented (dry-run; llama-quantize optional) |
@@ -393,7 +394,7 @@ Before computing features, classify each name into a **role**. This is more info
 | `norm` | `layernorm`, `rms_norm`, `norm` | Usually **skip** (leave F16/F32) |
 | `lm_head` | `lm_head`, `output` | Yes (often pinned high) |
 
-Also record **layer index** (and depth bucket: early / middle / late) when the name contains one. Role × depth is the grouping key used later (~25 groups instead of hundreds of tensors).
+Also record **layer index** (and depth bucket: early / middle / late) when the name contains one. Role × depth is the grouping key used later (~25 groups instead of hundreds of tensors). After the imatrix lands, `odg reband` (step 11b, also in `odg run`) re-cuts each role's layers into bands on measured importance cliffs — same band count, boundaries move.
 
 #### 2d · Build the tensor catalog
 
@@ -716,7 +717,7 @@ v1 deliberately skips Bayesian optimization and evolutionary search: each object
 - **Column generation** — probes only the `(group, quant)` columns needed to certify optimality (floor type per group first, then attractive columns by upper-bound gain per byte), instead of a full sweep. `--certificate exhaustive` probes everything for an unconditional certificate.
 - **Termination certificate** — every recipe records which columns were probed, which were excluded, and the bound model (monotonicity + Lipschitz `L`, auto-calibrated unless `--lipschitz` is given). Check `attractive_at_termination: []` to verify certification.
 - **Pareto frontier** — falls out of the DP table for free; `pareto/*.yaml` covers the standard ratios plus any `--pareto-ratios` values.
-- **Size margin** — all size estimates are scaled by the hard-coded `SIZE_ESTIMATE_MARGIN = 1.09` (calibrated on one 270M model: real exports run ~8–9% over estimates). Both optimizers and all budget ratios inherit it; replace with an empirically derived value or a better estimator when available.
+- **Measured sizes, no margin** — probed columns use exact group bytes read from trial-file GGUF metadata (`bytes_measured`, audited per entry); never-probed columns fall back to bytes-per-element estimates flagged `measured: false`. A dual-threshold sanity check (absolute deviation > 256 KiB *and* relative > 15%) aborts the optimize naming the corrupt column. DP bins are 256 KiB (recorded in the recipe).
 - **A/B comparison** — `--optimizer greedy` keeps the legacy optimizer; `--jobs N` sets process-level probe parallelism.
 - **GPU offload (hardware-agnostic)** — the pipeline never touches device code itself; it shells out to your llama.cpp build. `--perplexity-args "-ngl 99"` (sensitivity, reference-logits) and `--imatrix-args "-ngl 99"` (imatrix) append flags verbatim to those binaries, so the same interface drives CUDA, Vulkan, Metal, or ROCm builds with no rebuild and no repo changes. Without `-ngl` everything runs on CPU.
 
