@@ -131,6 +131,7 @@ def cache_reference_logits(
     gguf_sha256: str | None = None,
     mode: Mode = "auto",
     llama_perplexity: str | Path | None = None,
+    extra_args: list[str] | None = None,
 ) -> LogitsResult:
     log: list[str] = []
     notes: list[str] = []
@@ -181,12 +182,14 @@ def cache_reference_logits(
                 model_gguf=gguf,
                 text_file=search,
                 outfile=logits_search,
+                extra_args=extra_args,
             )
             log_h = run_kl_divergence_base(
                 binary=binary,
                 model_gguf=gguf,
                 text_file=heldout,
                 outfile=logits_heldout,
+                extra_args=extra_args,
             )
             (out_dir / "llama-perplexity-search.log").write_text(
                 log_s, encoding="utf-8"

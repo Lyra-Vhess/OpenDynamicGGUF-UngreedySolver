@@ -4,10 +4,26 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import sys
 from pathlib import Path
 
 import ui
+
+
+def split_extra_args(raw: str | None, flag: str) -> list[str] | None:
+    """Parse a `--*-args \"EXTRA ARGS\"` string into an argv list.
+
+    Passthrough to llama.cpp binaries (e.g. ``-ngl 99`` for GPU offload).
+    This repo never interprets the contents — they are appended verbatim.
+    """
+    if raw is None or not raw.strip():
+        return None
+    try:
+        parts = shlex.split(raw)
+    except ValueError as exc:
+        raise ValueError(f"{flag}: cannot parse {raw!r}: {exc}")
+    return parts or None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -223,6 +239,12 @@ def main(argv: list[str] | None = None) -> int:
         default=64,
         help="llama-imatrix --chunks (default 64; 0 = omit flag)",
     )
+    p_im.add_argument(
+        "--imatrix-args",
+        default=None,
+        metavar="ARGS",
+        help='Extra args appended verbatim to llama-imatrix, e.g. --imatrix-args "-ngl 99"',
+    )
     p_im.add_argument("--no-explain", action="store_true")
 
     # --- reference-logits (step 11) ---
@@ -244,6 +266,12 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=None,
         help="Path to llama-perplexity (or set LLAMA_CPP_DIR)",
+    )
+    p_lg.add_argument(
+        "--perplexity-args",
+        default=None,
+        metavar="ARGS",
+        help='Extra args appended verbatim to llama-perplexity, e.g. --perplexity-args "-ngl 99"',
     )
     p_lg.add_argument("--no-explain", action="store_true")
 
@@ -283,6 +311,12 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=None,
         help="Path to llama-perplexity for KL probes (or set LLAMA_CPP_DIR)",
+    )
+    p_sens.add_argument(
+        "--perplexity-args",
+        default=None,
+        metavar="ARGS",
+        help='Extra args appended verbatim to probe llama-perplexity runs, e.g. --perplexity-args "-ngl 99"',
     )
     p_sens.add_argument(
         "--quant",
@@ -2016,6 +2050,13 @@ def cmd_imatrix(args: argparse.Namespace) -> int:
         chunks_arg = None
     else:
         chunks_arg = chunks
+    try:
+        imatrix_args = split_extra_args(
+            getattr(args, "imatrix_args", None), "--imatrix-args"
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
     input_data = {
         "from_steps": ["freeze_gguf", "corpus"],
@@ -2024,6 +2065,7 @@ def cmd_imatrix(args: argparse.Namespace) -> int:
         "calib_path": str(calib_path),
         "mode": args.mode,
         "chunks": chunks_arg,
+        "imatrix_args": imatrix_args,
     }
 
     try:
@@ -2045,6 +2087,7 @@ def cmd_imatrix(args: argparse.Namespace) -> int:
                 mode=args.mode,
                 llama_imatrix=args.llama_imatrix,
                 n_chunks=chunks_arg,
+                extra_args=imatrix_args,
             )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "imatrix", str(exc))
@@ -2163,6 +2206,14 @@ def cmd_reference_logits(args: argparse.Namespace) -> int:
         "heldout_path": str(heldout_path),
         "mode": args.mode,
     }
+    try:
+        perplexity_args = split_extra_args(
+            getattr(args, "perplexity_args", None), "--perplexity-args"
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    input_data["perplexity_args"] = perplexity_args
 
     try:
         step_dir = store.begin_step(
@@ -2182,6 +2233,7 @@ def cmd_reference_logits(args: argparse.Namespace) -> int:
                 gguf_sha256=freeze_out.get("gguf_sha256"),
                 mode=args.mode,
                 llama_perplexity=args.llama_perplexity,
+                extra_args=perplexity_args,
             )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "reference_logits", str(exc))
@@ -2309,6 +2361,14 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
         "n_catalog_groups": len(catalog.get("groups") or {}),
         "jobs": args.jobs,
     }
+    try:
+        sens_perplexity_args = split_extra_args(
+            getattr(args, "perplexity_args", None), "--perplexity-args"
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    input_data["perplexity_args"] = sens_perplexity_args
 
     try:
         step_dir = store.begin_step(
@@ -2335,6 +2395,7 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
                 jobs=args.jobs,
                 llama_quantize=args.llama_quantize,
                 llama_perplexity=args.llama_perplexity,
+                perplexity_args=sens_perplexity_args,
             )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "sensitivity", str(exc))

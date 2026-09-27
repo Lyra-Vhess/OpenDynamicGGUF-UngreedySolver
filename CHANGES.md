@@ -58,7 +58,10 @@ grid and optimized mean KLD only.
 - **CLI** (`cli.py`): `--optimizer {greedy,dp_mckp}` (default `dp_mckp`),
   `--kld-objective {tail_1pct,mean}` (default `mean`),
   `--certificate {bounded,exhaustive}`,
-  `--lipschitz`, `--jobs`, `--pareto-ratios`, `--probe-types`.
+  `--lipschitz`, `--jobs`, `--pareto-ratios`, `--probe-types`,
+  `--perplexity-args` (sensitivity, reference-logits) and `--imatrix-args`
+  (imatrix): verbatim passthrough to llama.cpp binaries, e.g. `"-ngl 99"`
+  for GPU offload on any backend (CUDA/Vulkan/Metal/ROCm) with no rebuild.
   All existing flags preserved.
 - **Recipe** (`optimizer.py`): additive `optimizer`, `kld_metric`,
   `cost_matrix`, `allocation`, `totals`, `certificate`, `pareto`,
@@ -72,9 +75,9 @@ on a real sweep per the spec. Default is now `dp_mckp`.
 
 ## Test summary
 
-`python3 -m pytest tests/ -q` — 87 passed (1 new: per-group grids drop
-above-ladder probes, empty grid raises). No new dependencies (`numpy`
-only; the log parser is stdlib).
+`python3 -m pytest tests/ -q` — 91 passed (4 new: passthrough parsing,
+forwarding through imatrix/logits/probe runners). No new dependencies
+(`numpy` only; the log parser is stdlib).
 
 ## Deviations from Spec.md
 

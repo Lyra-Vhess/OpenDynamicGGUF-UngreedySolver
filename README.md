@@ -718,6 +718,7 @@ v1 deliberately skips Bayesian optimization and evolutionary search: each object
 - **Pareto frontier** — falls out of the DP table for free; `pareto/*.yaml` covers the standard ratios plus any `--pareto-ratios` values.
 - **Size margin** — all size estimates are scaled by the hard-coded `SIZE_ESTIMATE_MARGIN = 1.09` (calibrated on one 270M model: real exports run ~8–9% over estimates). Both optimizers and all budget ratios inherit it; replace with an empirically derived value or a better estimator when available.
 - **A/B comparison** — `--optimizer greedy` keeps the legacy optimizer; `--jobs N` sets process-level probe parallelism.
+- **GPU offload (hardware-agnostic)** — the pipeline never touches device code itself; it shells out to your llama.cpp build. `--perplexity-args "-ngl 99"` (sensitivity, reference-logits) and `--imatrix-args "-ngl 99"` (imatrix) append flags verbatim to those binaries, so the same interface drives CUDA, Vulkan, Metal, or ROCm builds with no rebuild and no repo changes. Without `-ngl` everything runs on CPU.
 
 ### Stage 8 — Reproducible export
 

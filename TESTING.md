@@ -86,6 +86,13 @@ Notes:
   16 GB GPU: one trial quant resident plus the reference model must fit in
   VRAM together. Raise to 3–4 only if `nvidia-smi` shows headroom during a
   probe; lower to 1 at the first OOM (see troubleshooting).
+- GPU offload is off by default (CPU everywhere). If your llama.cpp build
+  has a GPU backend compiled in, add `--perplexity-args "-ngl 99"` to the
+  `sensitivity` / `reference-logits` commands and `--imatrix-args "-ngl 99"`
+  to `imatrix` — flags pass through verbatim, no rebuild needed. The flag
+  spelling is identical on CUDA, Vulkan, Metal, and ROCm builds. Check
+  `llama-perplexity --help` lists `-ngl` first; if it doesn't, your build
+  is CPU-only and the flags will error.
 - The group count for this class of model is ~25 (one `role@depth` group per
   role per depth band, plus global embedding/lm_head). Bounded mode probes
   ~|G| floor columns first, then only attractive columns — far fewer than

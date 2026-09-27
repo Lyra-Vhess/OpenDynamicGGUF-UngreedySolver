@@ -228,9 +228,13 @@ def build_imatrix(
     mode: Mode = "auto",
     llama_imatrix: str | Path | None = None,
     n_chunks: int | None = 64,
+    extra_args: list[str] | None = None,
 ) -> ImatrixResult:
     """
     Produce imatrix.gguf (real) and/or imatrix_proxy.json under out_dir.
+
+    ``extra_args`` are appended verbatim to the llama-imatrix command
+    (e.g. ``["-ngl", "99"]`` for GPU offload). Never interpreted here.
     """
     log: list[str] = []
     notes: list[str] = []
@@ -270,6 +274,7 @@ def build_imatrix(
                 calib_txt=calib,
                 outfile=imatrix_path,
                 n_chunks=n_chunks,
+                extra_args=extra_args,
             )
             (out_dir / "llama-imatrix.log").write_text(run_log, encoding="utf-8")
             imatrix_sha = _sha256_file(imatrix_path)
