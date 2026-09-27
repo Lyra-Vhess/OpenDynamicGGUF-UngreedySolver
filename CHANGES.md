@@ -32,14 +32,27 @@ grid and optimized mean KLD only.
   probed cost matrix, 1 MiB ceil bins (conservative: binned-feasible always
   fits the true budget). Full Pareto frontier falls out of one solve.
   Infeasible budgets fail loudly with minimum size + largest group.
+- **P99 guardrail** (`optimizer.py`, `--tail-cap TAU`): measured-rematch
+  finding — a *summed* P99 is not a whole-model percentile and misranks
+  allocations, while mean KLD is approximately additive. So the recommended
+  shape is mean objective plus a per-group worst-1% cap: cap-violating
+  columns are deleted pre-DP (needs measured tails; hard-errors on proxy
+  rows; loud error if a group is emptied). DP, Pareto, and certificate run
+  unchanged on the restricted problem.
+- **Size-estimate margin** (`optimizer.py`, `--size-margin`, default 1.09):
+  real exports run ~8–9% over estimates (single 270M-model calibration, bake
+  in more models when available). Inherited by both optimizers and all
+  budget ratios; visible in recipe/manifest.
 - **Column generation** (`colgen.py`, new): floor-first probes, shadow-price
   pricing, monotone + Lipschitz bound model, termination certificate, and
   `exhaustive` mode for unconditional certification. Adaptive single-column
   batches (re-solve/re-price between probes) so early rounds don't degenerate
   into a full sweep.
 - **CLI** (`cli.py`): `--optimizer {greedy,dp_mckp}` (default `dp_mckp`),
-  `--kld-objective {tail_1pct,mean}`, `--certificate {bounded,exhaustive}`,
-  `--lipschitz`, `--jobs`, `--pareto-ratios`. All existing flags preserved.
+  `--kld-objective {tail_1pct,mean}`, `--tail-cap`, `--size-margin`,
+  `--certificate {bounded,exhaustive}`,
+  `--lipschitz`, `--jobs`, `--pareto-ratios`, `--probe-types`.
+  All existing flags preserved.
 - **Recipe** (`optimizer.py`): additive `optimizer`, `kld_metric`,
   `cost_matrix`, `allocation`, `totals`, `certificate`, `pareto`,
   `discretization` sections. Greedy output is byte-identical to before.
@@ -52,7 +65,9 @@ on a real sweep per the spec. Default is now `dp_mckp`.
 
 ## Test summary
 
-`python3 -m pytest tests/ -q` — 80 passed. No new dependencies (`numpy`
+`python3 -m pytest tests/ -q` — 84 passed (4 new: guardrail optimality vs
+brute force, cap-too-tight error, cap-vs-proxy hard error, margin
+inflation). No new dependencies (`numpy`
 only; the log parser is stdlib).
 
 ## Deviations from Spec.md

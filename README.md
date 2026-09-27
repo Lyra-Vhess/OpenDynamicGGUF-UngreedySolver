@@ -711,10 +711,12 @@ v1 deliberately skips Bayesian optimization and evolutionary search: each object
 
 `odg optimize` now solves bit assignment exactly as a **Multiple-Choice Knapsack Problem via dynamic programming** (`--optimizer dp_mckp`, the default), replacing greedy search with a provably optimal allocation over the probed cost matrix:
 
-- **Tail-KLD objective** — minimizes mean KLD over the worst 1% of tokens (`--kld-objective tail_1pct`, default); mean KLD is still reported alongside. Use `--kld-objective mean` for the legacy objective.
+- **Objective** — `--kld-objective tail_1pct` (default) minimizes the stock `99.0% KLD` percentile line; `--kld-objective mean` minimizes mean KLD. Both are always reported. Recommended: mean objective plus the P99 guardrail below — per-group percentiles don't add across groups, so a *summed* P99 systematically misranks allocations, while mean KLD is approximately additive.
+- **P99 guardrail** — `--tail-cap TAU` deletes every `(group, quant)` column whose measured P99 exceeds TAU *before* the DP runs (needs measured tails; hard-errors on proxy rows). Minimizing the additive mean subject to a per-group worst-1% cap is the sound shape; the DP, Pareto, and certificate all operate on the restricted problem unchanged.
 - **Column generation** — probes only the `(group, quant)` columns needed to certify optimality (floor type per group first, then attractive columns by upper-bound gain per byte), instead of a full sweep. `--certificate exhaustive` probes everything for an unconditional certificate.
 - **Termination certificate** — every recipe records which columns were probed, which were excluded, and the bound model (monotonicity + Lipschitz `L`, auto-calibrated unless `--lipschitz` is given). Check `attractive_at_termination: []` to verify certification.
 - **Pareto frontier** — falls out of the DP table for free; `pareto/*.yaml` covers the standard ratios plus any `--pareto-ratios` values.
+- **Size margin** — all size estimates are scaled by `--size-margin` (default `SIZE_ESTIMATE_MARGIN = 1.09`, calibrated on one 270M model: real exports run ~8–9% over estimates). Both optimizers and all budget ratios inherit it; recalibrate over more models when available.
 - **A/B comparison** — `--optimizer greedy` keeps the legacy optimizer; `--jobs N` sets process-level probe parallelism.
 
 ### Stage 8 — Reproducible export

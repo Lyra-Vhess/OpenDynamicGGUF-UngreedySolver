@@ -291,6 +291,12 @@ def main(argv: list[str] | None = None) -> int:
         metavar="FORMAT",
         help="Override run quant target for this step",
     )
+    p_sens.add_argument(
+        "--probe-types",
+        default=None,
+        metavar="TYPES",
+        help="Comma-separated probe grid override (default: from --quant profile)",
+    )
     p_sens.add_argument("--no-explain", action="store_true")
 
     # --- optimize (step 13) ---
@@ -360,6 +366,22 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         metavar="RATIOS",
         help="Comma-separated budget ratios (default: 0.55,0.65,0.72,0.80,0.90,1.0)",
+    )
+    p_opt.add_argument(
+        "--tail-cap",
+        type=float,
+        default=None,
+        metavar="KLD",
+        help="P99 guardrail: drop (group, type) candidates whose measured tail "
+        "exceeds KLD, under either objective (default: no guardrail)",
+    )
+    p_opt.add_argument(
+        "--size-margin",
+        type=float,
+        default=None,
+        metavar="FACTOR",
+        help="Safety factor on size estimates (default: 1.09; single-model "
+        "calibration, re-calibrate per family)",
     )
     p_opt.add_argument("--no-explain", action="store_true")
 
@@ -2285,7 +2307,12 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
         mode = "proxy"
 
     baseline = args.baseline or fmt.baseline_type
-    probe_types = list(fmt.probe_types)
+    if getattr(args, "probe_types", None):
+        probe_types = [t.strip().upper() for t in args.probe_types.split(",") if t.strip()]
+        if not probe_types:
+            raise ValueError("--probe-types was empty")
+    else:
+        probe_types = list(fmt.probe_types)
 
     input_data = {
         "from_steps": ["reference_logits", "imatrix", "corpus"],
@@ -2444,6 +2471,8 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         "lipschitz": getattr(args, "lipschitz", None),
         "jobs": getattr(args, "jobs", 1),
         "pareto_ratios": getattr(args, "pareto_ratios", None),
+        "tail_cap": getattr(args, "tail_cap", None),
+        "size_margin": getattr(args, "size_margin", None),
     }
 
     pareto_ratios = None
@@ -2471,6 +2500,9 @@ def cmd_optimize(args: argparse.Namespace) -> int:
 
     try:
         with ui.working('Optimizing quant recipe…', explain=print_explain):
+            from optimizer import SIZE_ESTIMATE_MARGIN
+
+            size_margin = getattr(args, "size_margin", None)
             result = optimize_recipes(
                 model_ref=meta.model_ref,
                 out_dir=step_dir,
@@ -2490,6 +2522,11 @@ def cmd_optimize(args: argparse.Namespace) -> int:
                 jobs=int(getattr(args, "jobs", 1) or 1),
                 pareto_ratios=pareto_ratios,
                 imatrix_groups=imatrix_groups,
+                tail_cap=getattr(args, "tail_cap", None),
+                size_margin=(
+                    size_margin if size_margin is not None
+                    else SIZE_ESTIMATE_MARGIN
+                ),
             )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "optimize", str(exc))
@@ -2511,6 +2548,7 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         "assignments": result.assignments,
         "optimizer": result.optimizer,
         "kld_objective": result.kld_objective,
+        "tail_cap": result.tail_cap,
         "total_tail_kld": result.total_tail_kld,
         "total_mean_kld": result.total_mean_kld,
         "certificate": result.certificate,

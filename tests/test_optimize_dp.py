@@ -1,11 +1,19 @@
 """Phase 4 — optimize_recipes integration: dp_mckp default, greedy preserved."""
 
+import itertools
 import json
+import math
 
 import pytest
 
-from optimizer import optimize_recipes
-from sensitivity import probe_groups_proxy
+from dp_mckp import BIN_BYTES, bytes_to_bins
+from optimizer import (
+    SIZE_ESTIMATE_MARGIN,
+    _estimate_total_bytes,
+    dp_mckp_optimize,
+    optimize_recipes,
+)
+from sensitivity import estimate_group_nbytes, probe_groups_proxy
 
 
 def tiny_catalog():
@@ -135,3 +143,81 @@ def test_bad_options_rejected(tmp_path):
     with pytest.raises(ValueError, match="Unknown kld_objective"):
         optimize_recipes(model_ref="t", out_dir=tmp_path / "y", catalog=catalog,
                          sensitivity=sens, kld_objective="median")
+
+
+def _measured_index(catalog):
+    sens = tiny_measured_sensitivity(catalog)
+    idx = {(r["group_id"], r["probe"]): r for r in sens["rows"]}
+    return sens, idx
+
+
+def test_tail_cap_restricts_to_brute_force_optimum():
+    """Mean + guardrail: allocation equals brute force over the cap-kept
+    candidates (bin-space, same ceil convention as the solver)."""
+    catalog = tiny_catalog()
+    sens, idx = _measured_index(catalog)
+    groups = sorted(catalog["groups"])
+    ladder = ["Q6_K", "Q5_K", "Q4_K", "Q3_K", "Q2_K"]
+    # Cap keeps every group's best-P99 candidate and removes at least one.
+    cap = max(min(idx[(g, q)]["kld_tail_1pct"] for q in ladder) for g in groups)
+    kept = {g: [q for q in ladder if idx[(g, q)]["kld_tail_1pct"] <= cap]
+            for g in groups}
+    assert all(kept.values())
+    assert any(len(v) < len(ladder) for v in kept.values())
+    n_elem = {g: sum(catalog["tensors"][n].get("n_elements") or 0
+                     for n in catalog["groups"][g]["tensor_names"])
+              for g in groups}
+    size_b = {(g, q): estimate_group_nbytes(n_elem[g], q)
+              for g in groups for q in ladder}
+    mean_c = {(g, q): float(idx[(g, q)]["kld_mean"])
+              for g in groups for q in ladder}
+    budget_bins = sum(bytes_to_bins(size_b[(g, kept[g][-1])]) for g in groups) + 4
+    best, best_alloc = math.inf, None
+    for combo in itertools.product(*(kept[g] for g in groups)):
+        alloc = dict(zip(groups, combo))
+        s = sum(bytes_to_bins(size_b[(g, alloc[g])]) for g in groups)
+        c = sum(mean_c[(g, alloc[g])] for g in groups)
+        if s <= budget_bins and c < best:
+            best, best_alloc = c, alloc
+    assert best_alloc is not None
+    res = dp_mckp_optimize(
+        catalog=catalog, sensitivity_rows=sens["rows"], objective="mean",
+        tail_cap=cap, size_margin=1.0, budget_bytes=budget_bins * BIN_BYTES,
+    )
+    assert res["allocation"] == best_alloc
+    assert res["total_mean_kld"] == pytest.approx(best)
+    assert res["tail_cap"] == cap
+    assert res["cap_removed_columns"] == sum(
+        len(ladder) - len(kept[g]) for g in groups)
+
+
+def test_tail_cap_too_tight_names_group():
+    catalog = tiny_catalog()
+    sens, _ = _measured_index(catalog)
+    with pytest.raises(ValueError, match="Raise --tail-cap"):
+        dp_mckp_optimize(
+            catalog=catalog, sensitivity_rows=sens["rows"], objective="mean",
+            tail_cap=1e-9, size_margin=1.0, budget_bytes=10 * BIN_BYTES,
+        )
+
+
+def test_tail_cap_refuses_proxy_tails():
+    """Guardrail needs measured tails even under the mean objective."""
+    catalog = tiny_catalog()
+    sens = tiny_sensitivity(catalog)
+    with pytest.raises(ValueError, match="measured kld_tail_1pct"):
+        dp_mckp_optimize(
+            catalog=catalog, sensitivity_rows=sens["rows"], objective="mean",
+            tail_cap=1e9, size_margin=1.0, budget_bytes=200 * BIN_BYTES,
+        )
+
+
+def test_size_margin_inflates_estimates():
+    catalog = tiny_catalog()
+    groups, tensors = catalog["groups"], catalog["tensors"]
+    assign = {g: "Q6_K" for g in groups}
+    base = _estimate_total_bytes(assign, groups, tensors, size_margin=1.0)
+    assert _estimate_total_bytes(
+        assign, groups, tensors, size_margin=SIZE_ESTIMATE_MARGIN) == int(
+            base * SIZE_ESTIMATE_MARGIN)
+    assert SIZE_ESTIMATE_MARGIN == pytest.approx(1.09)

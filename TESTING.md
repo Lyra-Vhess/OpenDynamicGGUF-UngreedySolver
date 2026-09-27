@@ -149,10 +149,25 @@ python3 cli.py optimize --budget-ratio 0.72 --optimizer dp_mckp --force
 python3 cli.py optimize --budget-ratio 0.72 --optimizer greedy --force
 ```
 
-Compare `totals.kld_tail` (DP) vs `estimate.predicted_mean_delta_kld`
-(greedy), and diff the two `recipe.tt` files. DP is guaranteed optimal over
-the probed cost matrix; any gap favoring greedy indicates a stale
-sensitivity table (re-run `sensitivity --force`), not a DP bug.
+Recommended rematch (mean objective with P99 guardrail — see below):
+
+```
+python3 cli.py optimize --budget-mb 270 --kld-objective mean --tail-cap 0.76
+python3 cli.py optimize --budget-mb 270 --optimizer greedy
+```
+
+then export each `recipe.tt` and measure both GGUFs with
+`llama-perplexity -m CANDIDATE -f heldout.txt --kl-divergence
+--kl-divergence-base <step-11 logits-heldout.bin>`.
+
+Compare `totals.kld_mean` / `totals.kld_tail` (DP) vs
+`estimate.predicted_mean_delta_kld` (greedy), and diff the two `recipe.tt`
+files. DP is guaranteed optimal over the probed cost matrix, but note: the
+*tail* objective minimizes a sum of per-group P99s, which is not a
+whole-model percentile and can fairly lose to greedy on measured mean, P99,
+and same-top. The mean + `--tail-cap` shape is the recommended comparison.
+Pick the cap from the measured P99 column of the sensitivity table (median
+to 75th percentile is a sane starting range).
 
 ## 6. Troubleshooting
 
@@ -164,9 +179,11 @@ differ.
 
 **DP reports infeasible.** The error states the minimum achievable size and
 the largest minimum-size group. Causes: budget below the pin floor
-(embeddings/lm_head at Q8, attn_v at Q5 minimum). Fixes in order: raise
-`--budget-mb`, or re-run with `--no-pins` (accepts quality risk on pinned
-roles — not recommended for release).
+(embeddings/lm_head at Q8, attn_v at Q5 minimum) — now quoted *with* the
+1.09 size margin and 1 MiB per-group ceil waste, so pad the budget ~10–15%
+above the raw estimate. Fixes in order: raise `--budget-mb`, or re-run
+with `--no-pins` (accepts quality risk on pinned roles — not recommended
+for release).
 
 **Certificate never terminates (non-empty `attractive_at_termination`).**
 The shadow price `λ` is oscillating on discretization noise: widen the

@@ -32,6 +32,7 @@ class OptimizeResult:
     total_mean_kld: float | None = None
     certificate: dict[str, Any] | None = None
     cost_matrix: dict[str, Any] | None = None
+    tail_cap: float | None = None
 
     def summary_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -45,6 +46,12 @@ DEFAULT_PINS: dict[str, str] = {
     "lm_head": "Q8_0",
     "attn_v": "Q5_K",
 }
+
+#: Safety margin multiplied onto BYTES_PER_ELEM size estimates. Measured
+#: exports run ~8-9% over the raw estimate on the 270M test model (GGUF
+#: headers, alignment, quant-block overhead). Single-model calibration:
+#: re-calibrate per model family; override per run with --size-margin.
+SIZE_ESTIMATE_MARGIN = 1.09
 
 
 def _ladder_index(q: str) -> int:
@@ -78,6 +85,7 @@ def _estimate_total_bytes(
     assignments: dict[str, str],
     groups: dict[str, Any],
     tensors: dict[str, Any],
+    size_margin: float = SIZE_ESTIMATE_MARGIN,
 ) -> int:
     total = 0
     assigned = set()
@@ -92,7 +100,7 @@ def _estimate_total_bytes(
         if gid in assigned and t.get("quantizable", True):
             continue
         total += int(t.get("nbytes") or 0)
-    return total
+    return int(total * size_margin)
 
 
 def _predicted_kld(
@@ -149,9 +157,11 @@ def greedy_optimize(
     start_type: str = "Q6_K",
     pins: dict[str, str] | None = None,
     use_pins: bool = True,
+    size_margin: float = SIZE_ESTIMATE_MARGIN,
 ) -> dict[str, Any]:
     """
     Start high, greedily downgrade best efficiency until size ≤ budget.
+    Sizes carry SIZE_ESTIMATE_MARGIN so the result fits real exports.
     """
     pins = dict(DEFAULT_PINS) if use_pins else {}
     groups = catalog.get("groups") or {}
@@ -185,7 +195,7 @@ def greedy_optimize(
                 assignments[gid] = floors[gid]
 
     def size_now() -> int:
-        return _estimate_total_bytes(assignments, groups, tensors)
+        return _estimate_total_bytes(assignments, groups, tensors, size_margin)
 
     history: list[dict[str, Any]] = []
     # Greedy loop
@@ -291,6 +301,8 @@ def dp_mckp_optimize(
     delta_bins: int = 16,
     batch_size: int = 1,
     objective: str = "tail",
+    tail_cap: float | None = None,
+    size_margin: float = SIZE_ESTIMATE_MARGIN,
 ) -> dict[str, Any]:
     """Optimize via column generation + DP MCKP (Spec 2.3/2.4).
 
@@ -299,6 +311,14 @@ def dp_mckp_optimize(
     ``kld_tail_1pct`` on every column it touches — proxy rows (tail None)
     raise loudly instead of being silently invented. The mean objective
     still accepts proxy ``kld_mean`` estimates for missing rows.
+
+    ``tail_cap`` is the P99 guardrail: any (group, type) whose measured
+    tail exceeds the cap is deleted from the candidate set *before* the DP
+    runs, under either objective. Minimizing a sum of percentiles misranks
+    allocations (percentiles don't add); constraining each group's worst-1%
+    while minimizing the additive mean is the sound shape. Needs measured
+    tails everywhere it filters — same hard error as the tail objective.
+    ``size_margin`` scales all size estimates (see SIZE_ESTIMATE_MARGIN).
     """
     from colgen import run_column_generation
     from sensitivity import _proxy_delta_kld
@@ -311,6 +331,47 @@ def dp_mckp_optimize(
     )
     groups = sorted(candidates)
     row_index = _build_row_index(sensitivity_rows)
+
+    cap_removed = 0
+    if tail_cap is not None:
+        cap = float(tail_cap)
+        for gid in groups:
+            kept: list[str] = []
+            worst = 0.0
+            for q in candidates[gid]:
+                row = row_index.get((gid, q.upper()))
+                t = row.get("kld_tail_1pct") if row else None
+                if t is None:
+                    have = (
+                        "a proxy row with no measured tail"
+                        if row is not None
+                        else "no row at all"
+                    )
+                    raise ValueError(
+                        f"--tail-cap needs a measured kld_tail_1pct for "
+                        f"({gid}, {q}) but there is {have}. Run step 12 with "
+                        f"--mode llama so every column is measured."
+                    )
+                t = float(t)
+                worst = max(worst, t)
+                if t <= cap:
+                    kept.append(q)
+                else:
+                    cap_removed += 1
+            if not kept:
+                raise ValueError(
+                    f"--tail-cap {cap} removes every candidate for group "
+                    f"{gid} (best measured P99 there is {worst:.4f}). "
+                    f"Raise --tail-cap."
+                )
+            candidates[gid] = kept
+    # Effective floors for the colgen baseline: pin floors normally, else
+    # the smallest surviving candidate (the pin floor may be cap-removed).
+    eff_floors = (
+        dict(floors)
+        if tail_cap is None
+        else {g: candidates[g][-1] for g in groups}
+    )
 
     def imatrix_imp(gid: str) -> float | None:
         if imatrix_groups and gid in imatrix_groups:
@@ -344,7 +405,10 @@ def dp_mckp_optimize(
         return {"kld_mean": mean, "kld_tail_1pct": None, "n_tokens": None}
 
     size_bytes = {
-        (gid, q): estimate_group_nbytes(_group_n_elements(groups_t[gid], tensors), q)
+        (gid, q): int(
+            estimate_group_nbytes(_group_n_elements(groups_t[gid], tensors), q)
+            * size_margin
+        )
         for gid in groups
         for q in candidates[gid]
     }
@@ -361,10 +425,13 @@ def dp_mckp_optimize(
         probe_fn=probe_fn, budget_bytes=budget_bytes,
         imatrix_scores=imatrix_scores, lipschitz_L=lipschitz_L,
         delta_bins=delta_bins, mode=certificate_mode, batch_size=batch_size,
-        floor_of=floors, objective=objective,
+        floor_of=eff_floors, objective=objective,
     )
     result["start_type"] = start_type.upper()
-    result["floors"] = floors
+    result["floors"] = eff_floors
+    result["tail_cap"] = tail_cap
+    result["cap_removed_columns"] = cap_removed
+    result["size_margin"] = size_margin
     result["meets_budget"] = result["total_bytes"] <= budget_bytes
     return result
 
@@ -497,10 +564,14 @@ def render_tensor_type_file(
     return "\n".join(lines)
 
 
-def default_budget_bytes(catalog: dict[str, Any], *, ratio: float = 0.72) -> int:
+def default_budget_bytes(
+    catalog: dict[str, Any], *, ratio: float = 0.72,
+    size_margin: float = SIZE_ESTIMATE_MARGIN,
+) -> int:
     """
     Budget as a fraction of all-Q6_K size, but never below the pinned floor
     (embd Q8 + attn_v Q5 + rest Q3) so greedy can actually meet it.
+    Both reference sizes carry the same margin, so ratios stay meaningful.
     """
     groups = catalog.get("groups") or {}
     tensors = catalog.get("tensors") or {}
@@ -509,7 +580,7 @@ def default_budget_bytes(catalog: dict[str, Any], *, ratio: float = 0.72) -> int
         for gid, g in groups.items()
         if g.get("quantizable", True)
     }
-    full = _estimate_total_bytes(q6, groups, tensors)
+    full = _estimate_total_bytes(q6, groups, tensors, size_margin)
     # Minimum achievable with default pins + Q3 elsewhere
     floor_assign = {}
     for gid, g in groups.items():
@@ -517,7 +588,7 @@ def default_budget_bytes(catalog: dict[str, Any], *, ratio: float = 0.72) -> int
             continue
         role = str(g.get("role") or "")
         floor_assign[gid] = DEFAULT_PINS.get(role, "Q3_K")
-    floor_bytes = _estimate_total_bytes(floor_assign, groups, tensors)
+    floor_bytes = _estimate_total_bytes(floor_assign, groups, tensors, size_margin)
     target = int(full * ratio)
     # Leave a little headroom above the pin floor
     return max(1, max(target, int(floor_bytes * 1.02)))
@@ -544,6 +615,8 @@ def _optimize_dp_mckp(
     jobs: int,
     pareto_ratios: list[float] | None,
     imatrix_groups: dict[str, Any] | None,
+    tail_cap: float | None = None,
+    size_margin: float = SIZE_ESTIMATE_MARGIN,
 ) -> OptimizeResult:
     """DP-MCKP path (Spec 2.3/2.4/2.6): colgen master + DP Pareto + certificate."""
     from dp_mckp import InfeasibleBudget, solve_mckp
@@ -567,7 +640,8 @@ def _optimize_dp_mckp(
     log.append(
         f"3. DP-MCKP column generation from Q6_K with role pins "
         f"(objective={kld_objective}, certificate={certificate_mode}, "
-        f"lipschitz={'auto' if lipschitz_L is None else lipschitz_L}, jobs={jobs})"
+        f"lipschitz={'auto' if lipschitz_L is None else lipschitz_L}, jobs={jobs}, "
+        f"tail_cap={tail_cap}, size_margin={size_margin})"
     )
     notes.append(
         f"jobs={jobs}: process-level probe parallelism (each probe is a "
@@ -585,6 +659,8 @@ def _optimize_dp_mckp(
         lipschitz_L=lipschitz_L,
         certificate_mode=certificate_mode,
         objective=obj,
+        tail_cap=tail_cap,
+        size_margin=size_margin,
     )
     alloc: dict[str, str] = dp["allocation"]
     cert = dp["certificate"]
@@ -628,7 +704,7 @@ def _optimize_dp_mckp(
     # Pareto: DP re-solves over probed columns only (free, no new probes;
     # the termination certificate strictly covers the primary budget).
     ratios = list(pareto_ratios) if pareto_ratios else list(DEFAULT_PARETO_RATIOS)
-    q6_size = default_budget_bytes(catalog, ratio=1.0)
+    q6_size = default_budget_bytes(catalog, ratio=1.0, size_margin=size_margin)
     pareto_targets = sorted({int(q6_size * r) for r in ratios} | {budget_bytes})
     p_groups = sorted(cost_matrix["groups"])
     p_cand = {
@@ -709,6 +785,18 @@ def _optimize_dp_mckp(
     extras = {
         "optimizer": "dp_mckp",
         "kld_metric": kld_metric,
+        "guardrail": {
+            "tail_cap": tail_cap,
+            "removed_columns": dp.get("cap_removed_columns", 0),
+            "note": (
+                "Per-group P99 ceiling: candidates violating the cap are "
+                "deleted pre-DP under either objective; the certificate "
+                "covers the restricted problem (Pareto points inherit it)."
+                if tail_cap is not None
+                else "No P99 guardrail (tail_cap null)."
+            ),
+        },
+        "size_margin": size_margin,
         "cost_matrix": cost_matrix,
         "allocation": allocation_list,
         "totals": totals,
@@ -764,6 +852,8 @@ def _optimize_dp_mckp(
                     "meets_budget": dp["total_bytes"] <= budget_bytes,
                     "optimizer": "dp_mckp",
                     "kld_objective": kld_objective,
+                    "tail_cap": tail_cap,
+                    "size_margin": size_margin,
                     "certificate": cert,
                     "rounds": dp["rounds"],
                     "floors": dp.get("floors"),
@@ -797,6 +887,7 @@ def _optimize_dp_mckp(
         total_mean_kld=total_mean,
         certificate=cert,
         cost_matrix=cost_matrix,
+        tail_cap=tail_cap,
     )
 
 
@@ -820,6 +911,8 @@ def optimize_recipes(
     jobs: int = 1,
     pareto_ratios: list[float] | None = None,
     imatrix_groups: dict[str, Any] | None = None,
+    tail_cap: float | None = None,
+    size_margin: float = SIZE_ESTIMATE_MARGIN,
 ) -> OptimizeResult:
     log: list[str] = []
     notes: list[str] = []
@@ -833,7 +926,9 @@ def optimize_recipes(
         raise ValueError("sensitivity table has no rows")
 
     if budget_bytes is None:
-        budget_bytes = default_budget_bytes(catalog, ratio=budget_ratio)
+        budget_bytes = default_budget_bytes(
+            catalog, ratio=budget_ratio, size_margin=size_margin
+        )
         log.append(
             f"1. Budget from ratio={budget_ratio:.2f} → {budget_bytes} bytes "
             f"({budget_bytes / (1024**2):.1f} MiB)"
@@ -862,6 +957,8 @@ def optimize_recipes(
             jobs=jobs,
             pareto_ratios=pareto_ratios,
             imatrix_groups=imatrix_groups,
+            tail_cap=tail_cap,
+            size_margin=size_margin,
         )
     if optimizer != "greedy":
         raise ValueError(f"Unknown optimizer: {optimizer!r}")
@@ -875,6 +972,7 @@ def optimize_recipes(
         budget_bytes=budget_bytes,
         start_type="Q6_K",
         use_pins=use_pins,
+        size_margin=size_margin,
     )
     log.append(
         f"4. Primary recipe size={primary['estimated_bytes']} "
