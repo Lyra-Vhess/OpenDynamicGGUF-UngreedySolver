@@ -10,16 +10,18 @@ grid and optimized mean KLD only.
 
 ## What changed
 
-- **Tail-KLD objective** (`kld.py`, new): `kld_tail_1pct` = the `99.0% KLD`
-  percentile line of a stock `llama-perplexity --kl-divergence` run — the
-  threshold above which the worst 1% of tokens sit. No upstream C++ patch:
-  the spec's exact top-1% mean needs a per-token dump the stock binary does
-  not emit, and P99 targets the same tail conservatively (top-1% mean is
-  always >= P99). `kld_mean` still reported. Every sensitivity row stores
-  `kld_mean`, `kld_tail_1pct`, `n_tokens`. Proxy-mode rows carry
-  `kld_tail_1pct = None` (no estimate); the DP tail objective refuses them
-  with a hard error. A missing `99.0% KLD` line is likewise a hard error,
-  never a silent fallback.
+- **Mean-KLD objective with P99 guardrail** (`kld.py`, new): every
+  sensitivity row stores `kld_mean` plus `kld_tail_1pct` — the `99.0% KLD`
+  percentile line of a stock `llama-perplexity --kl-divergence` run (no
+  upstream C++ patch: the exact top-1% mean needs a per-token dump the stock
+  binary does not emit, and P99 targets the same tail conservatively).
+  The optimizer **minimizes the mean** (additive across groups), while each
+  group's P99 acts as an automatic guardrail: pass 1 solves mean-only, pass 2
+  re-solves mean subject to every group staying within the worst pass-1 P99
+  (no hand-set cap; `--kld-objective tail_1pct` remains for experiments).
+  Proxy-mode rows carry `kld_tail_1pct = None` (no estimate); the tail
+  objective and the guardrail refuse them with a hard error. A missing
+  `99.0% KLD` line is likewise a hard error, never a silent fallback.
 - **Measured per-group probes** (`llama_probe.py`, new; `sensitivity.py`):
   `--mode llama` on step 12 now really measures: one trial quantize per
   probed `(group, type)` (single-group `--tensor-type-file` override,
