@@ -11,6 +11,7 @@ from optimizer import (
     SIZE_SANITY_ABS,
     SIZE_SANITY_REL,
     _estimate_total_bytes,
+    default_budget_bytes,
     dp_mckp_optimize,
     optimize_recipes,
 )
@@ -134,7 +135,11 @@ def test_dp_options_plumbed(tmp_path):
     assert res.total_mean_kld is not None
     manifest = json.loads((tmp_path / "ex" / "optimize_manifest.json").read_text())
     assert manifest["jobs"] == 2
-    assert len(manifest["pareto"]) == 3  # 0.7, 1.0 + primary budget
+    # 1.0×Q6 is above the 0.8 budget: dropped as over the hard limit,
+    # leaving the 0.7 point plus the primary budget.
+    assert len(manifest["pareto"]) == 2
+    assert manifest["dropped_pareto_above_budget"] == [
+        default_budget_bytes(catalog, ratio=1.0)]
 
 
 def test_bad_options_rejected(tmp_path):

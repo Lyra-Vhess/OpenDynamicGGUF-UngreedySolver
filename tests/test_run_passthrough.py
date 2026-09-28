@@ -102,12 +102,9 @@ def test_expected_inputs_sensitivity():
     assert exp4["budget_mb"] == pytest.approx(4885.0)
     # jobs is parallelism-only: never part of the comparison.
     assert "jobs" not in exp
-    # pareto_ratios sets the loosest re-solve the table must cover.
-    assert exp["pareto_ratios"] is None
-    exp5 = _pipeline_expected_inputs(
-        "sensitivity", _pipeline_ns(pareto_ratios="0.5,1.0"),
-        _gf("q4_k_m"))
-    assert exp5["pareto_ratios"] == "0.5,1.0"
+    # pareto_ratios only shapes step-13 frontier points below the budget;
+    # it changes nothing about step-12 probing, so it is not compared.
+    assert "pareto_ratios" not in exp
     # Without a resolved format, format-derived keys are omitted, not guessed.
     assert "baseline" not in exp
     assert "quant_format" not in exp

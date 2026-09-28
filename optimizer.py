@@ -763,27 +763,19 @@ def q6_reference_bytes(
 
 def pricing_reference_budget(
     catalog: dict[str, Any], *, intended_bytes: int,
-    pareto_top_ratio: float = 1.0,
 ) -> int:
     """Reference budget for lazy step-12 column-generation pricing.
 
-    The reference exists for one purpose: computing λ. Soundness needs it
+    The reference exists for one purpose: computing λ, and it is the
+    intended solve budget, nothing more. Soundness needs the reference
     *loose* relative to every budget step 13 might solve (columns excluded
-    at a loose budget stay excluded at any tighter real budget), so it is
-    ``max(intended solve budget, Pareto-top coverage)`` — both derived,
-    never user-supplied:
-
-    - ``intended_bytes``: exactly what step 13 will solve. The CLI threads
-      the same budget flags to both steps, so in run mode the reference
-      tracks the real budget by construction.
-    - ``pareto_top_ratio``: the loosest Pareto point re-solved from this
-      table (the standard span tops at 1.0×Q6). One table serves many
-      solves, so the reference must cover the loosest, not just primary.
+    at a loose budget stay excluded at any tighter real budget) — and the
+    solve budget is a hard limit: Pareto targets above it are dropped, so
+    no solve is ever looser than intended. The CLI threads the same budget
+    flags to both steps, so in run mode the reference tracks the real
+    budget by construction.
     """
-    pareto_top = default_budget_bytes(
-        catalog, ratio=max(1.0, float(pareto_top_ratio))
-    )
-    return max(1, max(int(intended_bytes), pareto_top))
+    return max(1, int(intended_bytes))
 
 
 def default_budget_bytes(
@@ -975,9 +967,26 @@ def _optimize_dp_mckp(
 
     # Pareto: DP re-solves over probed columns only (free, no new probes;
     # the termination certificate strictly covers the primary budget).
+    # The solve budget is a hard limit: targets above it are dropped, not
+    # solved — every emitted point is optimal at or below the budget the
+    # user asked for.
     ratios = list(pareto_ratios) if pareto_ratios else list(DEFAULT_PARETO_RATIOS)
     q6_size = default_budget_bytes(catalog, ratio=1.0, size_margin=size_margin)
     pareto_targets = sorted({int(q6_size * r) for r in ratios} | {budget_bytes})
+    dropped_above_budget = sorted({b for b in pareto_targets if b > budget_bytes})
+    if dropped_above_budget:
+        pareto_targets = [b for b in pareto_targets if b <= budget_bytes]
+        log.append(
+            f"4. Dropped {len(dropped_above_budget)} Pareto target(s) above "
+            f"the {budget_bytes}-byte hard budget limit: "
+            + ", ".join(f"{b} bytes" for b in dropped_above_budget)
+        )
+        notes.append(
+            "Pareto targets above the solve budget are dropped, not solved "
+            "(the budget is a hard limit): "
+            + ", ".join(f"{b // 1024} KiB" for b in dropped_above_budget)
+            + ". Every emitted recipe is optimal at or below the budget."
+        )
     p_groups = sorted(cost_matrix["groups"])
     p_cand = {
         g: sorted({e["type"] for e in cost_matrix["entries"] if e["group"] == g and e["probed"]})
@@ -1188,6 +1197,7 @@ def _optimize_dp_mckp(
                     "proxy_kld_columns": proxy_chosen,
                 },
                 "pareto": pareto_summary,
+                "dropped_pareto_above_budget": dropped_above_budget,
                 "budget_bytes": budget_bytes,
                 "jobs": jobs,
             },
@@ -1348,7 +1358,8 @@ def optimize_recipes(
     tt_path = out_dir / "recipe.tt"
     tt_path.write_text(tt, encoding="utf-8")
 
-    # Pareto: optimize under several budgets
+    # Pareto: optimize under several budgets, all at or below the hard
+    # solve-budget limit (targets above it are dropped, not solved).
     q6_size = default_budget_bytes(catalog, ratio=1.0)
     pareto_targets = sorted(
         {
@@ -1357,6 +1368,19 @@ def optimize_recipes(
         }
         | {budget_bytes}
     )
+    dropped_above_budget = sorted({b for b in pareto_targets if b > budget_bytes})
+    if dropped_above_budget:
+        pareto_targets = [b for b in pareto_targets if b <= budget_bytes]
+        log.append(
+            f"4. Dropped {len(dropped_above_budget)} Pareto target(s) above "
+            f"the {budget_bytes}-byte hard budget limit."
+        )
+        notes.append(
+            "Pareto targets above the solve budget are dropped, not solved "
+            "(the budget is a hard limit): "
+            + ", ".join(f"{b // 1024} KiB" for b in dropped_above_budget)
+            + "."
+        )
     pareto_paths: list[str] = []
     pareto_summary = []
     for i, b in enumerate(pareto_targets):
@@ -1418,6 +1442,7 @@ def optimize_recipes(
                     "history": primary["history"],
                 },
                 "pareto": pareto_summary,
+                "dropped_pareto_above_budget": dropped_above_budget,
                 "budget_bytes": budget_bytes,
             },
             indent=2,

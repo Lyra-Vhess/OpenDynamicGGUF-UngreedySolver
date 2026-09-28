@@ -436,7 +436,8 @@ def main(argv: list[str] | None = None) -> int:
         "--pareto-ratios",
         default=None,
         metavar="RATIOS",
-        help="Comma-separated budget ratios (default: 0.55,0.65,0.72,0.80,0.90,1.0)",
+        help="Comma-separated budget ratios (default: 0.55,0.65,0.72,0.80,0.90,1.0); "
+        "points above the solve budget are dropped, the budget is a hard limit",
     )
     p_opt.add_argument(
         "--fixed-groups",
@@ -670,7 +671,8 @@ def main(argv: list[str] | None = None) -> int:
         "--pareto-ratios",
         default=None,
         metavar="RATIOS",
-        help="Comma-separated budget ratios (default: 0.55,0.65,0.72,0.80,0.90,1.0)",
+        help="Comma-separated budget ratios (default: 0.55,0.65,0.72,0.80,0.90,1.0); "
+        "points above the solve budget are dropped, the budget is a hard limit",
     )
     p_run.add_argument(
         "--budget-mb",
@@ -1101,10 +1103,6 @@ def _pipeline_expected_inputs(step_id: str, args: argparse.Namespace, fmt):
         if fmt is not None:
             exp["baseline"] = fmt.baseline_type
             exp["quant_format"] = fmt.id
-        # pareto_ratios sets the loosest re-solve the table must cover,
-        # so it feeds the derived pricing reference (unlike optimize,
-        # raw string compare is enough — derivation parses it identically).
-        exp["pareto_ratios"] = _run_flag(args, "pareto_ratios", None)
     elif step_id == "optimize":
         bm = _run_flag(args, "budget_mb", None)
         exp["budget_mb"] = float(bm) if bm is not None else None
@@ -3095,11 +3093,11 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
     )
 
     # No sensitivity-level budget flags: the pricing reference is derived,
-    # not asked for. Intended = exactly what step 13 will solve (same
-    # threaded flags), covered up to the loosest Pareto point re-solved
-    # from this table. Computed before begin_step so input.json records it.
+    # not asked for. It is the intended step-13 budget exactly (same
+    # threaded flags) — Pareto targets above the solve budget are dropped,
+    # so no solve is ever looser than intended. Computed before begin_step
+    # so input.json records it.
     from optimizer import (
-        DEFAULT_PARETO_RATIOS,
         default_budget_bytes as _sens_budget,
         pricing_reference_budget as _sens_ref,
     )
@@ -3114,19 +3112,7 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
             ratio=float(_sens_br)
             if _sens_br is not None else float(fmt.budget_ratio),
         )
-    _raw_pr = getattr(args, "pareto_ratios", None)
-    try:
-        _ratios = (
-            [float(r) for r in str(_raw_pr).split(",")]
-            if _raw_pr else list(DEFAULT_PARETO_RATIOS)
-        )
-    except ValueError:
-        print(f"ERROR: bad --pareto-ratios: {_raw_pr}", file=sys.stderr)
-        return 1
-    _reference = _sens_ref(
-        catalog, intended_bytes=_intended,
-        pareto_top_ratio=max(_ratios),
-    )
+    _reference = _sens_ref(catalog, intended_bytes=_intended)
     input_data["intended_bytes"] = _intended
     input_data["pricing_reference_bytes"] = _reference
 

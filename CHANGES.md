@@ -1,5 +1,45 @@
 # Changes: DP-MCKP optimizer with column generation (`feat/dp-mckp-colgen`)
 
+## Budget is a hard limit: pareto capped, reference = intended (2026-09-28)
+
+- **Scope change** (user decision): the solve budget is a hard ceiling —
+  the user wants a guaranteed-optimal solution at or below the target
+  budget, and does not want frontier points above it. Pareto targets above
+  the solve budget are now dropped, not solved, in both DP and greedy
+  paths; dropped targets land in `optimize_manifest.json` as
+  `dropped_pareto_above_budget`, plus a log line and a manifest note
+  naming them. With the default span at a 0.72 budget, the 0.8/0.9/1.0
+  points are dropped and the lower points + primary remain.
+- **Reference = intended, nothing more**
+  (`pricing_reference_budget(catalog, *, intended_bytes)`): since no solve
+  is ever looser than intended, the loosest real solve *is* the intended
+  budget — the `pareto_top_ratio` parameter is gone, and step-12 pricing
+  finally sees real λ. The sensitivity stale-check drops the `pareto_ratios`
+  key again (it no longer affects probing). Expected effect: fewer GPU
+  probes than the 191-row verification run; quality gate for the rerun is
+  Tier-1 ≥ 0.00633/0.101/0.983.
+- **User-facing wording**: `--pareto-ratios` help on run/optimize now says
+  points above the budget are dropped; step-12/step-13 docs and the README
+  Pareto bullet say the frontier lives at or below the budget.
+- **Tests**: derivation is intended-only; new pareto-cap tests (custom
+  span + default span, DP path) and updated `test_dp_options_plumbed`
+  (1.0 point dropped at 0.8 budget). Suite: **150 green**.
+- **Rerun under hard budget (2026-09-28, same single command, fresh
+  `artifacts-verify`)**: 16 done, 0 failed. Step 12 reference = intended
+  4885 MiB → 81 priced rounds, 186 rows, 14 excluded, λ≈0 still. Step 13:
+  same allocation (Q5×10/Q8×5/Q4×5/Q6×4/Q2×1, emb Q4_K), `proxy_kld_columns:
+  []`, export byte-identical (5118550976 B), Tier-1 identical to six
+  decimals (0.006333/0.101207/0.9830, RELEASE). Dropped pareto: 0.9 + 1.0
+  points recorded; 5 recipes emitted (0.55–0.8 + primary).
+- **Probe verdict**: 186 vs 191 rows (−2.6%) — the hoped-for cut did not
+  materialize. λ≈0 even at intended, because at 0.72×Q6 nearly every
+  upgrade with real upside fits the budget (allocation confirms: only one
+  group sits at the Q2 floor). Probe count is driven by budget tightness
+  vs the model, not by the reference choice — the machinery works (14
+  bound-excluded under certificate, up from 9), there is just little fat
+  to cut at this budget. A tighter budget (e.g. 0.55) should show real
+  pruning; that is a prediction, not a promise.
+
 ## Derived pricing reference + step-13 loud note (2026-09-28)
 
 - **Reference derived, flags removed** (`optimizer.py`, `sensitivity.py`,

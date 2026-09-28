@@ -8,7 +8,7 @@
 
 Using the sensitivity table, assign a quantization type to every group so size stays under budget while maximizing bytes saved per unit ΔKLD.
 
-Emit `recipe.yaml`, `recipe.tt`, and a **Pareto set** of alternatives.
+Emit `recipe.yaml`, `recipe.tt`, and a **Pareto set** of alternatives at or below the budget — the budget is a hard limit, and Pareto targets above it are dropped (recorded in the manifest), not solved.
 
 ---
 
@@ -54,8 +54,8 @@ note covers the guardrail-opted-out remainder.)
 steps/13_optimize/
   recipe.yaml              # primary odg/recipe/v1
   recipe.tt                # llama-quantize --tensor-type-file
-  pareto/*.yaml            # frontier alternatives
-  optimize_manifest.json
+  pareto/*.yaml            # frontier alternatives at or below budget
+  optimize_manifest.json   # includes dropped_pareto_above_budget
   output.json
   status.json
   log.txt
@@ -67,7 +67,7 @@ steps/13_optimize/
 
 - [x] ≥1 recipe written with per-group assignments
 - [x] Traceable to sensitivity rows
-- [x] Pareto alternatives saved
+- [x] Pareto alternatives saved (all at or below budget)
 
 ## Next
 

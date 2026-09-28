@@ -921,10 +921,10 @@ def build_sensitivity_table(
     ``certificate_mode="exhaustive"`` keeps the legacy full-universe
     measurement. ``pricing_budget_bytes`` is the intended solve budget
     for pricing (the tightness λ should assume; defaults to the derived
-    pricing_reference_budget: default-format intent covered to the Pareto
-    top — loose is the safe direction for the transfer guarantee, tight is
-    where probes are saved; the CLI passes the derived reference so
-    pricing sees real λ).
+    pricing_reference_budget, which is the default-format intent — the
+    solve budget is a hard limit and Pareto targets above it are dropped,
+    so no solve is ever looser than intended; the CLI passes the derived
+    reference so pricing sees real λ).
     """
     log: list[str] = []
     notes: list[str] = []
