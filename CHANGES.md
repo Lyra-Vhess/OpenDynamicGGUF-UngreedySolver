@@ -30,8 +30,16 @@ grid and optimized mean KLD only.
   results. The grid is per-group: each group is probed only at the types on
   its own pins-aware ladder, so above-ladder types the DP could never choose
   (Q8 for unpinned groups, below-floor types for pinned ones) are skipped
-  before any GPU work — 132 probes to 97 on the 270M pilot. A grid covering
-  nothing on some group's ladder is a hard error naming the group.
+   before any GPU work — 132 probes to 97 on the 270M pilot. The default
+   grid is the union of the profile grid with every type on any qualifying
+   group's ladder, so pinned above-baseline types (Q8) are always covered
+   without manual `--probe-types`. A grid covering
+   nothing on some group's ladder is a hard error naming the group.
+- **Imatrix-fed trials** (`cli.py`, `sensitivity.py`): the sensitivity step
+   resolves the run's step-10 `imatrix.gguf` and passes it into every probe
+   trial (previously trials silently ran without imatrix, misranking columns
+   — wiring it in nearly halved the 5126 MB rematch loss). The resolved path
+   (or null when step 10 produced no file) is recorded in the step input.
 - **DP MCKP solver** (`dp_mckp.py`, new): exact dynamic programming over the
   probed cost matrix, 256 KiB ceil bins (conservative: binned-feasible always
   fits the true budget). Full Pareto frontier falls out of one solve.
@@ -60,7 +68,8 @@ grid and optimized mean KLD only.
 - **CLI** (`cli.py`): `--optimizer {greedy,dp_mckp}` (default `dp_mckp`),
   `--kld-objective {tail_1pct,mean}` (default `mean`),
   `--certificate {bounded,exhaustive}`,
-  `--lipschitz`, `--jobs`, `--pareto-ratios`, `--probe-types`,
+   `--lipschitz`, `--jobs`, `--pareto-ratios`, `--probe-types`,
+   `--fixed-groups` (sensitivity + optimize),
   `--perplexity-args` (sensitivity, reference-logits) and `--imatrix-args`
   (imatrix): verbatim passthrough to llama.cpp binaries, e.g. `"-ngl 99"`
   for GPU offload on any backend (CUDA/Vulkan/Metal/ROCm) with no rebuild.
@@ -76,7 +85,8 @@ grid and optimized mean KLD only.
 - **Recipe** (`optimizer.py`): additive `optimizer`, `kld_metric`,
   `cost_matrix`, `allocation`, `totals`, `certificate`, `pareto`,
   `discretization` sections. Greedy output is byte-identical to before.
-- **Docs**: README DP-MCKP subsection; `TESTING.md` (this branch).
+- **Docs**: README DP-MCKP subsection (`TESTING.md` kept local-only,
+  gitignored like `Spec.md`).
 - **Fixed groups** (`--fixed-groups`, `optimizer.py`, `llama_probe.py`):
   groups that must stay at source precision (tensors llama-quantize
   cannot quantize, e.g. arch-unknown 2-D projections) are excluded from
@@ -85,7 +95,9 @@ grid and optimized mean KLD only.
   keeps meaning actual file size. Probes now assert every non-flat group
   tensor actually took the probe type in the trial file — the old silent
   no-match (bogus zero-delta rows) is a hard error instead. Stale
-  trial-*.gguf files are cleared when probing starts.
+   trial-*.gguf files are cleared when probing starts. `--fixed-groups` also
+   exists on `sensitivity`: fixed groups are skipped at probe time (recorded
+   as `fixed_skipped`) instead of measured into bogus rows.
 - **Whole-file budget accounting** (`optimizer.py`, `cli.py`): `--budget-mb`
   is actual file bytes. Kept non-quantizable catalog bytes are counted into
   every total (previously omitted); file overhead (freeze GGUF `data_offset`
@@ -101,8 +113,9 @@ on a real sweep per the spec. Default is now `dp_mckp`.
 
 ## Test summary
 
-`python3 -m pytest tests/ -q` — 111 passed (9 new: probe-effect assert
-×3, fixed-group DP/greedy accounting ×4, kept/overhead accounting ×2). No
+`python3 -m pytest tests/ -q` — 114 passed (probe-effect assert
+×3, fixed-group DP/greedy accounting ×4, kept/overhead accounting ×2,
+probe-time fixed skip ×3). No
 new dependencies (`numpy` only; the log parser is stdlib).
 
 ## Deviations from Spec.md

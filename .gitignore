@@ -25,3 +25,6 @@ evaluation/results/*
 *.safetensors
 functiongemma-270m-it/
 gemma-4-E4B-it/
+# Local-only docs (kept in working tree, never pushed).
+Spec.md
+TESTING.md
