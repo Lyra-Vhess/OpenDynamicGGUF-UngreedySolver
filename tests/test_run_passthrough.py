@@ -102,6 +102,12 @@ def test_expected_inputs_sensitivity():
     assert exp4["budget_mb"] == pytest.approx(4885.0)
     # jobs is parallelism-only: never part of the comparison.
     assert "jobs" not in exp
+    # pareto_ratios sets the loosest re-solve the table must cover.
+    assert exp["pareto_ratios"] is None
+    exp5 = _pipeline_expected_inputs(
+        "sensitivity", _pipeline_ns(pareto_ratios="0.5,1.0"),
+        _gf("q4_k_m"))
+    assert exp5["pareto_ratios"] == "0.5,1.0"
     # Without a resolved format, format-derived keys are omitted, not guessed.
     assert "baseline" not in exp
     assert "quant_format" not in exp
@@ -295,6 +301,18 @@ def test_no_pins_flag_is_gone():
         ["run", "--model", "m", "--no-pins"],
         ["fit", "--model", "m", "--device", "dummy", "--no-pins"],
         ["sensitivity", "--model", "m", "--no-pins"],
+    ):
+        with pytest.raises(SystemExit):
+            cli.main(argv)
+
+
+def test_sensitivity_budget_flags_are_gone():
+    """Step-12 pricing reference is derived, not asked for: the
+    sensitivity parser rejects --budget-mb/--budget-ratio (they live on
+    run/fit/optimize, whose flags step 12 derives the reference from)."""
+    for argv in (
+        ["sensitivity", "--model", "m", "--budget-mb", "4885"],
+        ["sensitivity", "--model", "m", "--budget-ratio", "0.72"],
     ):
         with pytest.raises(SystemExit):
             cli.main(argv)

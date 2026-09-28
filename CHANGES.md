@@ -1,5 +1,65 @@
 # Changes: DP-MCKP optimizer with column generation (`feat/dp-mckp-colgen`)
 
+## Derived pricing reference + step-13 loud note (2026-09-28)
+
+- **Reference derived, flags removed** (`optimizer.py`, `sensitivity.py`,
+  `cli.py`): `pricing_reference_budget(catalog, *, intended_bytes,
+  pareto_top_ratio)` returns `max(intended, Pareto-top coverage)` — the
+  intended solve budget is exactly what step 13 will use (same threaded
+  flags in run mode; quant-format default standalone), and the Pareto top
+  (`max(1.0, loosest re-solve ratio)`) covers the standard span because one
+  table serves many solves. `--budget-mb`/`--budget-ratio` are gone from
+  the `sensitivity` parser (reversing the previous entry's fix — same
+  guarantee, zero new inputs); the all-Q6×margin fallback and
+  `PRICING_REFERENCE_MARGIN` are deleted, the API fallback is
+  default-format intent covered to the Pareto top. `cmd_sensitivity`
+  records `intended_bytes` + `pricing_reference_bytes` in `input.json`.
+- **Deliberate deviation from the design**: the sensitivity stale-check
+  keeps (not drops) the `budget_mb`/`budget_ratio` source keys and gains
+  `pareto_ratios` — all three feed the derivation, so a change should
+  offer a step-12 re-run. A looser-custom-budget-at-step-13 edge stays
+  covered by the next bullet, never silent.
+- **Step-13 loud note** (`optimizer.py: _optimize_dp_mckp`): whenever the
+  primary allocation chooses a column whose KLD is proxy-estimated
+  (measured-ness mirrors the lookup `probe_fn` exactly — row counts iff it
+  carries `kld_tail_1pct`; Q6_K start type exempt since ΔKLD ≡ 0;
+  all-proxy tables stay quiet as estimation-by-design), the manifest
+  records `primary.proxy_kld_columns` and the notes carry a WARNING naming
+  each column and advising a step-12 re-run covering the budget.
+- **Tests**: new `tests/test_pricing_reference.py` (derivation tracking /
+  Pareto coverage / custom top / floor-1.0, loud-note fires on a
+  floor-only-measured table solved loose, quiet on a fully measured
+  table), sensitivity flag-rejection + `pareto_ratios` stale key in
+  `test_run_passthrough.py`. Suite: **150 green**.
+- **Best result so far (bar for the from-scratch verification rerun)**:
+  lazy-pipeline Tier-1 heldout — mean 0.00633, P99 0.101, same-top 98.3%
+  at 4881 MiB (budget 4885; `/tmp/tier1_lazy.log`), beating manual
+  hand-export (0.0091/0.148/98.0 @ 4885) and XL (0.0178/0.251/97.2 @
+  5126). Probe cost that run: 193 rows / 84 pricing rounds at a
+  near-exhaustive reference (lambda≈0) — the derived reference should
+  reproduce the quality at fewer probes; judge reasonableness against
+  these two numbers, not against zero.
+- **From-scratch verification (2026-09-28, single `odg run`)**: fresh
+  `artifacts-verify`, one command (`run --model <bf16 gguf> --quant q4_k_m
+  --mode llama --budget-mb 4885 --fixed-groups other@global --jobs 2
+  --perplexity-args "-ngl 99" --no-ask --until validate`; note `--mode
+  llama` also covered imatrix this time, real `imatrix.gguf` produced):
+  **16 done, 0 failed**. Step 12 derived reference 5883 MiB (Pareto top,
+  as designed) → 83 priced rounds, 191 rows, 9 excluded, λ≈0. Step 13:
+  identical allocation (Q5×10/Q8×5/Q4×5/Q6×4/Q2×1, embedding Q4_K, pred
+  −0.00163), `proxy_kld_columns: []` (note correctly quiet), export
+  5118550976 B — byte-identical to the manual campaign. Tier-1 heldout:
+  mean 0.006333, P99 0.101207, top1 0.9830, verdict **RELEASE**.
+- **Probe-count evaluation**: 191 rows / 83 rounds vs the bar's 193 / 84 —
+  essentially unchanged, so the count is *reasonable* (bounded cert,
+  sound) but *not improved*. Cause: the reference is the Pareto top
+  (1.0×Q6), still loose enough that λ≈0 → near-exhaustive measurement.
+  Pricing at the intended 4885 MiB (0.83×Q6) would give λ>0 and real
+  pruning, but pareto points above intended would lose measurement
+  coverage. Improvement direction (future): price at intended and extend
+  loud-note coverage to pareto picks resting on estimates — needs the
+  pareto re-solve to report measured-ness per point. Not implemented.
+
 ## E4B lazy-pipeline rerun: gap reversed by the pipeline itself (2026-09-28)
 
 - **Step 12 --force** (pid 767486, `/tmp/lazy_sens4.log`): 193 rows, 84

@@ -920,10 +920,11 @@ def build_sensitivity_table(
     GPU measures: anchor + floors first, then attractive columns only).
     ``certificate_mode="exhaustive"`` keeps the legacy full-universe
     measurement. ``pricing_budget_bytes`` is the intended solve budget
-    for pricing (the tightness λ should assume; defaults to the loose
-    pricing_reference_budget(catalog): all-Q6 × margin — loose is the safe
-    direction for the transfer guarantee, tight is where probes are saved;
-    the CLI passes the intended solve budget so pricing sees real λ).
+    for pricing (the tightness λ should assume; defaults to the derived
+    pricing_reference_budget: default-format intent covered to the Pareto
+    top — loose is the safe direction for the transfer guarantee, tight is
+    where probes are saved; the CLI passes the derived reference so
+    pricing sees real λ).
     """
     log: list[str] = []
     notes: list[str] = []
@@ -985,10 +986,10 @@ def build_sensitivity_table(
             log.append("3b. certificate=exhaustive — measuring full universe")
             rows, baseline_absolute = probe_groups_llama(**lazy_kwargs)
         else:
-            from optimizer import pricing_reference_budget
+            from optimizer import default_budget_bytes, pricing_reference_budget
 
             ref_budget = pricing_budget_bytes or pricing_reference_budget(
-                catalog
+                catalog, intended_bytes=default_budget_bytes(catalog),
             )
             log.append(
                 f"3b. pricing reference budget={ref_budget} bytes "

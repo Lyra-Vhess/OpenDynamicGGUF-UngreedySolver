@@ -39,6 +39,13 @@ candidate ladder (F32 down to Q2_K for every group — no role floors; only
 measured `pin_high` hints floor at Q5_K), with the P99 guardrail and a
 termination certificate. See README Stage 7.
 
+If the primary allocation rests on proxy-estimated (never measured) KLD
+columns — e.g. solving at a budget looser than the step-12 pricing
+reference covered — the manifest records them under
+`primary.proxy_kld_columns` and the notes carry a WARNING naming each one.
+(The guardrail path hard-errors on such picks first when it is on; the
+note covers the guardrail-opted-out remainder.)
+
 ---
 
 ## Outputs

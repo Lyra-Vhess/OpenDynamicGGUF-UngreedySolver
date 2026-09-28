@@ -761,17 +761,29 @@ def q6_reference_bytes(
     return _estimate_total_bytes(q6, groups, tensors, size_margin)
 
 
-#: Pricing-reference margin over all-Q6 for lazy step-12 probing. The
-#: reference budget only needs to be *loose*: columns excluded at a loose
-#: budget stay excluded at any tighter real budget, so overestimating
-#: wastes probes but never breaks the certificate. 1.2 covers the loosest
-#: shipped format (q8_0, ratio 1.15) with headroom.
-PRICING_REFERENCE_MARGIN = 1.2
+def pricing_reference_budget(
+    catalog: dict[str, Any], *, intended_bytes: int,
+    pareto_top_ratio: float = 1.0,
+) -> int:
+    """Reference budget for lazy step-12 column-generation pricing.
 
+    The reference exists for one purpose: computing λ. Soundness needs it
+    *loose* relative to every budget step 13 might solve (columns excluded
+    at a loose budget stay excluded at any tighter real budget), so it is
+    ``max(intended solve budget, Pareto-top coverage)`` — both derived,
+    never user-supplied:
 
-def pricing_reference_budget(catalog: dict[str, Any]) -> int:
-    """Loose reference budget for lazy step-12 column-generation pricing."""
-    return max(1, int(q6_reference_bytes(catalog) * PRICING_REFERENCE_MARGIN))
+    - ``intended_bytes``: exactly what step 13 will solve. The CLI threads
+      the same budget flags to both steps, so in run mode the reference
+      tracks the real budget by construction.
+    - ``pareto_top_ratio``: the loosest Pareto point re-solved from this
+      table (the standard span tops at 1.0×Q6). One table serves many
+      solves, so the reference must cover the loosest, not just primary.
+    """
+    pareto_top = default_budget_bytes(
+        catalog, ratio=max(1.0, float(pareto_top_ratio))
+    )
+    return max(1, max(int(intended_bytes), pareto_top))
 
 
 def default_budget_bytes(
@@ -872,6 +884,36 @@ def _optimize_dp_mckp(
         file_overhead_bytes=file_overhead_bytes,
     )
     alloc: dict[str, str] = dp["allocation"]
+    # Deviation edge (loud, not silent): the primary allocation rests on a
+    # proxy-estimated KLD wherever the chosen column was never measured
+    # (e.g. step 13 solved at a budget looser than the step-12 pricing
+    # reference covered). Measured-ness mirrors the step-13 lookup probe_fn
+    # exactly: a row counts iff it carries kld_tail_1pct. The Q6_K start
+    # type is exempt (ΔKLD ≡ 0 by definition — choosing the baseline needs
+    # no measurement), and all-proxy tables stay quiet (nothing measured
+    # to contrast against; proxy mode is estimation by design).
+    measured_cells = {
+        (r["group_id"], str(r["probe"]).upper())
+        for r in rows
+        if r.get("kld_tail_1pct") is not None
+    }
+    proxy_chosen: list[str] = []
+    if measured_cells:
+        proxy_chosen = sorted(
+            f"{gid}@{q}"
+            for gid, q in alloc.items()
+            if q.upper() != "Q6_K"
+            and (gid, q.upper()) not in measured_cells
+        )
+    if proxy_chosen:
+        notes.append(
+            "WARNING: primary allocation rests on proxy-estimated (never "
+            "measured) KLD for: " + ", ".join(proxy_chosen) + ". This happens "
+            "when step 13 solves at a budget looser than the step-12 pricing "
+            "reference covered — the affected columns were attractive at a "
+            "tightness λ never priced for. Re-run step 12 so the reference "
+            "covers this budget, or treat the predicted KLD as an estimate."
+        )
     fixed_info: dict[str, dict[str, Any]] = dp.get("fixed_groups", {})
     fixed_total: int = int(dp.get("fixed_bytes_total", 0))
     kept_total: int = int(dp.get("kept_bytes_total", 0))
@@ -1143,6 +1185,7 @@ def _optimize_dp_mckp(
                     "certificate": cert,
                     "rounds": dp["rounds"],
                     "floors": dp.get("floors"),
+                    "proxy_kld_columns": proxy_chosen,
                 },
                 "pareto": pareto_summary,
                 "budget_bytes": budget_bytes,

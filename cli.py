@@ -373,20 +373,6 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Lipschitz bound L for pricing (default: auto-calibrated x2 margin)",
     )
-    p_sens.add_argument(
-        "--budget-mb",
-        type=float,
-        default=None,
-        help="Intended solve budget in MiB: pricing assumes this tightness "
-        "(default: from run quant profile ratio)",
-    )
-    p_sens.add_argument(
-        "--budget-ratio",
-        type=float,
-        default=None,
-        help="If --budget-mb omitted, intended budget as fraction of Q6_K "
-        "baseline (default: from --quant)",
-    )
     p_sens.add_argument("--no-explain", action="store_true")
 
     # --- optimize (step 13) ---
@@ -1115,6 +1101,10 @@ def _pipeline_expected_inputs(step_id: str, args: argparse.Namespace, fmt):
         if fmt is not None:
             exp["baseline"] = fmt.baseline_type
             exp["quant_format"] = fmt.id
+        # pareto_ratios sets the loosest re-solve the table must cover,
+        # so it feeds the derived pricing reference (unlike optimize,
+        # raw string compare is enough — derivation parses it identically).
+        exp["pareto_ratios"] = _run_flag(args, "pareto_ratios", None)
     elif step_id == "optimize":
         bm = _run_flag(args, "budget_mb", None)
         exp["budget_mb"] = float(bm) if bm is not None else None
@@ -3104,6 +3094,42 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
         str(imatrix_gguf) if imatrix_gguf.is_file() else None
     )
 
+    # No sensitivity-level budget flags: the pricing reference is derived,
+    # not asked for. Intended = exactly what step 13 will solve (same
+    # threaded flags), covered up to the loosest Pareto point re-solved
+    # from this table. Computed before begin_step so input.json records it.
+    from optimizer import (
+        DEFAULT_PARETO_RATIOS,
+        default_budget_bytes as _sens_budget,
+        pricing_reference_budget as _sens_ref,
+    )
+
+    _sens_bm = getattr(args, "budget_mb", None)
+    if _sens_bm is not None:
+        _intended = int(float(_sens_bm) * 1024 * 1024)
+    else:
+        _sens_br = getattr(args, "budget_ratio", None)
+        _intended = _sens_budget(
+            catalog,
+            ratio=float(_sens_br)
+            if _sens_br is not None else float(fmt.budget_ratio),
+        )
+    _raw_pr = getattr(args, "pareto_ratios", None)
+    try:
+        _ratios = (
+            [float(r) for r in str(_raw_pr).split(",")]
+            if _raw_pr else list(DEFAULT_PARETO_RATIOS)
+        )
+    except ValueError:
+        print(f"ERROR: bad --pareto-ratios: {_raw_pr}", file=sys.stderr)
+        return 1
+    _reference = _sens_ref(
+        catalog, intended_bytes=_intended,
+        pareto_top_ratio=max(_ratios),
+    )
+    input_data["intended_bytes"] = _intended
+    input_data["pricing_reference_bytes"] = _reference
+
     try:
         step_dir = store.begin_step(
             meta.run_id, "sensitivity", input_data, force=args.force
@@ -3113,18 +3139,6 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
 
     try:
         with ui.working('Probing sensitivity (ΔKLD)…', explain=print_explain):
-            from optimizer import default_budget_bytes as _sens_budget
-
-            _sens_bm = getattr(args, "budget_mb", None)
-            if _sens_bm is not None:
-                _intended = int(float(_sens_bm) * 1024 * 1024)
-            else:
-                _sens_br = getattr(args, "budget_ratio", None)
-                _intended = _sens_budget(
-                    catalog,
-                    ratio=float(_sens_br)
-                    if _sens_br is not None else float(fmt.budget_ratio),
-                )
             result, _rows = build_sensitivity_table(
                 model_ref=meta.model_ref,
                 out_dir=step_dir,
@@ -3147,7 +3161,7 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
                 certificate_mode=getattr(args, "certificate", "bounded"),
                 kld_objective=getattr(args, "kld_objective", "mean"),
                 lipschitz_L=getattr(args, "lipschitz", None),
-                pricing_budget_bytes=_intended,
+                pricing_budget_bytes=_reference,
             )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "sensitivity", str(exc))
