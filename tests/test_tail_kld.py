@@ -129,7 +129,7 @@ def test_update_row_with_measured_kl():
     assert row["kld_tail_1pct"] == pytest.approx(3.0)
 
 
-def test_per_group_grids_drop_above_ladder():
+def test_per_group_grids_use_uniform_ladder():
     from sensitivity import group_probe_grid, probe_groups_proxy
 
     catalog = {
@@ -149,20 +149,21 @@ def test_per_group_grids_drop_above_ladder():
         },
     }
     grid = ["Q2_K", "Q4_K", "Q6_K", "Q8_0"]
-    emb = catalog["groups"]["embedding@global"]
-    assert group_probe_grid(emb, grid) == ["Q8_0"]  # floor above start
-    assert group_probe_grid(catalog["groups"]["attn_q@early"], grid) == [
-        "Q2_K", "Q4_K", "Q6_K"]  # Q8_0 dropped: DP could never choose it
+    # Uniform ladder: no role floors, nothing dropped per group.
+    assert group_probe_grid(
+        catalog["groups"]["embedding@global"], grid) == grid
+    assert group_probe_grid(
+        catalog["groups"]["attn_q@early"], grid) == grid
     rows = probe_groups_proxy(catalog, probe_types=grid, baseline_type="Q6_K")
-    assert len(rows) == 4  # 1 + 3, not 2 x 4
-    assert {r["probe"] for r in rows if r["group_id"] == "embedding@global"} == {"Q8_0"}
+    assert len(rows) == 2 * 4
+    assert {r["probe"] for r in rows if r["group_id"] == "embedding@global"} == set(grid)
 
     import pytest as _pt
     with _pt.raises(ValueError, match="covers nothing"):
-        probe_groups_proxy(catalog, probe_types=["Q4_K"], baseline_type="Q6_K")
+        probe_groups_proxy(catalog, probe_types=["NOPE_K"], baseline_type="Q6_K")
 
 
-def test_default_grid_covers_pinned_ladders():
+def test_default_grid_covers_full_ladder():
     from sensitivity import default_probe_grid
 
     catalog = {
@@ -181,9 +182,9 @@ def test_default_grid_covers_pinned_ladders():
             },
         },
     }
-    # Bare profile grid (Q3-Q6): covers nothing on embedding's Q8 ladder.
+    # Bare profile grid (Q3-Q6): unioned with the full uniform ladder.
     grid = default_probe_grid(catalog, ["Q3_K", "Q4_K", "Q5_K", "Q6_K"])
-    assert grid == ["Q8_0", "Q6_K", "Q5_K", "Q4_K", "Q3_K", "Q2_K"]
+    assert grid == ["F32", "F16", "Q8_0", "Q6_K", "Q5_K", "Q4_K", "Q3_K", "Q2_K"]
     # Every group's per-group grid is non-empty under the default.
     from sensitivity import group_probe_grid
 

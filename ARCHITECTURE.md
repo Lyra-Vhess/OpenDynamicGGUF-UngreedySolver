@@ -79,7 +79,7 @@ thrown away; new layers are wrapped around it.
 | Layer | Responsibility | Rule |
 |---|---|---|
 | Core engine | Measure, search, export, gate. Content-addressed, resumable. | Never changes contract: JSON artifacts in the run store |
-| Decision | Translate *user intent* (hardware, workload, trade-offs) into engine inputs (budgets, pins, objectives) | Users say "16 GB MacBook", never "3.2 GB budget" |
+| Decision | Translate *user intent* (hardware, workload, trade-offs) into engine inputs (budgets, floors, objectives) | Users say "16 GB MacBook", never "3.2 GB budget" |
 | Trust | Make every decision inspectable: reports, reasons, benchmarks, checksums | No number without a source artifact |
 | Distribution | Move recipes and results between users: marketplace, leaderboard, HF | Recipes are the unit of sharing, not GGUF files |
 | Interface | CLI first; Web UI and CI are thin clients over the same engine | No logic lives in an interface |
@@ -286,7 +286,7 @@ These extend the existing design principles and every new feature must respect t
 2. **Recipes are the unit of exchange.** The marketplace and leaderboard share recipes and
    measured results — GGUF binaries are always rebuildable from recipe + source hash.
 3. **Intent in, budget out.** Users express hardware and workload; only the decision layer
-   translates to bytes/pins. Engine inputs never grow user-facing vocabulary.
+   translates to bytes/floors. Engine inputs never grow user-facing vocabulary.
 4. **No unmeasured claim leaves the system.** Reports, cards, and leaderboard rows link every
    number to a run artifact hash.
 5. **Paired statistics or nothing.** All published comparisons are paired vs the BF16

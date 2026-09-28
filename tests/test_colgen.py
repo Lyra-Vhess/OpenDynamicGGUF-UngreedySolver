@@ -145,3 +145,34 @@ def test_invalid_lipschitz_detected_against_brute_force():
     # ...yet the certificate vacuously claims no attractive columns remain,
     # which is exactly why `bounded` is conditional on a valid bound.
     assert res["certificate"]["attractive_at_termination"] == []
+
+
+def test_batch_probe_fn_same_result_as_sequential():
+    """batch_probe_fn batches priced rounds (and now floor init) with no
+    change in allocation vs sequential probing."""
+    kwargs, (groups, candidates, sizes, tail, mean, scores) = base_kwargs()
+    seq = run_column_generation(**kwargs)
+    calls: list[list[tuple[str, str]]] = []
+
+    def batch(cols):
+        calls.append(list(cols))
+        return [
+            {"kld_mean": mean[(g, q)], "kld_tail_1pct": tail[(g, q)],
+             "n_tokens": 1000}
+            for g, q in cols
+        ]
+
+    bat = run_column_generation(
+        **{**kwargs, "batch_probe_fn": batch, "batch_size": 2})
+    assert bat["allocation"] == seq["allocation"]
+    assert bat["certificate"]["attractive_at_termination"] == []
+    # Floors go out as one batch of |G|; priced rounds follow in pairs.
+    assert calls and calls[0] == [(g, "Q2_K") for g in groups]
+    assert all(len(c) <= 2 for c in calls[1:])
+
+
+def test_batch_length_mismatch_raises():
+    kwargs, _ = base_kwargs()
+    with pytest.raises(ValueError, match="one result per column"):
+        run_column_generation(
+            **{**kwargs, "batch_probe_fn": lambda cols: [], "batch_size": 2})

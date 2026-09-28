@@ -13,13 +13,13 @@ After optimization, explain every decision in plain language:
 ```text
 $ odg explain --model gemma4-27b
 
-token_embd            → Q8_0   pinned: touched by every token; probe Q4_K cost
-                               ΔKLD +0.055 for only 190 MB saved
-attn_v (all layers)   → Q6_K   pinned: probe Q4_K showed ΔKLD +0.037 for 45 MB —
-                               worst bytes-per-quality trade in the table
+token_embd            → Q5_K   measured: Q8 cost 1.1 GB for ΔKLD −0.003 —
+                              pricing kept the cheaper rung
+attn_v (all layers)   → Q5_K   measured pin_high: probe Q4_K showed ΔKLD +0.037
+                              for 45 MB — floored at Q5_K by the data
 ffn_up (mid layers)   → Q3_K   cheap bits: 310 MB saved for ΔKLD +0.004
 ffn_down (mid layers) → Q4_K   Q3_K probe rejected: ΔKLD +0.019 exceeded the
-                               marginal-rate cutoff at this budget
+                              marginal-rate cutoff at this budget
 ```
 
 ---
@@ -47,9 +47,9 @@ For each group, `explain.py` joins three artifacts:
 
 1. **Final assignment** — from `recipe.yaml`.
 2. **Probe evidence** — the sensitivity rows for that group (what was tried, what it cost).
-3. **Optimizer action** — why the greedy loop stopped where it did: accepted downgrade
-   (best ratio at that iteration), rejected downgrade (worse than the marginal cutoff),
-   or pin (role policy, with the probe row showing the pin was justified).
+3. **Optimizer action** — why the DP stopped where it did: chosen column (best
+   trade at this budget), bound-excluded column (certificate), or measured
+   floor (`pin_high` hint, `--fixed-groups`).
 
 To make (3) exact rather than reconstructed, step 13 gains a small addition: an
 `decisions.jsonl` log — one line per considered move

@@ -1,8 +1,19 @@
 """Column-generation probe strategy with termination certificate (Spec 2.4/2.5).
 
 Master problem: the DP in dp_mckp, restricted to probed columns.
-Initial columns: every group probed at its floor type (Q2_K or pin-adjusted
-floor) — ~|G| probes, guarantees feasibility (all-floor allocation).
+Initial columns: every group probed at its floor type (Q2_K unless
+floor_of says otherwise) — ~|G| probes, guarantees feasibility
+(all-floor allocation).
+
+Pricing (per unprobed (g, q), floor-referenced per Spec 2.4):
+  extra   = bytes[g][q] - bytes[g][floor]      (cost of upgrading from floor)
+  gain    = tail[floor] - tail[q]              (KLD reduction; predicted or bounded)
+  column is ATTRACTIVE iff upper_bound_gain / extra > lambda.
+
+The loop is probe-agnostic: probe_fn may be a real measurement (lazy GPU
+probing at step 12 — pricing decides what gets measured) or a row lookup
+(step 13 selection over step-12 rows). batch_probe_fn, when given, probes
+one priced batch in parallel (same results, fewer round-trips).
 
 Pricing (per unprobed (g, q), floor-referenced per Spec 2.4):
   extra   = bytes[g][q] - bytes[g][floor]      (cost of upgrading from floor)
@@ -55,6 +66,10 @@ DEFAULT_LIPSCHITZ = 1.0
 LIPSCHITZ_MARGIN = 2.0
 
 ProbeFn = Callable[[str, str], dict[str, Any]]
+#: Batch variant: probe a priced batch at once, return one result dict per
+#: (group, quant) in order. Used for parallel GPU probing; sequential
+#: probe_fn covers each batch item when absent.
+BatchProbeFn = Callable[[list[tuple[str, str]]], list[dict[str, Any]]]
 
 
 def bitwidth(quant: str) -> float:
@@ -195,6 +210,7 @@ def run_column_generation(
     max_rounds: int | None = None,
     batch_size: int = 1,
     objective: str = "mean",
+    batch_probe_fn: BatchProbeFn | None = None,
 ) -> dict[str, Any]:
     """Pricing loop around the DP master. Returns allocation + certificate.
 
@@ -241,9 +257,8 @@ def run_column_generation(
     probed: dict[str, list[str]] = {g: [] for g in groups}
     n_probed = 0
 
-    def do_probe(g: str, q: str) -> None:
+    def record(g: str, q: str, m: dict[str, Any]) -> None:
         nonlocal n_probed
-        m = probe_fn(g, q)
         t = m.get("kld_tail_1pct")
         tails[(g, q)] = None if t is None else float(t)
         c = m.get("kld_mean")
@@ -258,9 +273,27 @@ def run_column_generation(
                 f"(step 12 --mode llama) instead of estimating it."
             )
 
+    def do_probe(g: str, q: str) -> None:
+        record(g, q, probe_fn(g, q))
+
+    def do_batch(cols: list[tuple[str, str]]) -> None:
+        if batch_probe_fn is None or len(cols) <= 1:
+            for g, q in cols:
+                do_probe(g, q)
+            return
+        results = batch_probe_fn(list(cols))
+        if len(results) != len(cols):
+            raise ValueError(
+                f"batch_probe_fn returned {len(results)} results for "
+                f"{len(cols)} columns — one result per column, in order."
+            )
+        for (g, q), m in zip(cols, results):
+            record(g, q, m)
+
     # Initial columns: floor probe per group (mandatory baseline).
-    for g in groups:
-        do_probe(g, floors[g])
+    # Floors go through do_batch: all mandatory, so parallelism loses no
+    # laziness (no batch_probe_fn → same sequential loop as before).
+    do_batch([(g, floors[g]) for g in groups])
 
     auto_L = lipschitz_L is None
     L = DEFAULT_LIPSCHITZ if auto_L else float(lipschitz_L)
@@ -330,8 +363,7 @@ def run_column_generation(
                 f"widen delta_bins (lambda noise) or raise --lipschitz, "
                 f"do NOT accept a non-certified solution."
             )
-        for g, q in to_probe:
-            do_probe(g, q)
+        do_batch(to_probe)
 
     assert solution is not None  # floor probes guarantee a first solve
     n_excluded = total_cols - n_probed

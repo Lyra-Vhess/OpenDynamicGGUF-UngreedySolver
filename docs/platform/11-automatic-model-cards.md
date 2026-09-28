@@ -15,7 +15,7 @@ odg card --model gemma4-27b
 
 Generated from run artifacts, covering everything a maintainer writes by hand today:
 
-- optimization settings (budget, objective, pins) and the recipe summary
+- optimization settings (budget, objective, floors) and the recipe summary
 - calibration dataset (corpus recipe id + composition — feature 07)
 - benchmark results as paired deltas vs BF16 with CIs (feature 02)
 - supported hardware (which profiles this file fits, at which context — feature 01)

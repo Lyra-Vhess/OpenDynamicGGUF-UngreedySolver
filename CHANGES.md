@@ -1,5 +1,100 @@
 # Changes: DP-MCKP optimizer with column generation (`feat/dp-mckp-colgen`)
 
+## E4B lazy-pipeline rerun: gap reversed by the pipeline itself (2026-09-28)
+
+- **Step 12 --force** (pid 767486, `/tmp/lazy_sens4.log`): 193 rows, 84
+  pricing rounds, 7 bound-excluded, lambda=0.0, 7 `pin_high` hints (late
+  layers + other@early/late). Sidecar harvest recovered 49/52 orphan
+  trials (~287 GB freed, 2 partials remeasured); disk held 58–59%
+  throughout. 1 orphan gguf remains for next-run harvest.
+- **Reference-budget lesson**: the loose all-Q6×1.2 reference (7059 MiB)
+  put lambda≈0, so pricing measured near-exhaustively (193/200) — sound
+  (exclusions transfer down) but no probe savings. Fix, same commit:
+  `--budget-mb`/`--budget-ratio` added to the sensitivity parser;
+  `cmd_sensitivity` computes the intended solve bytes and passes them as
+  `pricing_budget_bytes` (loose reference stays as API fallback);
+  sensitivity stale-check gains `budget_mb`/`budget_ratio` keys.
+- **Step 13** (`/tmp/lazy_opt5.log`; first attempt failed correctly — the
+  operator forgot `--fixed-groups other@global`, DP took a proxy-Q2 column
+  and the guardrail refused it): allocation Q5×10/Q8×5/Q4×5/Q6×4/Q2×1,
+  **embedding@global→Q4_K on measured data**, predicted mean −0.00163,
+  guardrail pass1→pass2 (−0.00211→−0.00163, T*=0.0328), bounded cert 119
+  probed/43 excluded, 4881 MiB ≤ 4885 budget. Export matched prediction
+  within 2.4 KB (5118550976 B).
+- **Heldout Tier-1** (`/tmp/tier1_lazy.log`): mean 0.00633, P99 0.101,
+  same-top 98.3% — beats the manual hand-export (0.0091/0.148/98.0) and XL
+  (0.0178/0.251/97.2) at smaller size. The pipeline now reproduces on its
+  own what took manual intervention in the postscript below.
+- Follow-ups: BF16 stays off the ladder pending build verification;
+  IQ4_XS still not on the ladder.
+- **Measured Tier-1 wired** (`validate.py: _tier1_llama`, `cli.py`): step
+  15 runs `llama-perplexity --kl-divergence` on the candidate against
+  `logits-heldout.bin` whenever heldout assets exist (mode auto prefers
+  measured, falls back to proxy; mode llama hard-errors naming what's
+  missing). Gates are v1, E4B-calibrated (mean ≤ 0.05, P99 ≤ 0.50,
+  top1 ≥ 0.90). New flags `--llama-perplexity` / `--perplexity-args` on
+  `odg validate` (recorded in input.json + stale-check); `run`/`fit`
+  already thread `--perplexity-args` through the shared namespace.
+
+## Ladder reform: role pins gutted, F32/F16 ceiling, lazy probing wired (2026-09-28)
+
+- **Role pins deleted** (`optimizer.py`, `sensitivity.py`, `report.py`,
+  `cli.py`): `DEFAULT_PINS` (embedding/lm_head→Q8, attn_v→Q5) is gone, with
+  it the `report.py` mirror, the `use_pins`/`pins` parameters, and the
+  `--no-pins` flag on `optimize`/`run`/`fit` (passing it is now an argparse
+  error). The 17x E4B gap postscript below showed the embedding pin cost
+  1.1 GB for ~zero ΔKLD with no measured justification — heuristic floors
+  are not coming back. Kept, because they are measured or explicit:
+  `pin_high` hints (Q4 probe ΔKLD > 0.04 → Q5 floor), `--fixed-groups`,
+  kept non-quantizable norms, and the validate feedback constraint.
+- **Uniform ladder + F32/F16 ceiling** (`optimizer.py: LADDER`): every group
+  shares one ladder, `F32 → F16 → Q8_0 → … → Q2_K`. The ladder is the
+  candidate universe, not a bias: DP, pricing, and bounds treat every rung
+  identically. Proxy multipliers added (`F16 ≈ 0.03`, `F32 ≈ 0.01`);
+  `top_token_agree` gained its missing upper clamp (negative ΔKLD vs the
+  anchor used to yield >100% agreement). Greedy stays K-ladder-scoped
+  (downgrade-only walk; ceiling is DP-only) as the frozen A/B baseline.
+- **Lazy probing actually wired** (`sensitivity.py: probe_groups_lazy`,
+  `colgen.py: batch_probe_fn`): step 12 in llama mode now does what the
+  colgen docstring always claimed — anchor + floor columns first, then
+  priced rounds where `probe_fn` is a real `measure_column` call, stopping
+  on the certificate. Previously step 12 measured the grid exhaustively and
+  step-13 pricing was a row lookup, so pricing saved zero GPU probes. The
+  pricing reference budget is all-Q6 × 1.2 (loose is the safe direction:
+  excluded-at-loose stays excluded at any tighter real budget; 1.2 covers
+  the loosest shipped format, q8_0 at 1.15). `--jobs` sizes the priced
+  batch (probed in parallel; mandatory floor probes go out as one
+  parallel batch — no laziness lost); resume is sidecar-based
+  (`trials/probed.jsonl`: one line per success — KL metrics + byte counts,
+  everything downstream of a trial file), so disk stays at ~1 in-flight
+  trial instead of accumulating GBs per probe; orphan trial pairs from a
+  killed run are harvested into the sidecar on start (their `.gguf`s
+  deleted after parsing, logs kept); `--certificate exhaustive` keeps
+  full-universe measurement. Pricing scales come from the run's
+  `imatrix.gguf`
+  (per-group means via `reband.real_imatrix_scores`, proxy-JSON fallback,
+  neutral otherwise — neutral only widens bounds). New step-12 flags:
+  `--kld-objective`, `--certificate`, `--lipschitz` (also threaded through
+  `run`/`fit` stale-check).
+- **Guardrail drops unmeasured columns** (`optimizer.py`): cap filtering
+  removes columns with no measured P99 (counted as `cap_dropped_unmeasured`
+  in recipe/manifest) instead of erroring — a column with no P99 claim
+  cannot pass the guardrail, and the certificate covers the exclusion.
+  Fully-unmeasured tables still fail loudly (`removes every candidate`).
+- Tests: 144 green (was 126). New `tests/test_ladder_reform.py` (uniform
+  ladder, pin_high survival, negative-delta ceiling win, agreement clamp,
+  priced ceiling skip, sidecar resume + roundtrip/corruption rules,
+  harvest, imatrix aggregation) plus `tests/test_validate_tier1.py`
+  (measured Tier-1 pass/fail/errors, mode branches, CLI flags +
+  stale-check key) plus
+  `test_colgen.py` batch-parity tests (floors go out as one parallel batch —
+  mandatory, so no laziness lost); reworked pin asserts in `test_report.py`,
+  `test_tail_kld.py`, `test_optimize_dp.py`, `test_run_passthrough.py`
+  (incl. `--no-pins` rejection on all four parsers).
+- Follow-ups, not done here: GPU-verify an F32/F16 trial probe + export
+  line against the bundled llama.cpp build; BF16 stays off the ladder until
+  that verification passes for it.
+
 ## Why
 
 The Step-13 optimizer was a greedy downgrade loop: fast, but provably
@@ -107,6 +202,25 @@ grid and optimized mean KLD only.
   warning on fallback) is subtracted from the budget pre-solve and added
   back everywhere; recipe/manifest/`OptimizeResult` carry a `budget` block
   and the new fields. Over-budget floors fail loudly itemizing the parts.
+- **Single-command flag parity** (`cli.py`): `odg run` (and `odg fit`)
+  accept every result-affecting step flag — `--mode`, `--target-tokens`,
+  `--seed`, `--max-docs`, `--freeze-mode`, `--convert-script`,
+  `--require-bf16`, `--chunks`, `--imatrix-args`, `--perplexity-args`,
+  `--bands-per-role`, `--jobs`, `--probe-types`, `--fixed-groups`,
+  `--optimizer`, `--kld-objective`, `--certificate`, `--lipschitz`,
+  `--pareto-ratios`, `--no-pins`, `--budget-mb`, `--budget-ratio`
+  (`run` only; `fit` keeps its hardware-derived budget), `--export-mode`,
+  `--base-type`, `--validate-mode`, `--strict`, `--only-quantizable` —
+  and thread each into its step instead of running every step on hardcoded
+  defaults. Freeze/export/validate keep their own mode flags (their mode
+  vocabularies differ from the global probe `--mode`).
+- **Stale-checkpoint warn-and-confirm** (`cli.py`): when a checkpointed
+  step's recorded `input.json` disagrees with the pipeline flags on a
+  result-affecting key, `odg run`/`odg fit` warn itemizing the diffs and ask
+  whether to re-run that step (default no). Non-interactive sessions
+  (`--no-ask` or no TTY) warn and keep the checkpoint; `--force` re-runs
+  without asking. `jobs` is parallelism-only and never triggers a prompt;
+  keys absent from older checkpoints are ignored rather than false-positive.
 
 ## Deprecated (not removed)
 
@@ -115,10 +229,45 @@ on a real sweep per the spec. Default is now `dp_mckp`.
 
 ## Test summary
 
-`python3 -m pytest tests/ -q` — 114 passed (probe-effect assert
-×3, fixed-group DP/greedy accounting ×4, kept/overhead accounting ×2,
-probe-time fixed skip ×3). No
+`python3 -m pytest tests/ -q` — 134 passed (ladder reform ×8: uniform
+ladder, pin_high survival, negative-delta ceiling win, agreement clamp,
+priced ceiling skip, resume; run/fit flag parity + stale-confirm ×13
+incl. --no-pins rejection; probe-effect assert ×3; fixed-group DP/greedy
+accounting ×4; kept/overhead accounting ×2; probe-time fixed skip ×3). No
 new dependencies (`numpy` only; the log parser is stdlib).
+
+## Postscript (2026-09-28): the 17x gap is closed — it was the embedding pin
+
+Size-matched E4B rematch stood at ours 0.29 vs third-party Q4_K_XL 0.017.
+Per-tensor GGUF-header diff showed XL spends its budget nothing like us:
+190 tensors ours-Q2→theirs-Q4 (+591 MB), 19→Q6 (+234), 82→F32 (+188),
+24→Q5 (+148), 15→IQ4_XS (+56) — funded entirely by 2 tensors
+ours-Q8→theirs-Q5 (**−1248 MB**: token_embd + per_layer_token_embd).
+Byte-exact payload sums (4870 vs 4850 MB) confirm the trade balances.
+
+Solver exonerated (DP optimum is exact; all-Q4-class over our matrix
+predicts 0.0157 ≈ XL's 0.0178 — the matrix is honest), guardrail
+non-binding (pass 1 == pass 2, T* removed nothing), λ=0.0 explained (DP
+solution locally flat within the 16 MiB shadow-price window, not a bug).
+
+Manual embedding probes (same Q6 anchor/imatrix/search split as step 12):
+Q6 0.00295, **Q5 0.00276** — the Q8 pin cost 1.1 GB for ~zero quality.
+CPU re-solve with the two measured columns (ladder extended, everything
+else identical) predicts mean **0.0054** at 4885 MiB; hand-exported
+candidate measures on heldout Tier-1: **mean 0.0091, P99 0.148,
+same-top 98.0%, PPL ratio 1.002 at 4885 MiB** vs XL's 0.0178 / 0.251 /
+97.2% / 1.015 at 5126 MiB. Gap reversed at 241 MB smaller file.
+
+Follow-ups, not done here: ~~productize an override for pinned-group
+ladders (today only the manual path can probe embedding@Q5 — per-group
+grid filtering intersects even explicit `--probe-types` with the
+pins-only ladder)~~ DONE 2026-09-28 by the ladder reform above (pins
+gutted, uniform ladder, lazy pricing — no override needed because there
+is nothing left to override); consider IQ4_XS on the ladder; the 82 small
+`other@*` tensors XL keeps at F32 (+188 MB) are now reachable via the
+F32/F16 ceiling (pricing measures them iff attractive). Experiment
+artifacts (allocation, recipe.tt, quantize command, Tier-1 logs) are
+outside the repo.
 
 ## Deviations from Spec.md
 

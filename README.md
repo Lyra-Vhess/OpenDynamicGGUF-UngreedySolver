@@ -45,15 +45,20 @@ odg quantize --model functiongemma:latest --target-size 3.2GB
 Instead of a uniform preset like `Q4_K_M`, the output is a **recipe** — a measured, explainable, per-tensor-group bit assignment:
 
 ```text
-token_embd            -> Q8_0     (pinned: touched by every token)
-attn_v    (all)       -> Q6_K     (pinned: high sensitivity, small size)
+token_embd            -> Q5_K     (measured: Q8 cost 1.1 GB for ~zero ΔKLD)
+attn_v    (all)       -> Q5_K     (measured: high sensitivity, small size)
 attn_q/k  (early)     -> Q5_K
 attn_q/k  (mid/late)  -> Q4_K
 ffn_gate  (mid)       -> Q3_K     (cheap bits: large tensor, low sensitivity)
 ffn_up    (mid)       -> Q3_K
 ffn_down  (all)       -> Q4_K
-output                -> Q8_0     (pinned)
+output                -> Q5_K     (measured, like the input embeddings)
 ```
+
+No role is pinned: every group may use every rung from F32 down to Q2_K,
+and column-generation pricing measures only the columns that can win.
+The only floors are measured `pin_high` hints (a Q4 probe with large ΔKLD
+floors that group at Q5_K) and your own `--fixed-groups`.
 
 > [!IMPORTANT]
 > This project is in **alpha**. The full CLI pipeline (`odg run`, steps 01–15) is available. Without a local [llama.cpp](https://github.com/ggml-org/llama.cpp) build, export stays in **`dry_run`** (recipe + size estimate only — **no `.gguf` written**). See the **[Usage guide](docs/USAGE.md)** for install, dry-run vs real export, and how to produce a real file.
@@ -133,11 +138,20 @@ odg run --model functiongemma:latest --quant q5_k_m --no-ask
 odg run -m functiongemma:latest -q q4_k_m --no-ask --new-run
 odg run -m functiongemma:latest --until catalog          # stop early
 odg run -m functiongemma:latest --from-step optimize     # resume mid-pipeline
+
+# One command, full control: every step flag threads through, e.g.
+odg run -m <ref> --no-ask --mode llama --perplexity-args "-ngl 99" \
+  --jobs 2 --fixed-groups other@global --certificate exhaustive
 odg formats
 odg status --model functiongemma:latest
 ```
 
-Already-finished steps are skipped unless you pass `--force`.
+Already-finished steps are skipped unless you pass `--force`. If a
+checkpointed step's recorded inputs disagree with the flags you passed now
+(e.g. re-running with a different `--fixed-groups` over an old probe table),
+`odg run` warns and asks whether to re-run that step; non-interactive
+sessions warn and keep the checkpoint. (`--jobs` is parallelism-only and
+never triggers this.)
 
 > [!TIP]
 > If export finished as **`dry_run`** (`gguf_out: null`), no GGUF was written. Install llama.cpp, then:
@@ -380,7 +394,7 @@ Before computing features, classify each name into a **role**. This is more info
 
 | Role | Typical HF name patterns | Usually quantizable? |
 |---|---|---|
-| `embedding` | `embed_tokens`, `tok_embeddings` | Yes (often pinned high) |
+| `embedding` | `embed_tokens`, `tok_embeddings` | Yes (measured per run) |
 | `attn_q` | `q_proj`, `wq` | Yes |
 | `attn_k` | `k_proj`, `wk` | Yes |
 | `attn_v` | `v_proj`, `wv` | Yes (often high sensitivity) |
@@ -389,10 +403,10 @@ Before computing features, classify each name into a **role**. This is more info
 | `ffn_up` | `up_proj`, `w3` | Yes (often cheap bits) |
 | `ffn_down` | `down_proj`, `w2` | Yes (medium) |
 | `ffn_*_exps` | `*.experts.*` (MoE) | Yes |
-| `router` | `gate`, `router` (MoE) | Pin / careful |
+| `router` | `gate`, `router` (MoE) | Measure carefully |
 | `ssm_*` | hybrid / Mamba paths | Role-dependent |
 | `norm` | `layernorm`, `rms_norm`, `norm` | Usually **skip** (leave F16/F32) |
-| `lm_head` | `lm_head`, `output` | Yes (often pinned high) |
+| `lm_head` | `lm_head`, `output` | Yes (measured per run) |
 
 Also record **layer index** (and depth bucket: early / middle / late) when the name contains one. Role × depth is the grouping key used later (~25 groups instead of hundreds of tensors). After the imatrix lands, `odg reband` (step 11b, also in `odg run`) re-cuts each role's layers into bands on measured importance cliffs — same band count, boundaries move.
 
@@ -689,8 +703,8 @@ If the Q3 probe returns ΔKLD ≈ 0.003 → keep Q3. If it returns ΔKLD ≈ 0.1
 | `ffn_up` · mid layers | Q4_K → Q3_K | −310 MB | +0.004 | Accept downgrade |
 | `ffn_gate` · mid layers | Q4_K → Q3_K | −305 MB | +0.005 | Accept downgrade |
 | `ffn_down` · mid layers | Q4_K → Q3_K | −180 MB | +0.019 | Keep Q4_K |
-| `attn_v` · all layers | Q6_K → Q4_K | −45 MB | +0.037 | Pin Q6_K |
-| `token_embd` | Q8_0 → Q4_K | −190 MB | +0.055 | Pin Q8_0 |
+| `attn_v` · all layers | Q6_K → Q4_K | −45 MB | +0.037 | Floor Q5_K if Q4 probes hot (`pin_high`) |
+| `token_embd` | Q8_0 → Q5_K | −1.1 GB | +0.003 | Take Q5_K — the old Q8 pin cost 1.1 GB for ~zero ΔKLD |
 
 *Illustrative values — real numbers come from your probe run. Large MLP tensors often buy cheap savings; attention and embeddings often buy expensive regret — but we only believe that after measuring.*
 
@@ -714,7 +728,7 @@ v1 deliberately skips Bayesian optimization and evolutionary search: each object
 
 - **Objective** — `--kld-objective mean` (default) minimizes mean KLD under the automatic P99 guardrail below; `--kld-objective tail_1pct` minimizes the stock `99.0% KLD` percentile line instead. Both are always reported. Mean is the default because per-group percentiles don't add across groups, so a *summed* P99 systematically misranks allocations, while mean KLD is approximately additive.
 - **P99 guardrail (automatic)** — under the mean objective there is no knob: pass 1 solves mean-only, takes the worst per-group P99 in that allocation as T*, and pass 2 re-solves mean subject to every group staying at or below T* (provably feasible — pass 1's own allocation satisfies it). Minimizing the additive mean subject to a per-group worst-1% cap is the sound shape; T*, both pass means, and the removal count are recorded in the recipe. The DP, Pareto, and certificate all operate on the restricted problem unchanged.
-- **Column generation** — probes only the `(group, quant)` columns needed to certify optimality (floor type per group first, then attractive columns by upper-bound gain per byte), instead of a full sweep. `--certificate exhaustive` probes everything for an unconditional certificate.
+- **Column generation (lazy probing)** — step 12 measures the anchor plus each group's floor first, then column-generation pricing selects only attractive columns for GPU trials (floor-referenced gain per byte vs the shadow price λ), terminating with a certificate. The candidate universe is the full uniform ladder (F32 down to Q2_K) — wide costs nothing because pricing, not grid membership, spends GPU. `--certificate exhaustive` measures the whole universe for an unconditional certificate.
 - **Termination certificate** — every recipe records which columns were probed, which were excluded, and the bound model (monotonicity + Lipschitz `L`, auto-calibrated unless `--lipschitz` is given). Check `attractive_at_termination: []` to verify certification.
 - **Pareto frontier** — falls out of the DP table for free; `pareto/*.yaml` covers the standard ratios plus any `--pareto-ratios` values.
 - **Measured sizes, no margin** — probed columns use exact group bytes read from trial-file GGUF metadata (`bytes_measured`, audited per entry); never-probed columns fall back to bytes-per-element estimates flagged `measured: false`. A dual-threshold sanity check (absolute deviation > 256 KiB *and* relative > 15%) aborts the optimize naming the corrupt column. DP bins are 256 KiB (recorded in the recipe).
@@ -756,7 +770,7 @@ Catches failure modes logit metrics miss: broken chat-template handling, degener
 
 **Tier 3 — Benchmarks** *(final 1–2 candidates · hours)* — MMLU / GSM8K / HumanEval via lm-eval-harness. The gate is **statistical**: paired per-question comparison against the BF16 model, required to sit inside the confidence interval. Never a raw score threshold — benchmark noise would randomly pass and fail good quants.
 
-**Feedback loop:** a gate failure returns to the optimizer as a concrete constraint, not a blind restart. A max-KLD breach is traced to the group that caused it (the sensitivity table makes the lookup trivial), that group is pinned one precision level higher, and the search re-runs — from cache, so only changed artifacts are recomputed.
+**Feedback loop:** a gate failure returns to the optimizer as a concrete constraint, not a blind restart. A max-KLD breach is traced to the group that caused it (the sensitivity table makes the lookup trivial), that group is fixed one precision level higher (`--fixed-groups`), and the search re-runs — from cache, so only changed artifacts are recomputed.
 
 **Failure prevented:** shipping a quant that only looks good on its own calibration data — the exact overfitting failure this whole design exists to avoid.
 
@@ -778,8 +792,8 @@ MLP tensors dominate the byte count — that's where size is won. Attention and 
 | `ffn_up` · `ffn_gate` | Low | Search down to Q3_K — largest tensors, cheapest bits |
 | `ffn_down` | Medium | Search, typically lands one level above gate/up |
 | `attn_q` · `attn_k` | Medium | Search Q4–Q5; early layers usually need more |
-| `attn_v` · `attn_output` | High | Pin Q5_K–Q6_K — small tensors, outsized KLD impact |
-| `token_embd` · `output` | Critical | Pin Q8_0 (or leave F16) — touched by every token |
+| `attn_v` · `attn_output` | High | Measure first — small tensors, outsized KLD impact |
+| `token_embd` · `output` | Critical | Measure Q5–Q8 — touched by every token, but Q8 is not free |
 
 </details>
 
@@ -794,9 +808,9 @@ Expert tensors are ~90% of the bytes, so dynamic assignment pays off most here �
 |---|---|---|
 | `ffn_up_exps` · `ffn_gate_exps` | Low | Quantize hard (Q2–Q3) — the bulk of the model |
 | `ffn_down_exps` | Medium | One level above the up/gate experts |
-| shared expert | High | Pin high — active on every token |
-| router / gate | Critical | Pin — tiny tensor that controls all routing |
-| `attn_*` | High | Pin Q5–Q6 |
+| shared expert | High | Floor high on measured evidence — active on every token |
+| router / gate | Critical | Measure — tiny tensor that controls all routing |
+| `attn_*` | High | Search Q5–Q6 |
 
 </details>
 
@@ -811,8 +825,8 @@ Published probes on hybrids show the recurrent path is the trap: `ssm_out` at Q2
 |---|---|---|
 | `ffn_*` | Low | Search as in dense models |
 | `ssm_in` · `conv1d` | Medium | Search cautiously, one level at a time |
-| `attn_*` (sparse layers) | High | Pin — few of them, they carry long-range mixing |
-| `ssm_out` | Critical | Never below Q6 — max-KLD spike, minuscule savings |
+| `attn_*` (sparse layers) | High | Measure — few of them, they carry long-range mixing |
+| `ssm_out` | Critical | Floor Q6 on measured evidence — max-KLD spike, minuscule savings |
 
 </details>
 

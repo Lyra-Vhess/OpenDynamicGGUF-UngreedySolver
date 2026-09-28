@@ -154,7 +154,8 @@ def classify_tensors(
         role = classify_name(name)
         depth = depth_bucket(layer, n_layers) if layer is not None else "global"
         quantizable = role not in NON_QUANTIZABLE
-        # embeddings / lm_head stay quantizable=True but often pinned later
+        # embeddings / lm_head stay quantizable=True (no role floors;
+        # only measured pin_high hints constrain them later)
         group_id = f"{role}@{depth}" if depth else role
 
         row = ClassifiedTensor(

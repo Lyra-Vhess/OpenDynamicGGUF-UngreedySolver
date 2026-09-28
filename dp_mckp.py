@@ -42,7 +42,8 @@ class InfeasibleBudget(Exception):
             f"No allocation fits budget {budget_bytes} bytes: "
             f"minimum achievable is {min_bytes} bytes "
             f"(largest minimum-size group: {largest_group}). "
-            f"Raise the budget or relax role-pin floors."
+            f"Raise the budget: even the smallest candidate per group "
+            f"exceeds it."
         )
 
 

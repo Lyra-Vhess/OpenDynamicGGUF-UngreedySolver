@@ -772,6 +772,103 @@ def _tier1_proxy(recipe: dict[str, Any], *, has_candidate: bool) -> dict[str, An
     }
 
 
+def _tier1_llama(
+    *,
+    candidate: str | Path,
+    heldout_txt: str | Path,
+    heldout_bin: str | Path,
+    out_dir: Path,
+    llama_perplexity: str | Path | None = None,
+    extra_args: list[str] | None = None,
+) -> dict[str, Any]:
+    """Measured Tier-1: candidate GGUF vs held-out reference logits.
+
+    Runs ``llama-perplexity -m CANDIDATE -f heldout.txt --kl-divergence
+    --kl-divergence-base logits-heldout.bin`` (+ extra_args verbatim, e.g.
+    ``-ngl 99``) and gates the parsed KL summary. Thresholds are v1,
+    calibrated on the E4B run (good quant: mean 0.006, P99 0.10, top1
+    98.3; bad quant: mean 0.29) — an order of magnitude above a good
+    measurement, tight enough to catch real regressions.
+    """
+    import subprocess
+
+    from kld import parse_llama_perplexity_kl
+    from llama_bins import find_llama_binary
+
+    binary = find_llama_binary("llama-perplexity", llama_perplexity)
+    if binary is None:
+        raise RuntimeError(
+            "Tier-1 needs llama-perplexity (PATH, LLAMA_CPP_DIR, or "
+            "--llama-perplexity)."
+        )
+    for p, label in (
+        (candidate, "candidate GGUF"),
+        (heldout_txt, "heldout.txt"),
+        (heldout_bin, "logits-heldout.bin"),
+    ):
+        if not Path(p).is_file():
+            raise RuntimeError(f"Tier-1 needs {label}: missing {p}")
+    cmd = [
+        str(binary), "-m", str(candidate), "-f", str(heldout_txt),
+        "--kl-divergence", "--kl-divergence-base", str(heldout_bin),
+    ]
+    if extra_args:
+        cmd += list(extra_args)
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    log = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
+    (Path(out_dir) / "llama-perplexity-tier1.log").write_text(
+        log, encoding="utf-8"
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"llama-perplexity Tier-1 failed (exit {proc.returncode}):\n"
+            f"{log[-4000:]}"
+        )
+    m = parse_llama_perplexity_kl(log)  # hard error on missing KL lines
+    mean_kld = float(m["kld_mean"])
+    p99 = float(m["kld_tail_1pct"])
+    p999 = m["kld_p999"]
+    max_kld = m["kld_max"]
+    top1 = m["same_top_p"]
+    top1_frac = (float(top1) / 100.0) if top1 is not None else None
+
+    gates = {
+        "mean_kld_max": 0.05,
+        "p99_kld_max": 0.50,
+        "p999_kld_max": 2.0,
+        "max_kld_max": 10.0,
+        "top1_agree_min": 0.90,
+    }
+    checks = {
+        "mean_kld": mean_kld,
+        "p99_kld": p99,
+        "p999_kld": p999,
+        "max_kld": max_kld,
+        "top1_agree": top1_frac,
+    }
+    detail = {
+        "mean_kld": mean_kld <= gates["mean_kld_max"],
+        "p99_kld": p99 <= gates["p99_kld_max"],
+        "p999_kld": p999 <= gates["p999_kld_max"] if p999 is not None else True,
+        "max_kld": max_kld <= gates["max_kld_max"] if max_kld is not None else True,
+        "top1_agree": (
+            top1_frac >= gates["top1_agree_min"] if top1_frac is not None else True
+        ),
+        "candidate_exists": True,
+    }
+    passed = all(detail.values())
+    return {
+        "method": "llama_heldout",
+        "split": "heldout",
+        "gates": gates,
+        "metrics": checks,
+        "pass": passed,
+        "pass_detail": detail,
+        "perplexity": m.get("perplexity"),
+        "note": "Measured Tier-1: candidate vs held-out reference logits.",
+    }
+
+
 def _tier2_smoke(
     *,
     specialty: str | None,
@@ -974,6 +1071,10 @@ def validate_and_release(
     resolve_descriptor: dict[str, Any] | None = None,
     mode: Mode = "auto",
     allow_provisional: bool = True,
+    heldout_txt: str | Path | None = None,
+    heldout_bin: str | Path | None = None,
+    llama_perplexity: str | Path | None = None,
+    perplexity_args: list[str] | None = None,
 ) -> ValidateResult:
     log: list[str] = []
     notes: list[str] = []
@@ -1002,8 +1103,35 @@ def validate_and_release(
         )
 
     method = "proxy_gates"
-    log.append("3. Tier-1: proxy_from_recipe (held-out logits not available)")
-    tier1 = _tier1_proxy(recipe, has_candidate=has_candidate)
+    tier1: dict[str, Any] | None = None
+    heldout_ok = bool(
+        has_candidate
+        and heldout_txt and Path(heldout_txt).is_file()
+        and heldout_bin and Path(heldout_bin).is_file()
+    )
+    if heldout_ok:
+        if mode == "llama" or mode == "auto":
+            log.append(
+                "3. Tier-1: measured llama-perplexity vs held-out logits"
+            )
+            tier1 = _tier1_llama(
+                candidate=candidate,
+                heldout_txt=heldout_txt,
+                heldout_bin=heldout_bin,
+                out_dir=out_dir,
+                llama_perplexity=llama_perplexity,
+                extra_args=perplexity_args,
+            )
+            method = "llama_heldout"
+    if tier1 is None:
+        if mode == "llama":
+            raise RuntimeError(
+                "llama validate mode needs held-out assets from step 11 "
+                "(heldout.txt + logits-heldout.bin). Re-run "
+                "`odg reference-logits --mode llama`."
+            )
+        log.append("3. Tier-1: proxy_from_recipe (held-out logits not available)")
+        tier1 = _tier1_proxy(recipe, has_candidate=has_candidate)
     # For dry-run exports, allow provisional pass path
     if not has_candidate and allow_provisional:
         tier1["pass_detail"]["candidate_exists"] = False

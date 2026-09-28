@@ -204,14 +204,27 @@ def test_tail_cap_too_tight_names_group():
         )
 
 
-def test_tail_cap_refuses_proxy_tails():
-    """Guardrail needs measured tails even under the mean objective."""
+def test_tail_cap_drops_unmeasured_columns():
+    """Guardrail drops columns with no measured P99 (lazy bound-excluded)
+    instead of erroring; fully-unmeasured groups still fail loudly."""
     catalog = tiny_catalog()
-    sens = tiny_sensitivity(catalog)
-    with pytest.raises(ValueError, match="measured kld_tail_1pct"):
+    sens, _ = _measured_index(catalog)  # Q6..Q2 measured; ceiling not
+    res = dp_mckp_optimize(
+        catalog=catalog, sensitivity_rows=sens["rows"], objective="mean",
+        tail_cap=1e9, size_margin=1.0, budget_bytes=200 * BIN_BYTES,
+    )
+    assert res["cap_dropped_unmeasured"] == 3 * 3  # F32/F16/Q8 × 3 groups
+    assert all(
+        e["type"] not in ("F32", "F16", "Q8_0")
+        for e in res["cost_matrix"]["entries"]
+    )
+    # All-proxy table: every column unmeasured → nothing to solve over.
+    sens_proxy = tiny_sensitivity(catalog)
+    with pytest.raises(ValueError, match="removes every candidate"):
         dp_mckp_optimize(
-            catalog=catalog, sensitivity_rows=sens["rows"], objective="mean",
-            tail_cap=1e9, size_margin=1.0, budget_bytes=200 * BIN_BYTES,
+            catalog=catalog, sensitivity_rows=sens_proxy["rows"],
+            objective="mean", tail_cap=1e9, size_margin=1.0,
+            budget_bytes=200 * BIN_BYTES,
         )
 
 
@@ -242,8 +255,12 @@ def test_measured_sizes_preferred_and_audited():
         catalog=catalog, sensitivity_rows=sens["rows"], objective="mean",
         auto_cap=False, budget_bytes=200 * BIN_BYTES,
     )
-    assert all(e["measured"] for e in res["cost_matrix"]["entries"]
-               if e["probed"])
+    by_key = {(e["group"], e["type"]): e for e in res["cost_matrix"]["entries"]}
+    # Stamped rows carry measured:true; unmeasured ceiling columns exist
+    # with measured:false (priced, possibly proxy-filled, never invented).
+    for r in sens["rows"]:
+        assert by_key[(r["group_id"], r["probe"])]["measured"] is True
+    assert by_key[("attn_q@early", "F32")]["measured"] is False
 
 
 def test_measured_size_sanity_trip_names_column():

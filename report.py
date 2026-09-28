@@ -16,10 +16,11 @@ from typing import Any
 
 from sensitivity import estimate_group_nbytes
 
-# Role pins mirrored from optimizer.DEFAULT_PINS (import kept light on purpose)
-_PIN_ROLES = {"embedding": "Q8_0", "lm_head": "Q8_0", "attn_v": "Q5_K"}
-
+# Source of truth for role floors lives in optimizer._candidate_ladder
+# (measured pin_high hints only); report reasons never invent pins.
 _QUANT_COLORS = {
+    "F32": "#e8e8e8",
+    "F16": "#a5d6a7",
     "Q8_0": "#4dd0a5",
     "Q6_K": "#59b8e6",
     "Q5_K": "#7f96f0",
@@ -142,7 +143,6 @@ def extract_allocations(run_root: Path) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     for gid, q in sorted(opt["assignments"].items()):
         q = str(q).upper()
-        role = gid.split("@")[0]
         n_elem = group_elements(gid)
         try:
             nbytes = estimate_group_nbytes(n_elem, q) if n_elem else None
@@ -151,9 +151,7 @@ def extract_allocations(run_root: Path) -> dict[str, Any]:
         srow = row_index.get((gid, q))
         dkld = float(srow["delta_kld"]) if srow else (0.0 if q == baseline else None)
 
-        if role in _PIN_ROLES and q == _PIN_ROLES[role].upper():
-            reason = f"pinned: role floor {_PIN_ROLES[role]}"
-        elif q == baseline:
+        if q == baseline:
             reason = f"held at baseline {baseline} — no downgrade paid off"
         elif gid in last_move:
             mv = last_move[gid]

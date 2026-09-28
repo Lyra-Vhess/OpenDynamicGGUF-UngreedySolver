@@ -37,6 +37,7 @@ class OptimizeResult:
     pass1_mean_kld: float | None = None
     pass1_tail_kld: float | None = None
     cap_removed_columns: int = 0
+    cap_dropped_unmeasured: int = 0
     fixed_groups: dict[str, Any] = field(default_factory=dict)
     fixed_bytes_total: int = 0
     kept_bytes_total: int = 0
@@ -46,14 +47,13 @@ class OptimizeResult:
         return asdict(self)
 
 # --- from optimizer/optimize.py ---
-LADDER = ["Q8_0", "Q6_K", "Q5_K", "Q4_K", "Q3_K", "Q2_K"]
-
-# Role floor pins (still overridable via --no-pins)
-DEFAULT_PINS: dict[str, str] = {
-    "embedding": "Q8_0",
-    "lm_head": "Q8_0",
-    "attn_v": "Q5_K",
-}
+# Full candidate ladder, high precision first. No role floors: every group
+# may use every rung (pin_high hints from measured data are the only floors,
+# applied in _candidate_ladder). F32/F16 sit on top so small groups can keep
+# source precision where the shadow price says it is worth it; column
+# generation prices them and probes only attractive ones, so the ceiling
+# costs no GPU when unused.
+LADDER = ["F32", "F16", "Q8_0", "Q6_K", "Q5_K", "Q4_K", "Q3_K", "Q2_K"]
 
 #: Sanity bound for measured trial-file sizes vs the BYTES_PER_ELEM
 #: estimate. A probed column trips it only when BOTH hold, so tiny groups
@@ -165,8 +165,6 @@ def greedy_optimize(
     sensitivity_rows: list[dict[str, Any]],
     budget_bytes: int,
     start_type: str = "Q6_K",
-    pins: dict[str, str] | None = None,
-    use_pins: bool = True,
     size_margin: float = 1.0,
     fixed_groups: frozenset[str] | set[str] | None = None,
     file_overhead_bytes: int = 0,
@@ -177,12 +175,13 @@ def greedy_optimize(
     trial-file measurement; compare against DP accordingly). `size_margin`
     (default 1.0, no-op) scales the estimate; `file_overhead_bytes`
     (GGUF header/metadata) counts toward the budget like everywhere else.
+    The ceiling (F32/F16/Q8 above start) is DP-only: greedy walks down
+    from start_type and never upgrades, so its scope is unchanged.
 
     Groups in ``fixed_groups`` stay at source precision: they are never
     assigned or downgraded, and their catalog bytes ride along inside
     ``_estimate_total_bytes`` (unassigned tensors keep catalog nbytes).
     """
-    pins = dict(DEFAULT_PINS) if use_pins else {}
     groups = catalog.get("groups") or {}
     tensors = catalog.get("tensors") or {}
     row_index = _build_row_index(sensitivity_rows)
@@ -195,21 +194,13 @@ def greedy_optimize(
             continue
         if fixed_groups and gid in fixed_groups:
             continue  # fixed at source precision; bytes ride along below
-        role = str(g.get("role") or "")
-        q = start_type.upper()
-        floor = pins.get(role)
-        if floor:
-            floors[gid] = floor.upper()
-            # Never start below the role floor
-            if _ladder_index(q) > _ladder_index(floor):
-                q = floor.upper()
-        assignments[gid] = q
+        assignments[gid] = start_type.upper()
 
-    # pin_high hints from sensitivity → floor at Q5_K
+    # pin_high hints from sensitivity → floor at Q5_K (measured, kept)
     for r in sensitivity_rows:
         if r.get("decision_hint") == "pin_high" and r.get("probe") == "Q4_K":
             gid = r["group_id"]
-            floors[gid] = _min_quant(floors.get(gid, "Q3_K"), "Q5_K")
+            floors[gid] = _min_quant(floors.get(gid, "Q2_K"), "Q5_K")
             if _ladder_index(assignments.get(gid, start_type)) > _ladder_index(
                 floors[gid]
             ):
@@ -280,34 +271,36 @@ def _candidate_ladder(
     catalog: dict[str, Any],
     sensitivity_rows: list[dict[str, Any]],
     start_type: str = "Q6_K",
-    pins: dict[str, str] | None = None,
-    use_pins: bool = True,
 ) -> tuple[dict[str, list[str]], dict[str, str]]:
-    """Candidate quant ladder per group, reusing greedy's pin logic (Spec 2.2).
+    """Candidate quant ladder per group: the full uniform LADDER.
 
-    Returns (candidates high->low precision, floors). Floors come from
-    DEFAULT_PINS plus the same pin_high-hint floor (Q5_K) greedy applies.
+    No role floors — every group may use every rung including the F32/F16
+    ceiling. The only floors are measured pin_high hints (Q4 probe with
+    ΔKLD > 0.04 → floor Q5_K), applied here and in greedy alike.
     """
-    pins = dict(DEFAULT_PINS) if use_pins else {}
     groups = catalog.get("groups") or {}
     floors: dict[str, str] = {}
     for gid, g in groups.items():
         if not g.get("quantizable", True):
             continue
-        floors[gid] = pins.get(str(g.get("role") or ""), "Q2_K").upper()
+        floors[gid] = "Q2_K"
     for r in sensitivity_rows:
         if r.get("decision_hint") == "pin_high" and r.get("probe") == "Q4_K":
             gid = r["group_id"]
             if gid in floors:
                 floors[gid] = _min_quant(floors[gid], "Q5_K")
+    # Uniform: candidates run start..floor; ceiling rungs above start are
+    # always included so the DP can reach F32/F16/Q8 where measured good.
+    lo = _ladder_index(start_type.upper())
     candidates: dict[str, list[str]] = {}
     for gid in floors:
-        lo = _ladder_index(start_type.upper())
         hi = _ladder_index(floors[gid])
-        if hi < lo:  # pin above start (e.g. embedding Q8): pin wins
-            candidates[gid] = [floors[gid]]
-        else:
-            candidates[gid] = LADDER[lo : hi + 1]
+        body = LADDER[lo : hi + 1] if hi >= lo else []
+        ceiling = LADDER[:lo]
+        seen: dict[str, None] = {}
+        for q in ceiling + body:
+            seen.setdefault(q, None)
+        candidates[gid] = list(seen)
     return candidates, floors
 
 
@@ -317,8 +310,6 @@ def _dp_mckp_optimize_once(
     sensitivity_rows: list[dict[str, Any]],
     budget_bytes: int,
     start_type: str = "Q6_K",
-    pins: dict[str, str] | None = None,
-    use_pins: bool = True,
     imatrix_groups: dict[str, Any] | None = None,
     lipschitz_L: float | None = None,
     certificate_mode: str = "bounded",
@@ -368,7 +359,7 @@ def _dp_mckp_optimize_once(
     tensors = catalog.get("tensors") or {}
     candidates, floors = _candidate_ladder(
         catalog=catalog, sensitivity_rows=sensitivity_rows,
-        start_type=start_type, pins=pins, use_pins=use_pins,
+        start_type=start_type,
     )
     groups = sorted(candidates)
     if not groups:
@@ -430,6 +421,7 @@ def _dp_mckp_optimize_once(
     solve_budget = budget_bytes - fixed_total - kept_bytes_total - overhead
 
     cap_removed = 0
+    cap_dropped_unmeasured = 0
     if tail_cap is not None:
         cap = float(tail_cap)
         for gid in groups:
@@ -439,16 +431,12 @@ def _dp_mckp_optimize_once(
                 row = row_index.get((gid, q.upper()))
                 t = row.get("kld_tail_1pct") if row else None
                 if t is None:
-                    have = (
-                        "a proxy row with no measured tail"
-                        if row is not None
-                        else "no row at all"
-                    )
-                    raise ValueError(
-                        f"--tail-cap needs a measured kld_tail_1pct for "
-                        f"({gid}, {q}) but there is {have}. Run step 12 with "
-                        f"--mode llama so every column is measured."
-                    )
+                    # No measured P99 (lazy-probe bound-excluded, or a
+                    # narrowed universe): the column carries no P99 claim,
+                    # so the guardrail cannot pass it — drop it instead of
+                    # erroring. The colgen certificate covers the exclusion.
+                    cap_dropped_unmeasured += 1
+                    continue
                 t = float(t)
                 worst = max(worst, t)
                 if t <= cap:
@@ -462,8 +450,9 @@ def _dp_mckp_optimize_once(
                     f"Raise --tail-cap."
                 )
             candidates[gid] = kept
-    # Effective floors for the colgen baseline: pin floors normally, else
-    # the smallest surviving candidate (the pin floor may be cap-removed).
+    # Effective floors for the colgen baseline: measured pin_high floors
+    # normally, else the smallest surviving candidate (a floor may be
+    # cap-removed).
     eff_floors = (
         dict(floors)
         if tail_cap is None
@@ -555,6 +544,7 @@ def _dp_mckp_optimize_once(
     result["pass1_mean_kld"] = None
     result["pass1_tail_kld"] = None
     result["cap_removed_columns"] = cap_removed
+    result["cap_dropped_unmeasured"] = cap_dropped_unmeasured
     result["size_margin"] = size_margin
     result["fixed_groups"] = {
         gid: {"bytes": b, "type": "source", "kld_tail": 0.0, "kld_mean": 0.0}
@@ -576,8 +566,6 @@ def dp_mckp_optimize(
     sensitivity_rows: list[dict[str, Any]],
     budget_bytes: int,
     start_type: str = "Q6_K",
-    pins: dict[str, str] | None = None,
-    use_pins: bool = True,
     imatrix_groups: dict[str, Any] | None = None,
     lipschitz_L: float | None = None,
     certificate_mode: str = "bounded",
@@ -603,8 +591,8 @@ def dp_mckp_optimize(
     """
     kwargs: dict[str, Any] = dict(
         catalog=catalog, sensitivity_rows=sensitivity_rows,
-        budget_bytes=budget_bytes, start_type=start_type, pins=pins,
-        use_pins=use_pins, imatrix_groups=imatrix_groups,
+        budget_bytes=budget_bytes, start_type=start_type,
+        imatrix_groups=imatrix_groups,
         lipschitz_L=lipschitz_L, certificate_mode=certificate_mode,
         delta_bins=delta_bins, batch_size=batch_size, objective=objective,
         size_margin=size_margin, fixed_groups=fixed_groups,
@@ -759,15 +747,10 @@ def render_tensor_type_file(
     return "\n".join(lines)
 
 
-def default_budget_bytes(
-    catalog: dict[str, Any], *, ratio: float = 0.72,
-    size_margin: float = 1.0,
+def q6_reference_bytes(
+    catalog: dict[str, Any], *, size_margin: float = 1.0,
 ) -> int:
-    """
-    Budget as a fraction of all-Q6_K size, but never below the pinned floor
-    (embd Q8 + attn_v Q5 + rest Q3) so greedy can actually meet it.
-    Both reference sizes carry the same margin, so ratios stay meaningful.
-    """
+    """All-quantizable-groups-at-Q6_K estimated size (budget reference)."""
     groups = catalog.get("groups") or {}
     tensors = catalog.get("tensors") or {}
     q6 = {
@@ -775,17 +758,43 @@ def default_budget_bytes(
         for gid, g in groups.items()
         if g.get("quantizable", True)
     }
-    full = _estimate_total_bytes(q6, groups, tensors, size_margin)
-    # Minimum achievable with default pins + Q3 elsewhere
+    return _estimate_total_bytes(q6, groups, tensors, size_margin)
+
+
+#: Pricing-reference margin over all-Q6 for lazy step-12 probing. The
+#: reference budget only needs to be *loose*: columns excluded at a loose
+#: budget stay excluded at any tighter real budget, so overestimating
+#: wastes probes but never breaks the certificate. 1.2 covers the loosest
+#: shipped format (q8_0, ratio 1.15) with headroom.
+PRICING_REFERENCE_MARGIN = 1.2
+
+
+def pricing_reference_budget(catalog: dict[str, Any]) -> int:
+    """Loose reference budget for lazy step-12 column-generation pricing."""
+    return max(1, int(q6_reference_bytes(catalog) * PRICING_REFERENCE_MARGIN))
+
+
+def default_budget_bytes(
+    catalog: dict[str, Any], *, ratio: float = 0.72,
+    size_margin: float = 1.0,
+) -> int:
+    """
+    Budget as a fraction of all-Q6_K size, but never below the all-Q2_K
+    floor (plus headroom) so a feasible allocation always exists.
+    Both reference sizes carry the same margin, so ratios stay meaningful.
+    """
+    groups = catalog.get("groups") or {}
+    tensors = catalog.get("tensors") or {}
+    full = q6_reference_bytes(catalog, size_margin=size_margin)
+    # Minimum achievable: every quantizable group at Q2_K.
     floor_assign = {}
     for gid, g in groups.items():
         if not g.get("quantizable", True):
             continue
-        role = str(g.get("role") or "")
-        floor_assign[gid] = DEFAULT_PINS.get(role, "Q3_K")
+        floor_assign[gid] = "Q2_K"
     floor_bytes = _estimate_total_bytes(floor_assign, groups, tensors, size_margin)
     target = int(full * ratio)
-    # Leave a little headroom above the pin floor
+    # Leave a little headroom above the floor
     return max(1, max(target, int(floor_bytes * 1.02)))
 
 
@@ -803,7 +812,6 @@ def _optimize_dp_mckp(
     gguf_sha256: str | None,
     imatrix_sha256: str | None,
     corpus_id: str | None,
-    use_pins: bool,
     kld_objective: str,
     certificate_mode: str,
     lipschitz_L: float | None,
@@ -836,7 +844,7 @@ def _optimize_dp_mckp(
     log.append(f"1. Budget → {budget_bytes} bytes ({budget_bytes / (1024**2):.1f} MiB)")
     log.append(f"2. Sensitivity rows={len(rows)} method={sensitivity.get('method')}")
     log.append(
-        f"3. DP-MCKP column generation from Q6_K with role pins "
+        f"3. DP-MCKP column generation over the uniform ladder "
         f"(objective={kld_objective}, certificate={certificate_mode}, "
          f"lipschitz={'auto' if lipschitz_L is None else lipschitz_L}, jobs={jobs}, "
          f"tail_cap={tail_cap}, auto_cap={auto_cap}, size_margin={size_margin}, "
@@ -853,7 +861,6 @@ def _optimize_dp_mckp(
         sensitivity_rows=rows,
         budget_bytes=budget_bytes,
         start_type="Q6_K",
-        use_pins=use_pins,
         imatrix_groups=imatrix_groups,
         lipschitz_L=lipschitz_L,
         certificate_mode=certificate_mode,
@@ -1036,6 +1043,7 @@ def _optimize_dp_mckp(
             ),
             "tail_cap": dp.get("tail_cap"),
             "removed_columns": dp.get("cap_removed_columns", 0),
+            "dropped_unmeasured_columns": dp.get("cap_dropped_unmeasured", 0),
             "pass1_mean_kld": dp.get("pass1_mean_kld"),
             "pass1_tail_kld": dp.get("pass1_tail_kld"),
             "note": (
@@ -1170,6 +1178,7 @@ def _optimize_dp_mckp(
         pass1_mean_kld=dp.get("pass1_mean_kld"),
         pass1_tail_kld=dp.get("pass1_tail_kld"),
         cap_removed_columns=int(dp.get("cap_removed_columns", 0)),
+        cap_dropped_unmeasured=int(dp.get("cap_dropped_unmeasured", 0)),
         fixed_groups=dp.get("fixed_groups", {}),
         fixed_bytes_total=int(dp.get("fixed_bytes_total", 0)),
         kept_bytes_total=int(dp.get("kept_bytes_total", 0)),
@@ -1189,7 +1198,6 @@ def optimize_recipes(
     gguf_sha256: str | None = None,
     imatrix_sha256: str | None = None,
     corpus_id: str | None = None,
-    use_pins: bool = True,
     optimizer: str = "dp_mckp",
     kld_objective: str = "mean",
     certificate_mode: str = "bounded",
@@ -1239,7 +1247,6 @@ def optimize_recipes(
             gguf_sha256=gguf_sha256,
             imatrix_sha256=imatrix_sha256,
             corpus_id=corpus_id,
-            use_pins=use_pins,
             kld_objective=kld_objective,
             certificate_mode=certificate_mode,
             lipschitz_L=lipschitz_L,
@@ -1256,14 +1263,13 @@ def optimize_recipes(
         raise ValueError(f"Unknown optimizer: {optimizer!r}")
 
     log.append(f"2. Sensitivity rows={len(rows)} method={sensitivity.get('method')}")
-    log.append("3. Greedy downgrade from Q6_K with role pins")
+    log.append("3. Greedy downgrade from Q6_K (measured pin_high floors only)")
 
     primary = greedy_optimize(
         catalog=catalog,
         sensitivity_rows=rows,
         budget_bytes=budget_bytes,
         start_type="Q6_K",
-        use_pins=use_pins,
         size_margin=size_margin,
         fixed_groups=fixed_groups,
         file_overhead_bytes=file_overhead_bytes,
@@ -1316,7 +1322,6 @@ def optimize_recipes(
             sensitivity_rows=rows,
             budget_bytes=b,
             start_type="Q6_K",
-            use_pins=use_pins,
             fixed_groups=fixed_groups,
             file_overhead_bytes=file_overhead_bytes,
         )
@@ -1355,8 +1360,8 @@ def optimize_recipes(
     )
     if not primary["meets_budget"]:
         notes.append(
-            "Could not fully meet budget (hit pin floors). "
-            "Relax pins or raise --budget-mb."
+            "Could not fully meet budget (hit Q2 floors). "
+            "Raise --budget-mb."
         )
 
     (out_dir / "optimize_manifest.json").write_text(

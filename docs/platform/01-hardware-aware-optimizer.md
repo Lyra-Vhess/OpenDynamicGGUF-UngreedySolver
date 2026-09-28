@@ -16,7 +16,7 @@ odg fit --model qwen3 --device macbook-air-16gb --ctx 8192
 odg fit --model llama4 --ram 32GB --cpu-only
 ```
 
-and the platform picks the byte budget, pins, and quant search space for them.
+and the platform picks the byte budget, objective, and quant search space for them.
 
 ---
 

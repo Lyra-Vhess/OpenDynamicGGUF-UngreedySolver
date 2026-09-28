@@ -25,15 +25,19 @@ Requires Step 12.
 |---|---|
 | `--budget-mb` | Absolute target size (MiB) |
 | `--budget-ratio` | Default `0.72` of all-Q6_K estimate when mb omitted |
-| `--no-pins` | Disable embd/lm_head→Q8 and attn_v→Q5 floors |
+| `--optimizer` | `dp_mckp` (default, exact) or `greedy` (A/B baseline) |
+| `--kld-objective` | `mean` (default, + auto P99 guardrail) or `tail_1pct` |
+| `--certificate` | `bounded` (default) or `exhaustive` |
+| `--fixed-groups` | Group ids kept at source precision |
 
 ---
 
-## Algorithm (v1)
+## Algorithm
 
-1. Start all quantizable groups at Q6_K (respecting role pins).  
-2. Greedily apply the downgrade with best `Δbytes / ΔKLD` until size ≤ budget.  
-3. Emit Pareto recipes at several budget ratios.
+DP-MCKP (default): exact multiple-choice knapsack over the uniform
+candidate ladder (F32 down to Q2_K for every group — no role floors; only
+measured `pin_high` hints floor at Q5_K), with the P99 guardrail and a
+termination certificate. See README Stage 7.
 
 ---
 

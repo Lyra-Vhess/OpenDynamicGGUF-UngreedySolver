@@ -41,7 +41,7 @@ steps/04_classify/
 | attn_q / k / v / o | 18 each | yes |
 | ffn_gate / up / down | 18 each | yes |
 | norm (attn_norm, ffn_norm, …) | many | **no** |
-| embedding (`token_embd`) | 1 | yes (pin later) |
+| embedding (`token_embd`) | 1 | yes (measured per run, never pinned) |
 
 `attn_k_norm` → **norm** (not attn_k) — rule order matters.
 

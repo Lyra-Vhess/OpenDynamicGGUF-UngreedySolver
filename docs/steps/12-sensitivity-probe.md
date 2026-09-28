@@ -20,7 +20,9 @@ Requires Step 11. Uses **search** split only (never heldout).
 
 Modes:
 - `auto` / `proxy` — estimate ΔKLD from features + imatrix proxy; Δbytes from type sizes (plumbing)
-- `llama` — reserved for real `llama-quantize` + `llama-perplexity --kl-divergence` (needs tools + logit caches)
+- `llama` — real `llama-quantize` + `llama-perplexity --kl-divergence` (needs tools + logit caches), with **lazy probing**: the anchor plus each group's floor column is measured first, then column-generation pricing selects only attractive columns for GPU trials. The candidate universe is the full uniform ladder (F32 down to Q2_K) — wide costs nothing because pricing, not grid membership, spends GPU. `--certificate exhaustive` measures the whole universe instead. Reruns resume from trial files on disk.
+
+Flags: `--probe-types` narrows the universe, `--kld-objective` / `--certificate` / `--lipschitz` steer pricing (same flags at step 13 select among the measured columns), `--fixed-groups` skips groups kept at source precision.
 
 ---
 

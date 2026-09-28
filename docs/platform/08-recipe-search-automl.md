@@ -64,7 +64,7 @@ through the normal step 15 gates.
 
 A candidate = mapping `group → quant_type`, constrained by:
 
-- role pins (embd/output/router floors — same pins step 13 uses),
+- measured floors only (`pin_high` hints, `--fixed-groups` — same floors step 13 uses),
 - monotone depth hints (optional: early layers ≥ late layers for attn),
 - budget window (candidates outside ±10% of target are rejected before scoring).
 

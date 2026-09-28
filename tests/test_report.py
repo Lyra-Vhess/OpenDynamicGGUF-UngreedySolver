@@ -164,8 +164,8 @@ class TestExtraction:
         # downgraded group cites the greedy decision
         assert "greedy downgrade" in rows["ffn_up@early"]["reason"]
         assert rows["ffn_up@early"]["delta_kld"] == 0.004
-        # pinned role cites the pin, never a fabricated probe
-        assert "pinned" in rows["attn_v@early"]["reason"]
+        # no invented pins: unmeasured assignment cites the optimizer
+        assert rows["attn_v@early"]["reason"] == "assigned by optimizer"
 
     def test_gates_extracted_with_thresholds(self, run_dir):
         gates = {g["metric"]: g for g in build_report_data(run_dir)["gates"]["gates"]}

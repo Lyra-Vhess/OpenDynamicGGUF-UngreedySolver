@@ -355,6 +355,38 @@ def main(argv: list[str] | None = None) -> int:
         "llama-quantize cannot quantize). Skipped at probe time; accounted "
         "toward every budget at optimize time (pass the same flag there).",
     )
+    p_sens.add_argument(
+        "--kld-objective",
+        choices=("tail_1pct", "mean"),
+        default="mean",
+        help="Pricing objective for lazy probing (default: mean)",
+    )
+    p_sens.add_argument(
+        "--certificate",
+        choices=("bounded", "exhaustive"),
+        default="bounded",
+        help="bounded: lazy price-gated probing (default); exhaustive: measure all",
+    )
+    p_sens.add_argument(
+        "--lipschitz",
+        type=float,
+        default=None,
+        help="Lipschitz bound L for pricing (default: auto-calibrated x2 margin)",
+    )
+    p_sens.add_argument(
+        "--budget-mb",
+        type=float,
+        default=None,
+        help="Intended solve budget in MiB: pricing assumes this tightness "
+        "(default: from run quant profile ratio)",
+    )
+    p_sens.add_argument(
+        "--budget-ratio",
+        type=float,
+        default=None,
+        help="If --budget-mb omitted, intended budget as fraction of Q6_K "
+        "baseline (default: from --quant)",
+    )
     p_sens.add_argument("--no-explain", action="store_true")
 
     # --- optimize (step 13) ---
@@ -383,11 +415,6 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         metavar="FORMAT",
         help="Override run quant target for this step",
-    )
-    p_opt.add_argument(
-        "--no-pins",
-        action="store_true",
-        help="Disable default role pins (embd/lm_head Q8, attn_v Q5)",
     )
     p_opt.add_argument(
         "--optimizer",
@@ -486,6 +513,18 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Do not allow PROVISIONAL verdict without a real GGUF",
     )
+    p_val.add_argument(
+        "--llama-perplexity",
+        type=Path,
+        default=None,
+        help="Path to llama-perplexity for measured Tier-1 (or set LLAMA_CPP_DIR)",
+    )
+    p_val.add_argument(
+        "--perplexity-args",
+        default=None,
+        metavar="ARGS",
+        help='Extra args appended verbatim to Tier-1 llama-perplexity runs, e.g. --perplexity-args "-ngl 99"',
+    )
     p_val.add_argument("--no-explain", action="store_true")
 
     # --- run (full pipeline in one command) ---
@@ -533,6 +572,161 @@ def main(argv: list[str] | None = None) -> int:
         help="Less verbose per-step panels (still shows pipeline progress)",
     )
     p_run.add_argument("--no-explain", action="store_true")
+    # --- threaded step flags (full parity with the step commands) ---
+    # Global probe mode for the llama-capable steps (imatrix,
+    # reference-logits, sensitivity). Freeze/export/validate have their own
+    # mode flags below because their mode vocabularies differ.
+    p_run.add_argument(
+        "--mode",
+        choices=("auto", "llama", "proxy"),
+        default="auto",
+        help="Probe mode for imatrix / reference-logits / sensitivity "
+        "(default: auto)",
+    )
+    p_run.add_argument(
+        "--target-tokens",
+        type=int,
+        default=50_000,
+        help="Corpus token budget (default 50000; use 300000+ for production)",
+    )
+    p_run.add_argument("--seed", type=int, default=42, help="Corpus split seed")
+    p_run.add_argument(
+        "--max-docs",
+        type=int,
+        default=32,
+        help="Max calib docs for forward activation pass (default 32)",
+    )
+    p_run.add_argument(
+        "--freeze-mode",
+        choices=("auto", "hf-convert", "promote"),
+        default="auto",
+        help="freeze-gguf mode (default: auto)",
+    )
+    p_run.add_argument(
+        "--convert-script",
+        type=Path,
+        default=None,
+        help="Path to llama.cpp convert_hf_to_gguf.py (or set LLAMA_CPP_DIR)",
+    )
+    p_run.add_argument(
+        "--require-bf16",
+        action="store_true",
+        help="Fail unless the frozen file is BF16/F16 (not Q8)",
+    )
+    p_run.add_argument(
+        "--chunks",
+        type=int,
+        default=64,
+        help="llama-imatrix --chunks (default 64; 0 = omit flag)",
+    )
+    p_run.add_argument(
+        "--imatrix-args",
+        default=None,
+        metavar="ARGS",
+        help='Extra args appended verbatim to llama-imatrix, e.g. --imatrix-args "-ngl 99"',
+    )
+    p_run.add_argument(
+        "--perplexity-args",
+        default=None,
+        metavar="ARGS",
+        help='Extra args appended verbatim to probe llama-perplexity runs, e.g. --perplexity-args "-ngl 99"',
+    )
+    p_run.add_argument(
+        "--bands-per-role",
+        type=int,
+        default=3,
+        help="Reband contiguous bands per role (default 3)",
+    )
+    p_run.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="Parallel trial probes for sensitivity + optimize (default: 1)",
+    )
+    p_run.add_argument(
+        "--probe-types",
+        default=None,
+        metavar="TYPES",
+        help="Comma-separated sensitivity probe grid override",
+    )
+    p_run.add_argument(
+        "--fixed-groups",
+        default=None,
+        metavar="GIDS",
+        help="Comma-separated group ids kept at source precision (skipped at "
+        "probe time; counted toward every budget at optimize time)",
+    )
+    p_run.add_argument(
+        "--optimizer",
+        choices=("greedy", "dp_mckp"),
+        default="dp_mckp",
+        help="Recipe optimizer (default: dp_mckp; greedy kept for A/B)",
+    )
+    p_run.add_argument(
+        "--kld-objective",
+        choices=("tail_1pct", "mean"),
+        default="mean",
+        help="Optimizer objective (default: mean, with automatic P99 guardrail)",
+    )
+    p_run.add_argument(
+        "--certificate",
+        choices=("bounded", "exhaustive"),
+        default="bounded",
+        help="bounded: prune via Lipschitz bound (default); exhaustive: probe all",
+    )
+    p_run.add_argument(
+        "--lipschitz",
+        type=float,
+        default=None,
+        help="Lipschitz bound L (default: auto-calibrated x2 margin)",
+    )
+    p_run.add_argument(
+        "--pareto-ratios",
+        default=None,
+        metavar="RATIOS",
+        help="Comma-separated budget ratios (default: 0.55,0.65,0.72,0.80,0.90,1.0)",
+    )
+    p_run.add_argument(
+        "--budget-mb",
+        type=float,
+        default=None,
+        help="Target size in MiB (default: from --quant profile ratio)",
+    )
+    p_run.add_argument(
+        "--budget-ratio",
+        type=float,
+        default=None,
+        help="Fraction of Q6_K baseline if --budget-mb omitted",
+    )
+    p_run.add_argument(
+        "--export-mode",
+        choices=("auto", "llama", "dry-run"),
+        default="auto",
+        help="export mode (default: auto)",
+    )
+    p_run.add_argument(
+        "--base-type",
+        default=None,
+        help="Fallback/base type for llama-quantize (default: from --quant)",
+    )
+    p_run.add_argument(
+        "--validate-mode",
+        choices=("auto", "llama", "proxy"),
+        default="auto",
+        help="validate mode (default: auto)",
+    )
+    p_run.add_argument(
+        "--strict",
+        action="store_true",
+        help="Do not allow PROVISIONAL verdict without a real GGUF",
+    )
+    p_run.add_argument(
+        "--only-quantizable",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip non-quantizable tensors in weight features "
+        "(default: True; --no-only-quantizable to include)",
+    )
 
     # --- status / runs ---
     p_status = sub.add_parser("status", help="Show checkpoint status for a run")
@@ -600,6 +794,58 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_fit.add_argument("--quiet", action="store_true")
     p_fit.add_argument("--no-explain", action="store_true")
+    # --- threaded step flags (mirrors `odg run`; budget comes from hardware) ---
+    p_fit.add_argument(
+        "--mode",
+        choices=("auto", "llama", "proxy"),
+        default="auto",
+        help="Probe mode for imatrix / reference-logits / sensitivity",
+    )
+    p_fit.add_argument("--target-tokens", type=int, default=50_000)
+    p_fit.add_argument("--seed", type=int, default=42)
+    p_fit.add_argument("--max-docs", type=int, default=32)
+    p_fit.add_argument(
+        "--freeze-mode",
+        choices=("auto", "hf-convert", "promote"),
+        default="auto",
+    )
+    p_fit.add_argument("--convert-script", type=Path, default=None)
+    p_fit.add_argument("--require-bf16", action="store_true")
+    p_fit.add_argument("--chunks", type=int, default=64)
+    p_fit.add_argument("--imatrix-args", default=None, metavar="ARGS")
+    p_fit.add_argument("--perplexity-args", default=None, metavar="ARGS")
+    p_fit.add_argument("--bands-per-role", type=int, default=3)
+    p_fit.add_argument("--jobs", type=int, default=1)
+    p_fit.add_argument("--probe-types", default=None, metavar="TYPES")
+    p_fit.add_argument("--fixed-groups", default=None, metavar="GIDS")
+    p_fit.add_argument(
+        "--optimizer", choices=("greedy", "dp_mckp"), default="dp_mckp"
+    )
+    p_fit.add_argument(
+        "--kld-objective", choices=("tail_1pct", "mean"), default="mean"
+    )
+    p_fit.add_argument(
+        "--certificate", choices=("bounded", "exhaustive"), default="bounded"
+    )
+    p_fit.add_argument("--lipschitz", type=float, default=None)
+    p_fit.add_argument("--pareto-ratios", default=None, metavar="RATIOS")
+    p_fit.add_argument(
+        "--export-mode",
+        choices=("auto", "llama", "dry-run"),
+        default="auto",
+    )
+    p_fit.add_argument("--base-type", default=None)
+    p_fit.add_argument(
+        "--validate-mode",
+        choices=("auto", "llama", "proxy"),
+        default="auto",
+    )
+    p_fit.add_argument("--strict", action="store_true")
+    p_fit.add_argument(
+        "--only-quantizable",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
 
     # --- devices (named hardware profiles for odg fit) ---
     p_dev = sub.add_parser(
@@ -771,6 +1017,193 @@ def cmd_formats(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_flag(args: argparse.Namespace, name: str, default=None):
+    """getattr with default — pipeline Namespaces built by hand may lack new flags."""
+    return getattr(args, name, default)
+
+
+def _pipeline_fmt(store, args):
+    """Best-effort quant format for pipeline input comparison.
+
+    Returns None when no run exists yet (fresh pipeline) or the id is invalid;
+    callers then simply omit format-derived keys from the comparison.
+    """
+    try:
+        from quant_formats import get_format
+    except ImportError:
+        return None
+    if _run_flag(args, "quant", None):
+        try:
+            return get_format(args.quant)
+        except ValueError:
+            return None
+    run_id = _run_flag(args, "run", None)
+    try:
+        if run_id:
+            meta = store.load_run(run_id)
+        else:
+            meta = store.latest_run_for_model(args.model)
+    except (ValueError, FileNotFoundError, OSError):
+        return None
+    if meta is None or not meta.quant_format:
+        return None
+    try:
+        return get_format(meta.quant_format)
+    except ValueError:
+        return None
+
+
+def _pipeline_expected_inputs(step_id: str, args: argparse.Namespace, fmt):
+    """Result-affecting pipeline inputs for *step_id*, keyed like input.json.
+
+    Only keys the pipeline (`odg run` / `odg fit`) controls are included;
+    `jobs` is deliberately excluded (parallelism changes no numbers).
+    Keys requiring a resolved quant format are omitted when *fmt* is None.
+    """
+    exp: dict = {}
+    if step_id == "corpus":
+        exp["target_tokens"] = int(_run_flag(args, "target_tokens", 50_000) or 50_000)
+        seed = _run_flag(args, "seed", 42)
+        exp["seed"] = int(42 if seed is None else seed)
+    elif step_id == "activation_features":
+        exp["mode"] = _run_flag(args, "mode", "auto") or "auto"
+        exp["max_docs"] = int(_run_flag(args, "max_docs", 32) or 32)
+    elif step_id == "freeze_gguf":
+        exp["mode"] = _run_flag(args, "freeze_mode", "auto") or "auto"
+        exp["require_bf16"] = bool(_run_flag(args, "require_bf16", False))
+        cs = _run_flag(args, "convert_script", None)
+        exp["convert_script"] = str(cs) if cs else None
+    elif step_id == "imatrix":
+        exp["mode"] = _run_flag(args, "mode", "auto") or "auto"
+        chunks = int(_run_flag(args, "chunks", 64) or 0)
+        exp["chunks"] = None if chunks <= 0 else chunks
+        exp["imatrix_args"] = split_extra_args(
+            _run_flag(args, "imatrix_args", None), "--imatrix-args"
+        )
+    elif step_id == "reband":
+        exp["bands_per_role"] = int(_run_flag(args, "bands_per_role", 3) or 3)
+    elif step_id == "reference_logits":
+        exp["mode"] = _run_flag(args, "mode", "auto") or "auto"
+        exp["perplexity_args"] = split_extra_args(
+            _run_flag(args, "perplexity_args", None), "--perplexity-args"
+        )
+    elif step_id == "sensitivity":
+        exp["mode"] = _run_flag(args, "mode", "auto") or "auto"
+        pt = _run_flag(args, "probe_types", None)
+        if pt:
+            normed = [t.strip().upper() for t in str(pt).split(",") if t.strip()]
+            if normed:
+                exp["probe_types"] = normed
+        exp["perplexity_args"] = split_extra_args(
+            _run_flag(args, "perplexity_args", None), "--perplexity-args"
+        )
+        exp["fixed_groups"] = sorted(
+            g.strip()
+            for g in str(_run_flag(args, "fixed_groups", None) or "").split(",")
+            if g.strip()
+        )
+        exp["kld_objective"] = _run_flag(args, "kld_objective", "mean")
+        exp["certificate"] = _run_flag(args, "certificate", "bounded")
+        exp["lipschitz"] = _run_flag(args, "lipschitz", None)
+        _sbm = _run_flag(args, "budget_mb", None)
+        exp["budget_mb"] = float(_sbm) if _sbm is not None else None
+        _sbr = _run_flag(args, "budget_ratio", None)
+        if _sbr is not None:
+            exp["budget_ratio"] = float(_sbr)
+        elif fmt is not None:
+            exp["budget_ratio"] = float(fmt.budget_ratio)
+        if fmt is not None:
+            exp["baseline"] = fmt.baseline_type
+            exp["quant_format"] = fmt.id
+    elif step_id == "optimize":
+        bm = _run_flag(args, "budget_mb", None)
+        exp["budget_mb"] = float(bm) if bm is not None else None
+        br = _run_flag(args, "budget_ratio", None)
+        if br is not None:
+            exp["budget_ratio"] = float(br)
+        elif fmt is not None:
+            exp["budget_ratio"] = float(fmt.budget_ratio)
+        if fmt is not None:
+            exp["quant_format"] = fmt.id
+        exp["optimizer"] = _run_flag(args, "optimizer", "dp_mckp")
+        exp["kld_objective"] = _run_flag(args, "kld_objective", "mean")
+        exp["certificate"] = _run_flag(args, "certificate", "bounded")
+        exp["lipschitz"] = _run_flag(args, "lipschitz", None)
+        exp["pareto_ratios"] = _run_flag(args, "pareto_ratios", None)
+        exp["fixed_groups"] = sorted(
+            g.strip()
+            for g in str(_run_flag(args, "fixed_groups", None) or "").split(",")
+            if g.strip()
+        )
+    elif step_id == "export":
+        exp["mode"] = _run_flag(args, "export_mode", "auto") or "auto"
+        bt = _run_flag(args, "base_type", None)
+        if bt:
+            exp["base_type"] = bt
+        elif fmt is not None:
+            exp["base_type"] = fmt.base_type
+        if fmt is not None:
+            exp["quant_format"] = fmt.id
+    elif step_id == "validate":
+        exp["mode"] = _run_flag(args, "validate_mode", "auto") or "auto"
+        exp["strict"] = bool(_run_flag(args, "strict", False))
+        exp["perplexity_args"] = split_extra_args(
+            _run_flag(args, "perplexity_args", None), "--perplexity-args"
+        )
+    return exp
+
+
+def _check_stale_step(store, run_id: str, step_id: str, expected: dict,
+                       *, interactive: bool) -> bool:
+    """Warn-and-confirm when pipeline flags disagree with a done step.
+
+    Compares only keys present in the recorded input.json (older checkpoints
+    predate some keys and must not false-positive). Returns True when the
+    caller should force re-run this step; False means proceed normally (the
+    step fn will skip itself when done). Non-interactive sessions warn and
+    keep the checkpoint.
+    """
+    if not expected:
+        return False
+    try:
+        if not store.is_step_done(run_id, step_id):
+            return False
+    except (OSError, ValueError, FileNotFoundError):
+        return False
+    inp = store.step_path(run_id, step_id) / "input.json"
+    try:
+        recorded = json.loads(inp.read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(recorded, dict):
+        return False
+    diffs = [
+        (k, recorded[k], v)
+        for k, v in expected.items()
+        if k in recorded and recorded[k] != v
+    ]
+    if not diffs:
+        return False
+    lines = "\n".join(
+        f"  {k}: checkpoint has {old!r}, pipeline wants {new!r}"
+        for k, old, new in diffs
+    )
+    ui.warn(
+        f"Step '{step_id}' is already done but pipeline flags differ:\n{lines}"
+    )
+    if not interactive:
+        ui.warn(
+            f"Keeping the checkpointed '{step_id}' output. "
+            "Pass --force to re-run it with the new flags."
+        )
+        return False
+    try:
+        answer = input(f"Re-run '{step_id}' with the new flags? [y/N] ").strip().lower()
+    except EOFError:
+        return False
+    return answer in ("y", "yes")
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """Run steps 01–15 in order with one CLI invocation."""
     from steps import STEPS, STEPS_BY_ID
@@ -843,12 +1276,28 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     results: list[tuple[str, str]] = []  # (step_id, status)
 
+    # Stale-checkpoint support: compare pipeline flags against each done
+    # step's recorded input.json (warn-and-confirm on mismatch).
+    store = _store(args)
+    fmt = _pipeline_fmt(store, args)
+    interactive = sys.stdin.isatty() and not bool(_run_flag(args, "no_ask", False))
+
     for idx, (step_id, fn) in enumerate(selected, 1):
         title = STEPS_BY_ID[step_id].title
         ui.info(
             f"[{idx}/{len(selected)}] {step_cli.get(step_id, step_id)} — {title}",
             explain=not args.no_explain,
         )
+
+        # Per-step mode: freeze/export/validate have their own vocabularies.
+        if step_id == "freeze_gguf":
+            step_mode = _run_flag(args, "freeze_mode", "auto") or "auto"
+        elif step_id == "export":
+            step_mode = _run_flag(args, "export_mode", "auto") or "auto"
+        elif step_id == "validate":
+            step_mode = _run_flag(args, "validate_mode", "auto") or "auto"
+        else:
+            step_mode = _run_flag(args, "mode", "auto") or "auto"
 
         step_args = argparse.Namespace(
             command=step_cli.get(step_id, step_id.replace("_", "-")),
@@ -866,28 +1315,59 @@ def cmd_run(args: argparse.Namespace) -> int:
             cache_dir=None,
             out=None,
             # weight features
-            only_quantizable=True,
+            only_quantizable=bool(_run_flag(args, "only_quantizable", True)),
             # corpus
-            target_tokens=50_000,
-            seed=42,
+            target_tokens=int(_run_flag(args, "target_tokens", 50_000) or 50_000),
+            seed=int(_run_flag(args, "seed", 42)
+                     if _run_flag(args, "seed", 42) is not None else 42),
             # shared mode knobs
-            mode="auto",
-            max_docs=32,
-            bands_per_role=3,
-            convert_script=None,
-            require_bf16=False,
+            mode=step_mode,
+            max_docs=int(_run_flag(args, "max_docs", 32) or 32),
+            bands_per_role=int(_run_flag(args, "bands_per_role", 3) or 3),
+            convert_script=_run_flag(args, "convert_script", None),
+            require_bf16=bool(_run_flag(args, "require_bf16", False)),
             llama_imatrix=None,
-            chunks=64,
+            chunks=int(_run_flag(args, "chunks", 64)
+                       if _run_flag(args, "chunks", 64) is not None else 64),
+            imatrix_args=_run_flag(args, "imatrix_args", None),
             llama_perplexity=None,
             baseline=None,
+            perplexity_args=_run_flag(args, "perplexity_args", None),
+            probe_types=_run_flag(args, "probe_types", None),
+            fixed_groups=_run_flag(args, "fixed_groups", None),
             # threaded through by odg fit (hardware-derived budget)
-            budget_mb=getattr(args, "budget_mb", None),
-            budget_ratio=None,
-            no_pins=False,
-            base_type=None,
+            budget_mb=_run_flag(args, "budget_mb", None),
+            budget_ratio=_run_flag(args, "budget_ratio", None),
+            optimizer=_run_flag(args, "optimizer", "dp_mckp") or "dp_mckp",
+            kld_objective=_run_flag(args, "kld_objective", "mean") or "mean",
+            certificate=_run_flag(args, "certificate", "bounded") or "bounded",
+            lipschitz=_run_flag(args, "lipschitz", None),
+            jobs=int(_run_flag(args, "jobs", 1) or 1),
+            pareto_ratios=_run_flag(args, "pareto_ratios", None),
+            base_type=_run_flag(args, "base_type", None),
             llama_quantize=None,
-            strict=False,
+            strict=bool(_run_flag(args, "strict", False)),
         )
+
+        # Warn-and-confirm: a done step whose recorded inputs disagree with
+        # the pipeline flags keeps its checkpoint unless the user confirms
+        # a re-run (or passed --force). Non-interactive sessions warn and keep.
+        if not step_args.force:
+            check_run = _run_flag(args, "run", None)
+            if check_run is None:
+                latest = store.latest_run_for_model(args.model)
+                check_run = latest.run_id if latest is not None else None
+            if check_run is not None:
+                try:
+                    expected = _pipeline_expected_inputs(step_id, args, fmt)
+                except ValueError as exc:
+                    print(f"ERROR: {exc}", file=sys.stderr)
+                    return 1
+                if _check_stale_step(
+                    store, check_run, step_id, expected,
+                    interactive=interactive,
+                ):
+                    step_args.force = True
 
         try:
             code = fn(step_args)
@@ -914,6 +1394,11 @@ def cmd_run(args: argparse.Namespace) -> int:
             meta = store.latest_run_for_model(args.model)
             if meta is not None:
                 args.run = meta.run_id
+        # The resolve step may have created the run or set its quant format;
+        # refresh both the store handle inputs and the format used for the
+        # stale-check comparison below.
+        if step_id == "resolve":
+            fmt = _pipeline_fmt(store, args)
 
     ui.pipeline_summary(results, explain=not args.no_explain)
 
@@ -2583,6 +3068,15 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
         "baseline": baseline,
         "probe_types": probe_types,
         "quant_format": fmt.id,
+        "kld_objective": getattr(args, "kld_objective", "mean"),
+        "certificate": getattr(args, "certificate", "bounded"),
+        "lipschitz": getattr(args, "lipschitz", None),
+        "budget_mb": getattr(args, "budget_mb", None),
+        "budget_ratio": (
+            float(getattr(args, "budget_ratio"))
+            if getattr(args, "budget_ratio", None) is not None
+            else float(fmt.budget_ratio)
+        ),
         "gguf_sha256": freeze_out.get("gguf_sha256"),
         "search_path": str(search_path),
         "n_catalog_groups": len(catalog.get("groups") or {}),
@@ -2619,6 +3113,18 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
 
     try:
         with ui.working('Probing sensitivity (ΔKLD)…', explain=print_explain):
+            from optimizer import default_budget_bytes as _sens_budget
+
+            _sens_bm = getattr(args, "budget_mb", None)
+            if _sens_bm is not None:
+                _intended = int(float(_sens_bm) * 1024 * 1024)
+            else:
+                _sens_br = getattr(args, "budget_ratio", None)
+                _intended = _sens_budget(
+                    catalog,
+                    ratio=float(_sens_br)
+                    if _sens_br is not None else float(fmt.budget_ratio),
+                )
             result, _rows = build_sensitivity_table(
                 model_ref=meta.model_ref,
                 out_dir=step_dir,
@@ -2638,6 +3144,10 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
                 perplexity_args=sens_perplexity_args,
                 imatrix_gguf=input_data["imatrix_gguf"],
                 fixed_groups=sens_fixed_groups,
+                certificate_mode=getattr(args, "certificate", "bounded"),
+                kld_objective=getattr(args, "kld_objective", "mean"),
+                lipschitz_L=getattr(args, "lipschitz", None),
+                pricing_budget_bytes=_intended,
             )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "sensitivity", str(exc))
@@ -2764,7 +3274,6 @@ def cmd_optimize(args: argparse.Namespace) -> int:
         "budget_mb": args.budget_mb,
         "budget_ratio": budget_ratio,
         "quant_format": fmt.id,
-        "no_pins": bool(args.no_pins),
         "gguf_sha256": freeze_out.get("gguf_sha256"),
         "optimizer": getattr(args, "optimizer", "dp_mckp"),
         "kld_objective": getattr(args, "kld_objective", "mean"),
@@ -2821,7 +3330,6 @@ def cmd_optimize(args: argparse.Namespace) -> int:
                 gguf_sha256=freeze_out.get("gguf_sha256"),
                 imatrix_sha256=imatrix_out.get("imatrix_sha256"),
                 corpus_id=corpus_out.get("corpus_id"),
-                use_pins=not args.no_pins,
                 optimizer=getattr(args, "optimizer", "dp_mckp"),
                 kld_objective=getattr(args, "kld_objective", "mean"),
                 certificate_mode=getattr(args, "certificate", "bounded"),
@@ -3088,6 +3596,13 @@ def cmd_validate(args: argparse.Namespace) -> int:
         "strict": bool(args.strict),
         "export_method": export_out.get("method"),
         "gguf_out": export_out.get("gguf_out"),
+        "perplexity_args": split_extra_args(
+            getattr(args, "perplexity_args", None), "--perplexity-args"
+        ),
+        "llama_perplexity": (
+            str(args.llama_perplexity)
+            if getattr(args, "llama_perplexity", None) else None
+        ),
     }
 
     try:
@@ -3099,6 +3614,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
     try:
         with ui.working('Validating & staging release…', explain=print_explain):
+            ref_out = store.read_step_output(meta.run_id, "reference_logits") or {}
             result = validate_and_release(
                 model_ref=meta.model_ref,
                 out_dir=step_dir,
@@ -3112,6 +3628,16 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 resolve_descriptor=desc,
                 mode=args.mode,
                 allow_provisional=not args.strict,
+                heldout_txt=ref_out.get("heldout_path"),
+                heldout_bin=ref_out.get("logits_heldout_path"),
+                llama_perplexity=(
+                    str(args.llama_perplexity)
+                    if getattr(args, "llama_perplexity", None) else None
+                ),
+                perplexity_args=split_extra_args(
+                    getattr(args, "perplexity_args", None),
+                    "--perplexity-args",
+                ),
             )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "validate", str(exc))
@@ -3319,6 +3845,33 @@ def cmd_fit(args: argparse.Namespace) -> int:
         quiet=bool(args.quiet),
         no_explain=args.no_explain,
         budget_mb=plan.weight_budget_mb,
+        budget_ratio=None,
+        mode=_run_flag(args, "mode", "auto") or "auto",
+        target_tokens=int(_run_flag(args, "target_tokens", 50_000) or 50_000),
+        seed=int(_run_flag(args, "seed", 42)
+                 if _run_flag(args, "seed", 42) is not None else 42),
+        max_docs=int(_run_flag(args, "max_docs", 32) or 32),
+        freeze_mode=_run_flag(args, "freeze_mode", "auto") or "auto",
+        convert_script=_run_flag(args, "convert_script", None),
+        require_bf16=bool(_run_flag(args, "require_bf16", False)),
+        chunks=int(_run_flag(args, "chunks", 64)
+                   if _run_flag(args, "chunks", 64) is not None else 64),
+        imatrix_args=_run_flag(args, "imatrix_args", None),
+        perplexity_args=_run_flag(args, "perplexity_args", None),
+        bands_per_role=int(_run_flag(args, "bands_per_role", 3) or 3),
+        jobs=int(_run_flag(args, "jobs", 1) or 1),
+        probe_types=_run_flag(args, "probe_types", None),
+        fixed_groups=_run_flag(args, "fixed_groups", None),
+        optimizer=_run_flag(args, "optimizer", "dp_mckp") or "dp_mckp",
+        kld_objective=_run_flag(args, "kld_objective", "mean") or "mean",
+        certificate=_run_flag(args, "certificate", "bounded") or "bounded",
+        lipschitz=_run_flag(args, "lipschitz", None),
+        pareto_ratios=_run_flag(args, "pareto_ratios", None),
+        export_mode=_run_flag(args, "export_mode", "auto") or "auto",
+        base_type=_run_flag(args, "base_type", None),
+        validate_mode=_run_flag(args, "validate_mode", "auto") or "auto",
+        strict=bool(_run_flag(args, "strict", False)),
+        only_quantizable=bool(_run_flag(args, "only_quantizable", True)),
     )
     return cmd_run(pipeline_args)
 
