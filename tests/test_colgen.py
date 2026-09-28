@@ -70,6 +70,7 @@ def base_kwargs():
         "imatrix_scores": scores,
         "bin_bytes": 1,
         "delta_bins": 2,
+        "objective": "tail",  # these tests assert tail-optimum parity
     }, (groups, candidates, sizes, tail, mean, scores)
 
 

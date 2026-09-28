@@ -194,17 +194,18 @@ def run_column_generation(
     floor_of: dict[str, str] | None = None,
     max_rounds: int | None = None,
     batch_size: int = 1,
-    objective: str = "tail",
+    objective: str = "mean",
 ) -> dict[str, Any]:
     """Pricing loop around the DP master. Returns allocation + certificate.
 
     probe_fn(group, quant) -> {"kld_mean", "kld_tail_1pct", "n_tokens"}.
     mode "bounded" prices via the bound model (conditional certificate);
     mode "exhaustive" probes every column (unconditional certificate).
-    objective "tail" minimizes kld_tail_1pct (default, Spec 2.1);
-    "mean" minimizes kld_mean instead (the same monotonicity/Lipschitz
-    bound model is assumed to hold for means; cost_matrix still records
-    both metrics for every probed column).
+    objective "mean" minimizes kld_mean (default: mean KLD is approximately
+    additive across groups, while a sum of per-group percentiles misranks
+    allocations); "tail" minimizes kld_tail_1pct instead (the same
+    monotonicity/Lipschitz bound model is assumed to hold for means;
+    cost_matrix still records both metrics for every probed column).
 
     Granularity note (Spec 2.4 "iteration"): each pass solves the master,
     reprices every unprobed column, and probes the top `batch_size`
@@ -235,7 +236,7 @@ def run_column_generation(
     tails: dict[tuple[str, str], float] = {}
     means: dict[tuple[str, str], float] = {}
     ntoks: dict[tuple[str, str], Any] = {}
-    # DP objective cost: tail KLD by default, mean KLD under --kld-objective mean.
+    # DP objective cost: mean KLD by default, tail KLD under --kld-objective tail_1pct.
     obj = means if objective == "mean" else tails
     probed: dict[str, list[str]] = {g: [] for g in groups}
     n_probed = 0
