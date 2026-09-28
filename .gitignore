@@ -19,3 +19,9 @@ benchmarks/*
 !benchmarks/.gitkeep
 evaluation/results/*
 !evaluation/results/.gitkeep
+# Local model checkouts (HF repos; GBs of weights — inputs, never sources).
+# *.safetensors covers the weights in any current/future checkout; named dirs
+# cover their tokenizer/config sidecars.
+*.safetensors
+functiongemma-270m-it/
+gemma-4-E4B-it/
