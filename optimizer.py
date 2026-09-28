@@ -471,6 +471,9 @@ def _dp_mckp_optimize_once(
                 "kld_mean": float(row.get("kld_mean", row.get("delta_kld") or 0.0)),
                 "kld_tail_1pct": float(row["kld_tail_1pct"]),
                 "n_tokens": row.get("n_tokens"),
+                # Measured row: anchors pricing bounds (colgen trusts
+                # only measured anchors; proxy estimates never tighten).
+                "measured": True,
             }
         if objective != "mean":
             have = "a proxy row with no measured tail" if row is not None else "no row at all"
@@ -485,10 +488,18 @@ def _dp_mckp_optimize_once(
                 "kld_mean": float(row.get("kld_mean", row.get("delta_kld") or 0.0)),
                 "kld_tail_1pct": None,
                 "n_tokens": row.get("n_tokens"),
+                # Row-hit mean is measured even without a tail value.
+                "measured": True,
             }
         g = groups_t.get(gid) or {}
         mean = _proxy_delta_kld(g, tensors, q, imatrix_group_importance=imatrix_imp(gid))
-        return {"kld_mean": mean, "kld_tail_1pct": None, "n_tokens": None}
+        return {
+            "kld_mean": mean,
+            "kld_tail_1pct": None,
+            "n_tokens": None,
+            # Pure proxy: never anchors a pricing bound.
+            "measured": False,
+        }
 
     # Sizes: exact trial-file bytes where the column was measured
     # (row "bytes_measured" from step-12 llama probes), BYTES_PER_ELEM
@@ -534,6 +545,10 @@ def _dp_mckp_optimize_once(
         imatrix_scores=imatrix_scores, lipschitz_L=lipschitz_L,
         delta_bins=delta_bins, mode=certificate_mode, batch_size=batch_size,
         floor_of=eff_floors, objective=objective,
+        # Row hits are measurements; anything else is proxy. Lazy
+        # ceilings fire only for measurably-topped groups (a proxy
+        # ceiling anchors nothing and must keep legacy late timing).
+        measured_cols=set(row_index),
     )
     result["start_type"] = start_type.upper()
     result["floors"] = eff_floors

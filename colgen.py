@@ -36,10 +36,29 @@ reduction per byte is (V[B-D] - V[B]) / D_bytes >= 0):
 Bound model (the certificate is conditional on it — Spec 2.4):
   monotonicity: tail[g][q] non-increasing in precision.
   Lipschitz:    tail[q]-tail[q'] <= L*(bw[q']-bw[q])*scale[g] (adjacent).
-  upper_bound_gain = min(monotone_ub, lipschitz_ub), clipped >= 0, where
-  monotone_ub extrapolates from the nearest probed type at precision >= q
-  (tail[floor] alone if none), and lipschitz_ub accumulates L over the
-  floor->q bitwidth gap.
+  local secant: gain over floor <= (t_floor - t_anchor) + slope*margin*gap,
+    slope from the group's own nearest probed pair (tight on plateaus,
+    loose on cliffs — the shape one global slope cannot fit).
+  upper_bound_gain = min(monotone_ub, lipschitz_ub, local_ub), clipped >= 0,
+  where monotone_ub extrapolates from the nearest probed type at precision
+  >= q (tail[floor] alone if none), lipschitz_ub accumulates L over the
+  floor->q bitwidth gap, and local_ub is None until the group has two
+  distinct probed widths. A bracketed group (floor + ceiling measured)
+  needs no slope assumption at all between its brackets.
+
+Probe order (bisection=True, default): tier 0 = lazy ceilings (top
+  AFFORDABLE rung — the highest rung that fits if every other group sat
+  at floor — of floor-only groups whose full affordable range could beat
+  lambda), tier 1 =
+  midpoints of probed intervals still straddling the DP decision, tier 2
+  = rest by bounded gain per byte. Order never affects validity —
+  exclusion comes only from the bounds. bisection=False restores legacy
+  flat gain-per-byte ranking (and disables the local term).
+
+Self-monitoring: every probe audits the bound that priced it. Measured
+  gain past 2% + 1e-9 above the bound counts a violation, widens the
+  local margin (x1.5, cap 16), and ships as bound_violations in the
+  certificate — so "conditional" comes with a check count.
 
 Prior / type-benefit curve (Spec 2.5): predicted tail[g][q] =
   scale[g] * a * 2**(-b*bw[q]), (a, b) fit by log-linear least squares over
@@ -64,6 +83,15 @@ from sensitivity import BYTES_PER_ELEM
 DEFAULT_LIPSCHITZ = 1.0
 #: Safety margin on the calibrated Lipschitz constant.
 LIPSCHITZ_MARGIN = 2.0
+#: Starting margin for the local-secant bound (same value, adapted per run).
+LOCAL_MARGIN_START = 2.0
+#: Cap for adaptive local-margin growth after bound violations.
+LOCAL_MARGIN_CAP = 16.0
+#: A probe counts as a bound violation only past this relative tolerance
+#: (plus absolute floor): KLD comes from finite tokens, so measurement
+#: noise must not trip the monitor.
+VIOLATION_REL_TOL = 0.02
+VIOLATION_ABS_TOL = 1e-9
 
 ProbeFn = Callable[[str, str], dict[str, Any]]
 #: Batch variant: probe a priced batch at once, return one result dict per
@@ -128,8 +156,15 @@ def calibrate_lipschitz(
     tails: dict[tuple[str, str], float],
     probed: dict[str, list[str]],
     scales: dict[str, float],
+    kld_measured: dict[tuple[str, str], bool] | None = None,
 ) -> float:
-    """Max observed adjacent-type slope x margin; DEFAULT while uncalibrated."""
+    """Max observed adjacent-type slope x margin; DEFAULT while uncalibrated.
+
+    Only measured pairs calibrate: proxy estimates must not set the
+    global slope (an optimistic proxy pair would collapse every group's
+    Lipschitz bound; a pessimistic one just over-probes — the former is
+    the dangerous direction, so proxies are excluded entirely).
+    """
     worst = 0.0
     seen = False
     for g, qs in probed.items():
@@ -138,6 +173,13 @@ def calibrate_lipschitz(
             continue
         ordered = sorted(qs, key=bitwidth)
         for q_lo, q_hi in zip(ordered, ordered[1:]):
+            if kld_measured is not None and not (
+                kld_measured.get((g, q_lo), True)
+                and kld_measured.get((g, q_hi), True)
+            ):
+                continue
+            if tails.get((g, q_lo)) is None or tails.get((g, q_hi)) is None:
+                continue
             dbw = bitwidth(q_hi) - bitwidth(q_lo)
             if dbw <= 0:
                 continue
@@ -149,6 +191,86 @@ def calibrate_lipschitz(
     return max(worst * LIPSCHITZ_MARGIN, 1e-9)
 
 
+def _width_values(
+    group: str,
+    tails: dict[tuple[str, str], float],
+    probed: dict[str, list[str]],
+    kld_measured: dict[tuple[str, str], bool] | None = None,
+) -> dict[float, list[float]]:
+    """Measured values per bitwidth for a group.
+
+    None entries skipped; when kld_measured is given, proxy-filled
+    (unmeasured) columns are skipped too — a bound is only as good as
+    its anchors, and proxy estimates must never tighten one.
+    """
+    out: dict[float, list[float]] = {}
+    for p in probed.get(group, []):
+        if kld_measured is not None and not kld_measured.get((group, p), True):
+            continue
+        v = tails.get((group, p))
+        if v is None:
+            continue
+        out.setdefault(bitwidth(p), []).append(float(v))
+    return out
+
+
+def local_secant_ub(
+    *,
+    group: str,
+    quant: str,
+    floor: str,
+    tails: dict[tuple[str, str], float],
+    probed: dict[str, list[str]],
+    margin: float | None = LIPSCHITZ_MARGIN,
+    kld_measured: dict[tuple[str, str], bool] | None = None,
+) -> float | None:
+    """Upper bound on tail[floor] - tail[q] from the group's OWN probes.
+
+    Nearest-neighbour secant extrapolation: take the probed pair flanking
+    q (or the top pair when q sits above all probes) and extend its slope
+    by `margin`. Returns None when the group has fewer than two distinct
+    probed widths (nothing local to extrapolate from) or when `margin` is
+    None (local term disabled — legacy pricing).
+
+    Uses the objective metric the caller passes as `tails` (means under
+    the default mean objective, tails under --kld-objective tail_1pct),
+    so the bound is self-consistent with what the DP minimizes.
+    Duplicate-width choices are conservative (weak-side): anchor on the
+    largest value, slope on the steepest pair — a looser bound probes
+    more and wrongly excludes less.
+    """
+    if margin is None:
+        return None
+    wv = _width_values(group, tails, probed, kld_measured)
+    widths = sorted(wv)
+    if len(widths) < 2:
+        return None
+    t_floor = tails.get((group, floor))
+    if t_floor is None:
+        return None
+    bw_q = bitwidth(quant)
+    blo = [w for w in widths if w < bw_q]
+    bhi = [w for w in widths if w > bw_q]
+    if blo and bhi:
+        a, b = max(blo), min(bhi)
+        v_a, v_b = max(wv[a]), min(wv[b])
+        anchor_w, anchor_v = a, v_a
+    elif blo:
+        # q above every probe: slope from the top pair, anchor at the top.
+        if len(blo) < 2:
+            return None
+        a, b = sorted(blo)[-2:]
+        v_a, v_b = max(wv[a]), min(wv[b])
+        anchor_w, anchor_v = b, max(wv[b])
+    else:
+        return None  # q at/below every probe: monotone term covers it
+    dbw = b - a
+    if dbw <= 0:
+        return None
+    slope = max(0.0, (v_a - v_b) / dbw)
+    return max(0.0, (t_floor - anchor_v) + slope * margin * (bw_q - anchor_w))
+
+
 def upper_bound_gain(
     *,
     group: str,
@@ -158,18 +280,39 @@ def upper_bound_gain(
     probed: dict[str, list[str]],
     scales: dict[str, float],
     lipschitz_L: float,
+    margin: float | None = LIPSCHITZ_MARGIN,
+    kld_measured: dict[tuple[str, str], bool] | None = None,
 ) -> float:
-    """Upper bound on tail[floor] - tail[q] under monotonicity + Lipschitz."""
+    """Upper bound on tail[floor] - tail[q] under monotonicity + slopes.
+
+    kld_measured maps (group, quant) -> True when the value is a real
+    measurement. Proxy-filled columns never anchor a bound (neither the
+    monotone-above term nor the local secant): tightening on estimates
+    lets proxy error exclude measured-good columns. Absent map (legacy
+    callers, unit probes) means all-measured.
+    """
     t_floor = tails[(group, floor)]
     bw_q, bw_f = bitwidth(quant), bitwidth(floor)
-    # Monotone bound: tail[q] >= tail[p] for nearest probed p at bw >= bw_q.
+    # Monotone bound: tail[q] >= tail[p] for nearest MEASURED probed p
+    # at bw >= bw_q.
     above = [
-        tails[(group, p)] for p in probed.get(group, []) if bitwidth(p) >= bw_q
+        tails[(group, p)]
+        for p in probed.get(group, [])
+        if bitwidth(p) >= bw_q
+        and tails.get((group, p)) is not None
+        and (kld_measured is None or kld_measured.get((group, p), True))
     ]
     mono_ub = t_floor - (max(above) if above else 0.0)
     # Lipschitz bound accumulated over the floor -> q gap.
     lip_ub = lipschitz_L * max(0.0, bw_q - bw_f) * scales.get(group, 0.5)
-    return max(0.0, min(mono_ub, lip_ub))
+    # Local-secant bound from the group's own probes (tight on plateaus,
+    # loose on cliffs — the shape a global slope cannot fit).
+    local_ub = local_secant_ub(
+        group=group, quant=quant, floor=floor, tails=tails,
+        probed=probed, margin=margin, kld_measured=kld_measured,
+    )
+    ubs = [mono_ub, lip_ub] + ([local_ub] if local_ub is not None else [])
+    return max(0.0, min(ubs))
 
 
 def shadow_price(
@@ -211,6 +354,8 @@ def run_column_generation(
     batch_size: int = 1,
     objective: str = "mean",
     batch_probe_fn: BatchProbeFn | None = None,
+    bisection: bool = True,
+    measured_cols: set[tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Pricing loop around the DP master. Returns allocation + certificate.
 
@@ -252,6 +397,10 @@ def run_column_generation(
     tails: dict[tuple[str, str], float] = {}
     means: dict[tuple[str, str], float] = {}
     ntoks: dict[tuple[str, str], Any] = {}
+    # Per-column measured flag from probe_fn ("measured" key, default
+    # True): real GPU measurements anchor bounds; proxy-filled lookups
+    # (step-13 rows without measurements) never do.
+    kmeasured: dict[tuple[str, str], bool] = {}
     # DP objective cost: mean KLD by default, tail KLD under --kld-objective tail_1pct.
     obj = means if objective == "mean" else tails
     probed: dict[str, list[str]] = {g: [] for g in groups}
@@ -264,6 +413,7 @@ def run_column_generation(
         c = m.get("kld_mean")
         means[(g, q)] = None if c is None else float(c)
         ntoks[(g, q)] = m.get("n_tokens")
+        kmeasured[(g, q)] = bool(m.get("measured", True))
         probed[g].append(q)
         n_probed += 1
         if objective == "tail" and tails[(g, q)] is None:
@@ -274,7 +424,31 @@ def run_column_generation(
             )
 
     def do_probe(g: str, q: str) -> None:
+        nonlocal n_violations, local_margin
+        # Audit only measurement-vs-measurement: proxy floors or proxy
+        # probes audit nothing (mixed comparisons prove nothing).
+        audit = (
+            q != floors[g]
+            and (g, floors[g]) in obj
+            and kmeasured.get((g, floors[g]), True)
+        )
+        pre_ub = bound_for(g, q) if audit else None
         record(g, q, probe_fn(g, q))
+        if audit and pre_ub is not None and kmeasured.get((g, q), True):
+            fl = obj.get((g, floors[g]))
+            v = obj.get((g, q))
+            if fl is None or v is None:
+                return
+            gain = fl - v
+            if gain > pre_ub * (1.0 + VIOLATION_REL_TOL) + VIOLATION_ABS_TOL:
+                # Reality beat the bound: count it and widen the local
+                # margin so sibling columns price more conservatively.
+                n_violations += 1
+                need = (gain / pre_ub) if pre_ub > 0 else LOCAL_MARGIN_CAP
+                local_margin = min(
+                    LOCAL_MARGIN_CAP,
+                    max(local_margin * 1.5, need * 1.1),
+                )
 
     def do_batch(cols: list[tuple[str, str]]) -> None:
         if batch_probe_fn is None or len(cols) <= 1:
@@ -301,15 +475,65 @@ def run_column_generation(
     solution: dict[str, Any] | None = None
     rounds = 0
     lam = 0.0
+    # Self-monitoring certificate: every probe audits the bound that
+    # priced it. A violation (measured gain past tolerance above the
+    # bound) widens the local margin; the count ships in the manifest.
+    local_margin = LOCAL_MARGIN_START
+    n_violations = 0
+    # Columns known upfront to carry measurements (step-13 row hits).
+    # None = unknown/trust probes as they arrive (step-12 GPU: everything
+    # probed is measured). Lazy ceilings fire only for measurably-topped
+    # groups: a proxy ceiling can never complete a bracket (it anchors
+    # nothing), so prioritizing it buys no information and only lets
+    # estimates into the DP master early.
+    measured_norm = (
+        None if measured_cols is None
+        else {(g, q.upper()) for g, q in measured_cols}
+    )
+
+    def bound_for(g: str, q: str) -> float:
+        return upper_bound_gain(
+            group=g, quant=q, floor=floors[g], tails=obj,
+            probed=probed, scales=scales, lipschitz_L=L,
+            margin=local_margin if bisection else None,
+            kld_measured=kmeasured,
+        )
 
     def price_unprobed() -> list[tuple[float, str, str]]:
-        """Score unprobed columns; returns [(ub_per_byte, g, q)] attractive-only."""
+        """Score unprobed columns; returns [(ub_per_byte, g, q)] attractive-only.
+
+        With bisection (default), bracket probes sort first: tier 0 =
+        lazy ceilings (top rung of floor-only groups whose full-range
+        gain could beat lambda), tier 1 = midpoints of undecided probed
+        intervals (bisect only while the interval straddles the DP's
+        decision), tier 2 = everything else by bounded gain per byte.
+        Order never affects certificate validity — exclusion comes only
+        from the bounds — it only changes how fast brackets close.
+        With bisection=False, legacy flat gain-per-byte ranking.
+        """
         nonlocal L
         if auto_L:
-            L = calibrate_lipschitz(obj, probed, scales)
+            L = calibrate_lipschitz(obj, probed, scales, kmeasured)
         LL = L
-        ranked: list[tuple[float, str, str]] = []
+        LM = local_margin if bisection else None
+        tiered: list[tuple[int, float, str, str]] = []
+        # Slack if every OTHER group sat at floor: what this group could
+        # take without breaking the budget. The lazy ceiling is the top
+        # AFFORDABLE rung, not the top rung — bracketing what the DP can
+        # never pick buys no decision, only cost.
+        floor_total = sum(
+            size_bytes[(h, floors[h])] for h in groups
+        )
         for g in groups:
+            f = floors[g]
+            slack = budget_bytes - (floor_total - size_bytes[(g, f)])
+            affordable = [
+                q for q in candidates[g]
+                if size_bytes[(g, q)] <= slack
+            ]
+            ceiling = (
+                max(affordable, key=bitwidth) if affordable else f
+            )
             for q in candidates[g]:
                 if q in probed[g]:
                     continue
@@ -317,15 +541,59 @@ def run_column_generation(
                 ub = upper_bound_gain(
                     group=g, quant=q, floor=floors[g], tails=obj,
                     probed=probed, scales=scales, lipschitz_L=LL,
+                    margin=LM, kld_measured=kmeasured,
                 )
                 if extra <= 0:
                     if ub > 0:
-                        ranked.append((math.inf, g, q))
+                        tiered.append((0, math.inf, g, q))
                     continue
-                if ub / extra > lam:
-                    ranked.append((ub / extra, g, q))
-        ranked.sort(key=lambda t: t[0], reverse=True)
-        return ranked
+                score = ub / extra
+                if score <= lam:
+                    continue
+                tier = 2
+                if bisection:
+                    tier = _bracket_tier(g, q, ceiling, extra)
+                tiered.append((tier, score, g, q))
+        tiered.sort(key=lambda t: (t[0], -t[1]))
+        return [(s, g, q) for _, s, g, q in tiered]
+
+    def _bracket_tier(g: str, q: str, ceiling: str, extra: int) -> int:
+        """0 = lazy (affordable) ceiling, 1 = undecided-interval midpoint."""
+        f = floors[g]
+        fl = obj.get((g, f))
+        if fl is None:
+            return 2
+        if len(probed[g]) == 1 and q == ceiling and ceiling != f:
+            # Lazy ceiling: worth the probe only if the group's whole
+            # affordable range could change the DP's mind at current
+            # lambda — and only if the ceiling is (or may be) measured.
+            # A proxy ceiling anchors nothing, so it keeps legacy late
+            # timing.
+            if fl / extra > lam and (
+                measured_norm is None
+                or (g, q.upper()) in measured_norm
+            ):
+                return 0
+            return 2
+        # Only valued widths bracket: None entries (unmeasured metric
+        # under the other objective) bracket nothing.
+        wv = _width_values(g, obj, probed, kmeasured)
+        widths = sorted(wv)
+        bw_q = bitwidth(q)
+        blo = [w for w in widths if w < bw_q]
+        bhi = [w for w in widths if w > bw_q]
+        if not (blo and bhi):
+            return 2
+        a, b = max(blo), min(bhi)
+        if any(w != a and w != b and a < w < b for w in widths):
+            return 2  # not an adjacent probed pair
+        t_a, t_b = max(wv[a]), min(wv[b])
+        # Bisect only while the interval straddles the decision: once
+        # the whole interval's gain per byte sits on one side of lambda,
+        # further bisection cannot change the DP pick.
+        if (t_a - t_b) / extra > lam:
+            return 1
+        return 2
 
     while True:
         master_cand = {g: list(probed[g]) for g in groups}
@@ -388,6 +656,12 @@ def run_column_generation(
             "monotonic": True,
             "lipschitz_L": L,
             "lipschitz_auto_calibrated": auto_L,
+            "local_secant": bisection,
+            "local_margin": local_margin,
+            "local_margin_adapted": local_margin != LOCAL_MARGIN_START,
+            "bound_violations": n_violations,
+            "bisection_tiers": bisection,
+            "anchors": "measured-only",
             "sensitivity_source": "imatrix" if imatrix_scores else "uniform",
         },
         "probed_columns": n_probed,
