@@ -1,5 +1,34 @@
 # Changes: DP-MCKP optimizer with column generation (`feat/dp-mckp-colgen`)
 
+## Bisection pricing reverted: invalid exclusions (2026-09-28)
+
+- **Verdict** (user decision): commit `19f6c19` (local-secant bound, tiered
+  bisection order, measured anchors, self-monitoring) is reverted by
+  `9643500`. The savings were small (E4B rerun: 181 probes vs 186, 19
+  excluded vs 14) and the bound was proven wrong.
+- **The failure** (deterministic, reproduced arithmetic, not noise —
+  cross-day measurements match to 6 decimals): for `other@early`, Q3_K
+  measures genuinely terribly (mean 0.064 vs Q2 floor 0.009). The
+  local-secant bound interpolated across that cliff neighborhood and
+  priced Q4/Q5/Q6/Q8 at gain 0.000000, excluding all four — while the
+  old bounds allowed 0.0096 and yesterday's run measured true gains of
+  ~0.009 there. A slope drawn across a cliff predicts garbage next to
+  it, and `min()` lets that zero overrule the correct terms.
+- **Compounding hole**: the violation audit runs only in the sequential
+  probe path; step 12 with `--jobs 2` uses the batch path, which never
+  audits — so all 19 exclusions were decided with a frozen margin and
+  zero checks. Step 13 (sequential lookups) then logged 54 violations
+  with the margin slammed to its cap, after the damage was done.
+- **Lesson for next ideas**: at this budget tightness (lambda ~ 0),
+  near-exhaustive measuring is forced no matter the order — pricing
+  cleverness can only ever save a handful of probes. Bigger savings
+  need a looser reference or fewer rungs, not better ranking. Any
+  future bound that takes a minimum over terms must distrust intervals
+  containing a worse-than-floor measurement, and audits must run on
+  every path including batches.
+- **Tests**: back to **150 green** (the 9 bisection tests left with the
+  revert).
+
 ## Budget is a hard limit: pareto capped, reference = intended (2026-09-28)
 
 - **Scope change** (user decision): the solve budget is a hard ceiling —
