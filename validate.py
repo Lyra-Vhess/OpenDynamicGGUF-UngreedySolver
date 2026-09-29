@@ -71,10 +71,14 @@ def build_report_card_data(
     optimize_manifest: dict[str, Any] | None = None,
     validate_payload: dict[str, Any] | None = None,
     resolve_descriptor: dict[str, Any] | None = None,
-    baseline: str = BASELINE,
+    baseline: str | None = None,
+    sensitivity_baseline: str | None = None,
 ) -> dict[str, Any]:
     tensors = catalog.get("tensors") or {}
     groups = catalog.get("groups") or {}
+    # Size/KLD baseline: the run's trial background rung (what the
+    # sensitivity rows measured against), never a hardcoded rung.
+    baseline = baseline or sensitivity_baseline or BASELINE
     n_layers = int(catalog.get("n_layers") or 0)
     if not n_layers:
         # infer
@@ -283,6 +287,8 @@ def build_report_card_data(
 
     desc = resolve_descriptor or {}
     validate_payload = validate_payload or {}
+    _t1 = validate_payload.get("tier1") or {}
+    _t1m = _t1.get("metrics") or {}
 
     return {
         "title": "OpenDynamicGGUF — Quantization Report Card",
@@ -313,9 +319,19 @@ def build_report_card_data(
         },
         "quality": {
             "predicted_delta_kld_sum": total_kld,
+            "predicted_delta_kld_corrected": primary.get(
+                "predicted_delta_kld_corrected"),
+            "background_penalty_kld": primary.get("background_penalty_kld"),
             "optimize_predicted_delta_kld": primary.get("predicted_delta_kld"),
+            "measured_mean_kld": _t1m.get("mean_kld"),
+            "measured_p99_kld": _t1m.get("p99_kld"),
+            "measured_p999_kld": _t1m.get("p999_kld"),
+            "measured_max_kld": _t1m.get("max_kld"),
+            "measured_top1_agree": _t1m.get("top1_agree"),
+            "measured_perplexity": _t1.get("perplexity"),
+            "measured_method": _t1.get("method"),
             "verdict": validate_payload.get("verdict"),
-            "tier1": (validate_payload.get("tier1") or {}).get("metrics"),
+            "tier1": _t1m,
         },
         "quant_histogram": dict(sorted(quant_hist.items())),
         "role_summary": role_summary,
@@ -334,6 +350,10 @@ def build_report_card_data(
 def write_report_card_md(data: dict[str, Any], path: Path) -> None:
     arch = data["architecture"]
     size = data["size"]
+    q = data["quality"]
+
+    def _k(v: Any) -> str:
+        return "n/a" if v is None else f"{float(v):.4f}"
     lines = [
         f"# {data['title']}",
         "",
@@ -356,7 +376,15 @@ def write_report_card_md(data: dict[str, Any], path: Path) -> None:
         f"| Fixed (norms etc.) | { _mb(size['fixed_nonquant_bytes']):.2f} |",
         f"| **Estimated total** | **{size['estimated_total_mb']:.2f}** |",
         "",
-        f"Predicted Σ ΔKLD: `{data['quality'].get('predicted_delta_kld_sum', 0):.4f}`  ",
+        f"Predicted Σ ΔKLD: `{_k(q.get('predicted_delta_kld_sum'))}` "
+        f"(background-corrected `{_k(q.get('predicted_delta_kld_corrected'))})`  ",
+        f"Measured held-out ({q.get('measured_method') or 'n/a'}): "
+        f"mean `{_k(q.get('measured_mean_kld'))}` · "
+        f"P99 `{_k(q.get('measured_p99_kld'))}` · "
+        f"P999 `{_k(q.get('measured_p999_kld'))}` · "
+        f"max `{_k(q.get('measured_max_kld'))}` · "
+        f"top-1 `{_k(q.get('measured_top1_agree'))}` · "
+        f"PPL `{_k(q.get('measured_perplexity'))}`  ",
         f"Quant mix: `{data['quant_histogram']}`",
         "",
         "## Compression by role",
@@ -463,6 +491,23 @@ def write_report_card_html(data: dict[str, Any], path: Path) -> None:
     arch = data["architecture"]
     size = data["size"]
     esc = html_lib.escape
+    q = data["quality"]
+
+    def _h(v: Any, digits: int = 4) -> str:
+        return "n/a" if v is None else f"{float(v):.{digits}f}"
+
+    measured_cells = "".join(
+        f"<div class='stat'><div class='label'>{label}</div>"
+        f"<div class='value'>{val}</div></div>"
+        for label, val in [
+            ("Mean KLD", _h(q.get("measured_mean_kld"))),
+            ("P99 KLD", _h(q.get("measured_p99_kld"))),
+            ("Top-1 agree", _h(q.get("measured_top1_agree"))),
+            ("Perplexity", _h(q.get("measured_perplexity"), 3)),
+            ("Pred. corrected", _h(q.get("predicted_delta_kld_corrected"))),
+            ("Pred. raw Σ", _h(q.get("predicted_delta_kld_sum"), 3)),
+        ]
+    )
 
     def badge(q: str) -> str:
         colors = {
@@ -534,6 +579,10 @@ def write_report_card_html(data: dict[str, Any], path: Path) -> None:
 
     hist = " · ".join(
         f"{badge(k)} ×{v}" for k, v in (data.get("quant_histogram") or {}).items()
+    )
+    qmethod = (
+        f" — {esc(str(q.get('measured_method')))}"
+        if q.get("measured_method") else ""
     )
 
     doc = f"""<!DOCTYPE html>
@@ -616,6 +665,11 @@ def write_report_card_html(data: dict[str, Any], path: Path) -> None:
   </div>
   <p class="hist">Quant mix: {hist}</p>
 
+  <h2>Measured quality (held-out Tier-1{qmethod})</h2>
+  <div class="grid">
+    {measured_cells}
+  </div>
+
   <h2>Compression by role</h2>
   <table>
     <thead><tr>
@@ -674,6 +728,7 @@ def write_quantization_report_card(
     optimize_manifest: dict[str, Any] | None = None,
     validate_payload: dict[str, Any] | None = None,
     resolve_descriptor: dict[str, Any] | None = None,
+    sensitivity_baseline: str | None = None,
 ) -> dict[str, str]:
     """Write html/md/json report card. Returns paths."""
     out_dir = Path(out_dir)
@@ -686,6 +741,7 @@ def write_quantization_report_card(
         optimize_manifest=optimize_manifest,
         validate_payload=validate_payload,
         resolve_descriptor=resolve_descriptor,
+        sensitivity_baseline=sensitivity_baseline,
     )
     json_path = out_dir / "quantization_report_card.json"
     md_path = out_dir / "quantization_report_card.md"
@@ -1183,9 +1239,12 @@ def validate_and_release(
     report_card_paths: dict[str, str] = {}
     if catalog and assignments:
         sens_rows = None
+        sens_baseline = None
         if sensitivity_path and Path(sensitivity_path).is_file():
             try:
-                sens_rows = json.loads(Path(sensitivity_path).read_text()).get("rows")
+                sens_json = json.loads(Path(sensitivity_path).read_text())
+                sens_rows = sens_json.get("rows")
+                sens_baseline = sens_json.get("baseline_type")
             except Exception:  # noqa: BLE001
                 sens_rows = None
         validate_payload = {
@@ -1204,6 +1263,7 @@ def validate_and_release(
             validate_payload=validate_payload,
             resolve_descriptor=resolve_descriptor
             or ({"specialty_domain": specialty_domain} if specialty_domain else None),
+            sensitivity_baseline=sens_baseline,
         )
         log.append(
             "8. Wrote quantization_report_card.html/.md/.json "

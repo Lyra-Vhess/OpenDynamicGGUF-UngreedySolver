@@ -24,6 +24,9 @@ Usage:
       --heldout-txt <run>/steps/07_corpus/heldout.txt \\
       --heldout-bin <run>/steps/11_reference_logits/logits-heldout.bin \\
       --out-dir <run>/steps/16_pareto_sweep [--xl-gguf ...] [--dry-run]
+
+  Step-15 frontier set (curated recipes, export deferred):
+    --recipe-file <f.yaml> (repeat) --drop-winner
 """
 
 from __future__ import annotations
@@ -44,55 +47,64 @@ _PRED_RE = re.compile(r"^\s*predicted_mean_delta_kld:\s*([-\d.eE+]+)\s*$")
 _EST_RE = re.compile(r"^\s*size_bytes:\s*(\d+)\s*$")
 
 
-def parse_recipe_points(pareto_dir: Path) -> list[dict[str, Any]]:
-    """Parse every pareto-*.yaml: budget, predicted mean, overrides.
+def _parse_recipe_file(path: Path) -> dict[str, Any]:
+    """Parse one recipe yaml: budget, predicted mean, overrides."""
+    text = path.read_text(encoding="utf-8")
+    budget = predicted = estimated = None
+    overrides: dict[str, str] = {}
+    in_overrides = False
+    for line in text.splitlines():
+        if line.startswith("overrides:"):
+            in_overrides = True
+            continue
+        if in_overrides:
+            m = _OVERRIDES_RE.match(line)
+            if m:
+                # Unescape the \" sequences the yaml renderer emits.
+                regex = m.group(1).replace(r"\"", "\"").replace("\\\\", "\\")
+                overrides[regex] = m.group(2)
+                continue
+            if line and not line.startswith(" "):
+                in_overrides = False
+        m = _TARGET_RE.match(line)
+        if m:
+            budget = int(m.group(1))
+            continue
+        m = _PRED_RE.match(line)
+        if m:
+            predicted = float(m.group(1))
+            continue
+        m = _EST_RE.match(line)
+        if m:
+            estimated = int(m.group(1))
+    if budget is None or not overrides:
+        raise RuntimeError(
+            f"Could not parse recipe {path} "
+            f"(budget={budget}, overrides={len(overrides)})."
+        )
+    return {
+        "path": str(path),
+        "budget_bytes": budget,
+        "predicted_mean_kld": predicted,
+        "estimated_bytes": estimated,
+        "overrides": overrides,
+    }
+
+
+def parse_recipe_points(
+    pareto_dir: Path,
+    patterns: tuple[str, ...] = ("pareto-*.yaml",),
+) -> list[dict[str, Any]]:
+    """Parse every recipe matching patterns: budget, predicted, overrides.
 
     Line-based (render_recipe_yaml has a fixed layout); avoids a yaml
     dependency. Returns one dict per file: path, budget_bytes,
     predicted_mean_kld, estimated_bytes, overrides {regex: type}.
     """
     points = []
-    for path in sorted(pareto_dir.glob("pareto-*.yaml")):
-        text = path.read_text(encoding="utf-8")
-        budget = predicted = estimated = None
-        overrides: dict[str, str] = {}
-        in_overrides = False
-        for line in text.splitlines():
-            if line.startswith("overrides:"):
-                in_overrides = True
-                continue
-            if in_overrides:
-                m = _OVERRIDES_RE.match(line)
-                if m:
-                    # Unescape the \" sequences the yaml renderer emits.
-                    regex = m.group(1).replace(r"\"", "\"").replace("\\\\", "\\")
-                    overrides[regex] = m.group(2)
-                    continue
-                if line and not line.startswith(" "):
-                    in_overrides = False
-            m = _TARGET_RE.match(line)
-            if m:
-                budget = int(m.group(1))
-                continue
-            m = _PRED_RE.match(line)
-            if m:
-                predicted = float(m.group(1))
-                continue
-            m = _EST_RE.match(line)
-            if m:
-                estimated = int(m.group(1))
-        if budget is None or not overrides:
-            raise RuntimeError(
-                f"Could not parse pareto recipe {path} "
-                f"(budget={budget}, overrides={len(overrides)})."
-            )
-        points.append({
-            "path": str(path),
-            "budget_bytes": budget,
-            "predicted_mean_kld": predicted,
-            "estimated_bytes": estimated,
-            "overrides": overrides,
-        })
+    for pat in patterns:
+        for path in sorted(pareto_dir.glob(pat)):
+            points.append(_parse_recipe_file(path))
     return points
 
 
@@ -290,8 +302,17 @@ def run_sweep(
     dry_run: bool = False,
     export_fn=export_candidate,
     measure_fn=measure_candidate,
+    recipe_files: list[Path] | None = None,
+    keep_winner: bool = True,
 ) -> dict[str, Any]:
-    """Full sweep. Returns the frontier record (also written to disk)."""
+    """Full sweep. Returns the frontier record (also written to disk).
+
+    ``recipe_files`` measures exactly those recipes (the step-15
+    frontier set: curated BPW selections + the primary) instead of
+    globbing the pareto dir; exact-duplicate allocations fold by
+    overrides identity. ``keep_winner=False`` deletes every export
+    after measuring (export deferred — plots + frontier.json stay).
+    """
     optimize_dir = Path(optimize_dir)
     out_dir = Path(out_dir)
     (out_dir / "exports").mkdir(parents=True, exist_ok=True)
@@ -304,11 +325,15 @@ def run_sweep(
                 manifest_hashes[int(entry["budget_bytes"])] = str(
                     entry["allocation_hash"])
 
-    points = parse_recipe_points(optimize_dir / "pareto")
-    if manifest_hashes:
-        feasible_budgets = set(manifest_hashes)
-        points = [p for p in points if p["budget_bytes"] in feasible_budgets]
-    kept = dedupe_points(points, manifest_hashes or None)
+    if recipe_files is not None:
+        points = [_parse_recipe_file(Path(p)) for p in recipe_files]
+        kept = dedupe_points(points, None)
+    else:
+        points = parse_recipe_points(optimize_dir / "pareto")
+        if manifest_hashes:
+            feasible_budgets = set(manifest_hashes)
+            points = [p for p in points if p["budget_bytes"] in feasible_budgets]
+        kept = dedupe_points(points, manifest_hashes or None)
 
     measured: list[dict[str, Any]] = []
     for i, p in enumerate(kept):
@@ -322,7 +347,8 @@ def run_sweep(
         recipe_yaml = Path(p["path"])
         out_gguf = exp_dir / f"pareto-{tag}.gguf"
         rec: dict[str, Any] = {
-            "hash": manifest_hashes.get(p["budget_bytes"]),
+            "hash": manifest_hashes.get(p["budget_bytes"]) or json.dumps(
+                sorted(p["overrides"].items()), separators=(",", ":")),
             "budget_bytes": p["budget_bytes"],
             "predicted_mean_kld": p.get("predicted_mean_kld"),
             "estimated_bytes": p.get("estimated_bytes"),
@@ -375,10 +401,20 @@ def run_sweep(
                 f"  {m['budget_bytes']}B est / "
                 f"{m.get('actual_bytes')}B actual" for m in measured)
         )
+    if not dry_run and not keep_winner:
+        # Export deferred (step-15 frontier mode): every candidate GGUF
+        # is deleted after measuring — plots + frontier.json stay.
+        assert winner is not None
+        for m in measured:
+            tag_dir = out_dir / "exports" / (
+                f"{measured.index(m):02d}-{m['budget_bytes'] // 1024}k")
+            for gguf in tag_dir.glob("*.gguf"):
+                gguf.unlink(missing_ok=True)
+        winner["kept_gguf"] = None
     # Delete losers: only the winner's GGUF stays on disk. The winner's
     # working export is removed too after copying to its final name —
     # one GGUF total, plus small recipe/provenance/logs.
-    if not dry_run:
+    if not dry_run and keep_winner:
         assert winner is not None
         wi = measured.index(winner)
         wtag = f"{wi:02d}-{winner['budget_bytes'] // 1024}k"
@@ -440,6 +476,12 @@ def main(argv: list[str] | None = None) -> int:
                     help='Extra args for Tier-1 perplexity, e.g. "-ngl 99"')
     ap.add_argument("--dry-run", action="store_true",
                     help="Parse + dedupe + pick-shape only (no GPU).")
+    ap.add_argument("--recipe-file", type=Path, action="append", default=None,
+                    help="Measure exactly these recipes (repeatable); "
+                    "skips the pareto-dir glob. The step-15 frontier set.")
+    ap.add_argument("--drop-winner", action="store_true",
+                    help="Delete every export after measuring (export "
+                    "deferred — keep plots + frontier.json only).")
     args = ap.parse_args(argv)
 
     from cli import split_extra_args
@@ -459,6 +501,8 @@ def main(argv: list[str] | None = None) -> int:
         perplexity_args=split_extra_args(args.perplexity_args,
                                          "--perplexity-args"),
         dry_run=args.dry_run,
+        recipe_files=args.recipe_file,
+        keep_winner=not args.drop_winner,
     )
     w = record["winner"] or {}
     print(json.dumps({

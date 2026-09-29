@@ -1,5 +1,33 @@
 # Changes: DP-MCKP optimizer with column generation (`feat/dp-mckp-colgen`)
 
+## Exhaustive integration: correction + frontier recipes + step-15 sweep (2026-09-29)
+
+- **Background correction (report-only)**: summed DP predictions
+  overcount the all-background penalty (N−1)x. `background_penalty_kld`
+  (mean of probed background-rung cells) + `corrected_prediction_kld`
+  (raw − (N−1)·B) in `optimizer.py`; manifest primary + every pareto
+  point carry raw and corrected; E4B gold regression pinned
+  (379·0.001233 = 0.4673 vs drift 0.4596). DP decisions untouched.
+- **Report card off hardcoded Q6**: baseline resolves from the run's
+  sensitivity `baseline_type`; quality section gains measured held-out
+  Tier-1 (mean/P99/P999/max/top-1/PPL + method) next to raw and
+  corrected predictions (md + html + json).
+- **Full frontier in step 13**: one extra solve backtracks every
+  distinct optimum ≤ budget into `manifest.frontier.table`; BPW grid
+  (3→8 + user budget) rounds UP to the smallest optimum at/above each
+  need → `pareto/frontier-bpw-*.yaml` (hash-folded, unfilled points
+  stay empty). Ratio-grid pareto files unchanged.
+- **`odg export --recipe`**: export any step-13 recipe (frontier/pareto
+  file or path); `.tt` rendered from recipe overrides, output named
+  after the recipe, selection recorded + stale-checked.
+- **Step-15 `--frontier` / `--budget-mb frontier`**: 9-point measure
+  (exports + held-out Tier-1 + 4 PNGs + frontier.json) via the
+  `pareto_sweep.run_sweep` path (`--recipe-file`/`--drop-winner`
+  added there); frontier-only mode needs no step 14, forces the
+  exhaustive certificate (hard error otherwise), keeps no GGUF.
+- **Tests**: 202 green (2 correction + 2 card + 3 frontier + 5 export
+  + 4 frontier-validate, incl. a stub-GPU end-to-end sweep).
+
 ## Pareto sweep tool (2026-09-29)
 
 - **New committed `pareto_sweep.py`** (standalone, reads step artifacts):

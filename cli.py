@@ -497,6 +497,17 @@ def main(argv: list[str] | None = None) -> int:
         metavar="FORMAT",
         help="Override run quant target for this step",
     )
+    p_ex.add_argument(
+        "--recipe",
+        default=None,
+        metavar="NAME",
+        help="Export a non-primary recipe from step 13 instead of "
+        "recipe.yaml: a frontier file (frontier-bpw-4.yaml), a Pareto "
+        "file (pareto-03-5120k.yaml), or a path. Resolved against the "
+        "optimize dir, its pareto/ subdir, then the filesystem; the .tt "
+        "is rendered from the recipe overrides. Output is named after "
+        "the recipe.",
+    )
     p_ex.add_argument("--no-explain", action="store_true")
 
     # --- validate (step 15) ---
@@ -528,6 +539,27 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         metavar="ARGS",
         help='Extra args appended verbatim to Tier-1 llama-perplexity runs, e.g. --perplexity-args "-ngl 99"',
+    )
+    p_val.add_argument(
+        "--frontier",
+        action="store_true",
+        help="After the primary validation, measure the step-13 frontier "
+        "recipe set (BPW selections + primary) with held-out Tier-1 and "
+        "write frontier plots (needs --mode llama; exports are transient).",
+    )
+    p_val.add_argument(
+        "--budget-mb",
+        default=None,
+        metavar="MIB",
+        help="Validate the primary under this MiB budget; "
+        "'frontier' validates the frontier set only (no primary, "
+        "requires an exhaustive step-13 certificate, exports deferred).",
+    )
+    p_val.add_argument(
+        "--llama-quantize",
+        type=Path,
+        default=None,
+        help="Path to llama-quantize for --frontier exports (or set LLAMA_CPP_DIR)",
     )
     p_val.add_argument("--no-explain", action="store_true")
 
@@ -730,6 +762,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Fallback/base type for llama-quantize (default: from --quant)",
     )
     p_run.add_argument(
+        "--recipe",
+        default=None,
+        metavar="NAME",
+        help="Step-14 recipe selection (frontier/pareto file or path; "
+        "default: primary recipe.yaml)",
+    )
+    p_run.add_argument(
         "--validate-mode",
         choices=("auto", "llama", "proxy"),
         default="auto",
@@ -739,6 +778,12 @@ def main(argv: list[str] | None = None) -> int:
         "--strict",
         action="store_true",
         help="Do not allow PROVISIONAL verdict without a real GGUF",
+    )
+    p_run.add_argument(
+        "--frontier",
+        action="store_true",
+        help="Step 15 also measures the frontier recipe set (BPW "
+        "selections + primary) with held-out Tier-1 + plots",
     )
     p_run.add_argument(
         "--only-quantizable",
@@ -859,12 +904,14 @@ def main(argv: list[str] | None = None) -> int:
         default="auto",
     )
     p_fit.add_argument("--base-type", default=None)
+    p_fit.add_argument("--recipe", default=None, metavar="NAME")
     p_fit.add_argument(
         "--validate-mode",
         choices=("auto", "llama", "proxy"),
         default="auto",
     )
     p_fit.add_argument("--strict", action="store_true")
+    p_fit.add_argument("--frontier", action="store_true")
     p_fit.add_argument(
         "--only-quantizable",
         action=argparse.BooleanOptionalAction,
@@ -1171,9 +1218,16 @@ def _pipeline_expected_inputs(step_id: str, args: argparse.Namespace, fmt):
             exp["base_type"] = fmt.base_type
         if fmt is not None:
             exp["quant_format"] = fmt.id
+        exp["recipe"] = _run_flag(args, "recipe", None) or "primary"
     elif step_id == "validate":
         exp["mode"] = _run_flag(args, "validate_mode", "auto") or "auto"
         exp["strict"] = bool(_run_flag(args, "strict", False))
+        exp["frontier"] = bool(_run_flag(args, "frontier", False))
+        _vbm = _run_flag(args, "budget_mb", None)
+        # Standalone validate accepts the literal "frontier"; run/fit
+        # carry a numeric MiB budget (or None) — normalize for compare.
+        exp["budget_mb"] = _vbm if isinstance(_vbm, str) else (
+            float(_vbm) if _vbm is not None else None)
         exp["perplexity_args"] = split_extra_args(
             _run_flag(args, "perplexity_args", None), "--perplexity-args"
         )
@@ -1374,7 +1428,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             jobs=int(_run_flag(args, "jobs", 1) or 1),
             pareto_ratios=_run_flag(args, "pareto_ratios", None),
             base_type=_run_flag(args, "base_type", None),
+            recipe=_run_flag(args, "recipe", None),
             llama_quantize=None,
+            frontier=bool(_run_flag(args, "frontier", False)),
             strict=bool(_run_flag(args, "strict", False)),
         )
 
@@ -3443,6 +3499,26 @@ def cmd_optimize(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_recipe(opt_dir: Path, sel: str) -> Path:
+    """Resolve --recipe: exact path, optimize dir, or its pareto/ subdir."""
+    cands = [
+        Path(sel).expanduser(),
+        opt_dir / sel,
+        opt_dir / "pareto" / sel,
+    ]
+    for c in cands:
+        if c.is_file() and c.suffix in {".yaml", ".yml"}:
+            return c
+    avail = sorted(
+        [p.name for p in opt_dir.glob("*.yaml")]
+        + [f"pareto/{p.name}" for p in (opt_dir / "pareto").glob("*.yaml")]
+    )
+    raise ValueError(
+        f"--recipe {sel!r} not found (tried {', '.join(str(c) for c in cands)}). "
+        f"Available step-13 recipes: {', '.join(avail) or '(none)'}"
+    )
+
+
 def cmd_export(args: argparse.Namespace) -> int:
     from export import export_gguf
     from store import StepAlreadyDone
@@ -3489,11 +3565,23 @@ def cmd_export(args: argparse.Namespace) -> int:
         return 0
 
     opt_dir = store.step_path(meta.run_id, "optimize")
-    recipe_path = opt_dir / "recipe.yaml"
-    recipe_tt = opt_dir / "recipe.tt"
-    if not recipe_path.is_file() or not recipe_tt.is_file():
-        print(f"ERROR: missing recipe.yaml / recipe.tt in {opt_dir}", file=sys.stderr)
-        return 1
+    recipe_sel = getattr(args, "recipe", None)
+    tt_text: str | None = None
+    out_name: str | None = None
+    if recipe_sel:
+        from optimizer import parse_recipe_overrides, render_tt_from_overrides
+
+        recipe_path = _resolve_recipe(opt_dir, recipe_sel)
+        tt_text = render_tt_from_overrides(
+            parse_recipe_overrides(recipe_path))
+        recipe_tt = None  # rendered into the step dir after begin_step
+        out_name = recipe_path.stem + ".gguf"
+    else:
+        recipe_path = opt_dir / "recipe.yaml"
+        recipe_tt = opt_dir / "recipe.tt"
+        if not recipe_path.is_file() or not recipe_tt.is_file():
+            print(f"ERROR: missing recipe.yaml / recipe.tt in {opt_dir}", file=sys.stderr)
+            return 1
 
     freeze_out = store.read_step_output(meta.run_id, "freeze_gguf") or {}
     gguf_in = freeze_out.get("gguf_path")
@@ -3522,6 +3610,7 @@ def cmd_export(args: argparse.Namespace) -> int:
         "from_step": "optimize",
         "gguf_in": gguf_in,
         "recipe_path": str(recipe_path),
+        "recipe_selection": recipe_sel or "primary",
         "mode": args.mode,
         "base_type": base_type,
         "quant_format": fmt.id,
@@ -3533,6 +3622,10 @@ def cmd_export(args: argparse.Namespace) -> int:
         )
     except StepAlreadyDone:
         return cmd_export(args)
+
+    if tt_text is not None:
+        recipe_tt = step_dir / f"recipe-{recipe_path.stem}.tt"
+        recipe_tt.write_text(tt_text, encoding="utf-8")
 
     try:
         with ui.working('Exporting candidate GGUF…', explain=print_explain):
@@ -3546,6 +3639,7 @@ def cmd_export(args: argparse.Namespace) -> int:
                 mode=args.mode,
                 llama_quantize=args.llama_quantize,
                 base_type=base_type,
+                out_name=out_name,
             )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "export", str(exc))
@@ -3572,6 +3666,95 @@ def cmd_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def _validate_frontier(
+    store, meta, step_dir: Path, optimize_manifest: dict | None,
+    ref_out: dict, export_out: dict, args: argparse.Namespace,
+    *, keep_winner: bool,
+) -> dict[str, Any]:
+    """Step-15 frontier sweep: measure the 9-point recipe set, plot it.
+
+    Recipes come from the step-13 manifest frontier selection (BPW
+    points) plus the primary recipe.yaml. Exports are transient; with
+    keep_winner=False every GGUF is deleted after measuring (export
+    deferred — plots + frontier.json stay).
+    """
+    from pareto_sweep import run_sweep
+
+    opt_dir = store.step_path(meta.run_id, "optimize")
+    manifest = optimize_manifest or {}
+    front = manifest.get("frontier") or {}
+    sel = front.get("selection") or {}
+    cert_mode = ((manifest.get("primary") or {}).get("certificate") or {}).get("mode")
+    if cert_mode != "exhaustive":
+        raise ValueError(
+            "Frontier validation needs the step-13 exhaustive certificate "
+            f"(got {cert_mode!r}): frontier optima are only meaningful over "
+            "a fully measured table. Re-run steps 12–13 with "
+            "--certificate exhaustive."
+        )
+    files: list[str] = []
+    for key, entry in sel.items():
+        if key == "budget" or not isinstance(entry, dict):
+            continue
+        rp = entry.get("path")
+        if not rp:
+            continue  # unfilled grid point
+        p = Path(rp)
+        if not p.is_absolute():
+            p = opt_dir / "pareto" / p.name
+        if p.is_file() and str(p) not in files:
+            files.append(str(p))
+    primary_recipe = opt_dir / "recipe.yaml"
+    if primary_recipe.is_file() and str(primary_recipe) not in files:
+        files.append(str(primary_recipe))
+    if not files:
+        raise ValueError(
+            "Step-13 manifest has no frontier selection and no primary "
+            "recipe.yaml — re-run step 13 (frontier recipes are emitted "
+            "by the current optimizer)."
+        )
+
+    freeze_out = store.read_step_output(meta.run_id, "freeze_gguf") or {}
+    gguf_in = freeze_out.get("gguf_path")
+    if not gguf_in or not Path(gguf_in).is_file():
+        step9 = store.step_path(meta.run_id, "freeze_gguf")
+        for name in ("model-bf16.gguf", "model-ref.gguf"):
+            if (step9 / name).is_file():
+                gguf_in = str(step9 / name)
+                break
+    if not gguf_in:
+        raise ValueError("Frozen GGUF missing (step 09).")
+    imatrix_out = store.read_step_output(meta.run_id, "imatrix") or {}
+    imatrix_path = imatrix_out.get("imatrix_path")
+    if imatrix_path and not Path(imatrix_path).is_file():
+        imatrix_path = None
+    heldout_txt = ref_out.get("heldout_path")
+    heldout_bin = ref_out.get("logits_heldout_path")
+    if not heldout_txt or not Path(heldout_txt).is_file():
+        raise ValueError("Held-out text missing (step 11 --mode llama).")
+    if not heldout_bin or not Path(heldout_bin).is_file():
+        raise ValueError("Held-out logits missing (step 11 --mode llama).")
+
+    return run_sweep(
+        optimize_dir=opt_dir,
+        gguf_in=Path(gguf_in),
+        imatrix=Path(imatrix_path) if imatrix_path else None,
+        heldout_txt=Path(heldout_txt),
+        heldout_bin=Path(heldout_bin),
+        out_dir=step_dir / "frontier",
+        base_type=export_out.get("base_type") or "q4_k_m",
+        llama_quantize=getattr(args, "llama_quantize", None),
+        llama_perplexity=(
+            str(args.llama_perplexity)
+            if getattr(args, "llama_perplexity", None) else None
+        ),
+        perplexity_args=split_extra_args(
+            getattr(args, "perplexity_args", None), "--perplexity-args"),
+        recipe_files=[Path(f) for f in files],
+        keep_winner=keep_winner,
+    )
+
+
 def cmd_validate(args: argparse.Namespace) -> int:
     from store import StepAlreadyDone
     from validate import validate_and_release
@@ -3585,7 +3768,21 @@ def cmd_validate(args: argparse.Namespace) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    if not store.is_step_done(meta.run_id, "export"):
+    budget_sel = getattr(args, "budget_mb", None)
+    frontier_only = (
+        str(budget_sel).strip().lower() == "frontier"
+        if budget_sel is not None else False
+    )
+    want_frontier = frontier_only or bool(getattr(args, "frontier", False))
+    if want_frontier and (getattr(args, "mode", "auto") or "auto") == "proxy":
+        print(
+            "ERROR: --frontier needs measured Tier-1 (--mode llama or auto "
+            "with tools); proxy mode estimates, it cannot score exports.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if not frontier_only and not store.is_step_done(meta.run_id, "export"):
         print(
             "ERROR: Step 14 (export) is not done.\n"
             f"  Run: odg export --model {meta.model_ref}",
@@ -3646,6 +3843,8 @@ def cmd_validate(args: argparse.Namespace) -> int:
         "strict": bool(args.strict),
         "export_method": export_out.get("method"),
         "gguf_out": export_out.get("gguf_out"),
+        "frontier": want_frontier,
+        "budget_mb": budget_sel,
         "perplexity_args": split_extra_args(
             getattr(args, "perplexity_args", None), "--perplexity-args"
         ),
@@ -3662,46 +3861,70 @@ def cmd_validate(args: argparse.Namespace) -> int:
     except StepAlreadyDone:
         return cmd_validate(args)
 
+    ref_out = store.read_step_output(meta.run_id, "reference_logits") or {}
+    result = None
     try:
         with ui.working('Validating & staging release…', explain=print_explain):
-            ref_out = store.read_step_output(meta.run_id, "reference_logits") or {}
-            result = validate_and_release(
-                model_ref=meta.model_ref,
-                out_dir=step_dir,
-                recipe_path=recipe_path,
-                export_manifest=export_out,
-                specialty_domain=desc.get("specialty_domain"),
-                sensitivity_path=sens_path if sens_path.is_file() else None,
-                catalog=catalog,
-                assignments=assignments,
-                optimize_manifest=optimize_manifest,
-                resolve_descriptor=desc,
-                mode=args.mode,
-                allow_provisional=not args.strict,
-                heldout_txt=ref_out.get("heldout_path"),
-                heldout_bin=ref_out.get("logits_heldout_path"),
-                llama_perplexity=(
-                    str(args.llama_perplexity)
-                    if getattr(args, "llama_perplexity", None) else None
-                ),
-                perplexity_args=split_extra_args(
-                    getattr(args, "perplexity_args", None),
-                    "--perplexity-args",
-                ),
-            )
+            if not frontier_only:
+                result = validate_and_release(
+                    model_ref=meta.model_ref,
+                    out_dir=step_dir,
+                    recipe_path=recipe_path,
+                    export_manifest=export_out,
+                    specialty_domain=desc.get("specialty_domain"),
+                    sensitivity_path=sens_path if sens_path.is_file() else None,
+                    catalog=catalog,
+                    assignments=assignments,
+                    optimize_manifest=optimize_manifest,
+                    resolve_descriptor=desc,
+                    mode=args.mode,
+                    allow_provisional=not args.strict,
+                    heldout_txt=ref_out.get("heldout_path"),
+                    heldout_bin=ref_out.get("logits_heldout_path"),
+                    llama_perplexity=(
+                        str(args.llama_perplexity)
+                        if getattr(args, "llama_perplexity", None) else None
+                    ),
+                    perplexity_args=split_extra_args(
+                        getattr(args, "perplexity_args", None),
+                        "--perplexity-args",
+                    ),
+                )
+            frontier_record = None
+            if want_frontier:
+                frontier_record = _validate_frontier(
+                    store, meta, step_dir, optimize_manifest,
+                    ref_out, export_out, args,
+                    keep_winner=not frontier_only,
+                )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "validate", str(exc))
         ui.error(15, "validate", exc, store.step_path(meta.run_id, "validate"))
         return 1
 
-    payload = result.summary_dict()
-    log_text = "\n".join(result.steps_log) + "\n"
+    if result is not None:
+        payload = result.summary_dict()
+    else:
+        payload = {"mode": "frontier", "verdict": None}
+    if frontier_record is not None:
+        payload["frontier"] = {
+            "n_measured": frontier_record["n_measured"],
+            "plots": frontier_record["plots"],
+            "winner": frontier_record["winner"],
+            "out_dir": str(step_dir / "frontier"),
+        }
+    log_text = (
+        ("\n".join(result.steps_log) + "\n" if result is not None else "")
+        + "Frontier sweep: "
+        + (f"{frontier_record['n_measured']} points measured.\n"
+           if frontier_record is not None else "skipped.\n")
+    )
     store.complete_step(meta.run_id, "validate", payload, log_text=log_text)
 
     # Mark run complete when validate finishes
     try:
         meta2 = store.load_run(meta.run_id)
-        if result.verdict in {"RELEASE", "PROVISIONAL"}:
+        if result is not None and result.verdict in {"RELEASE", "PROVISIONAL"}:
             meta2.status = "done"
             meta2.current_step = None
             store._write_run_meta(meta2)  # noqa: SLF001
@@ -3709,7 +3932,8 @@ def cmd_validate(args: argparse.Namespace) -> int:
         pass
 
     if print_explain:
-        _explain_validate(result)
+        if result is not None:
+            _explain_validate(result)
         ui.checkpoint_saved(
             run_id=meta.run_id,
             step_dir=step_dir,
@@ -3721,6 +3945,8 @@ def cmd_validate(args: argparse.Namespace) -> int:
     else:
         print(json.dumps(payload, indent=2))
 
+    if result is None:
+        return 0  # frontier-only: no release verdict
     return 0 if result.verdict != "FAIL" else 2
 
 
@@ -3921,7 +4147,9 @@ def cmd_fit(args: argparse.Namespace) -> int:
         splice_farm=_run_flag(args, "splice_farm", None),
         export_mode=_run_flag(args, "export_mode", "auto") or "auto",
         base_type=_run_flag(args, "base_type", None),
+        recipe=_run_flag(args, "recipe", None),
         validate_mode=_run_flag(args, "validate_mode", "auto") or "auto",
+        frontier=bool(_run_flag(args, "frontier", False)),
         strict=bool(_run_flag(args, "strict", False)),
         only_quantizable=bool(_run_flag(args, "only_quantizable", True)),
     )

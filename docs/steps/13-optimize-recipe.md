@@ -54,10 +54,36 @@ note covers the guardrail-opted-out remainder.)
 steps/13_optimize/
   recipe.yaml              # primary odg/recipe/v1
   recipe.tt                # llama-quantize --tensor-type-file
-  pareto/*.yaml            # frontier alternatives at or below budget
-  optimize_manifest.json   # includes dropped_pareto_above_budget
+  pareto/*.yaml            # ratio-grid alternatives at or below budget
+  pareto/frontier-bpw-*.yaml  # BPW selections: 3→8 bpw, round-UP rule
+  optimize_manifest.json   # includes dropped_pareto_above_budget + frontier
   output.json
   status.json
+  log.txt
+```
+
+## Predicted KLD, corrected
+
+Summed DP predictions overcount the all-background penalty once per
+group: each of the N summed cells carries the other N−1 groups'
+background. The manifest reports both the raw sum
+(`predicted_delta_kld`) and the corrected value
+(`predicted_delta_kld_corrected` = raw − (N−1)·B, where B is the mean of
+the probed background-rung cells). Correction is report-only — DP
+decisions are unaffected (B cancels per cell in the argmin). When no
+background cell was probed the corrected value is null.
+
+## Full frontier + BPW selection
+
+One extra solve at the adjusted budget backtracks **every** distinct
+optimum at or below it (free from the DP tables) into
+`manifest.frontier.table`. The BPW grid (3, 3.5, 4, 4.5, 5, 5.5, 6, 8,
+plus the user budget as the 9th point = the primary recipe) rounds each
+point UP to the smallest frontier allocation at/above its byte need and
+writes it as `pareto/frontier-bpw-<bpw>.yaml`; duplicate hashes fold
+onto one file, points above the frontier top stay unfilled. These are
+the user-selectable recipe set step 15 measures (`--frontier`) and
+step 14 exports (`--recipe`).
   log.txt
 ```
 

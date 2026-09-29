@@ -3,6 +3,7 @@
 import itertools
 import json
 import math
+from pathlib import Path
 
 import pytest
 
@@ -11,6 +12,8 @@ from optimizer import (
     SIZE_SANITY_ABS,
     SIZE_SANITY_REL,
     _estimate_total_bytes,
+    background_penalty_kld,
+    corrected_prediction_kld,
     default_budget_bytes,
     dp_mckp_optimize,
     optimize_recipes,
@@ -501,3 +504,86 @@ def test_file_overhead_subtracted_and_recorded():
         budget_bytes=10**15, file_overhead_bytes=2_000_000,
     )
     assert gover["estimated_bytes"] - gbase["estimated_bytes"] == 2_000_000
+
+
+def _bg_cost_matrix():
+    return {"entries": [
+        {"group": "g1", "type": "Q4_K", "probed": True, "kld_mean": 0.01},
+        {"group": "g1", "type": "Q8_0", "probed": True, "kld_mean": 0.001},
+        {"group": "g2", "type": "Q4_K", "probed": True, "kld_mean": 0.02},
+        {"group": "g2", "type": "Q8_0", "probed": True, "kld_mean": 0.001},
+        {"group": "g3", "type": "Q4_K", "probed": False, "kld_mean": 0.05},
+        {"group": "g3", "type": "Q8_0", "probed": False, "kld_mean": 0.001},
+    ]}
+
+
+def test_background_penalty_from_probed_cells():
+    # Same all-background trial under every group: mean of probed cells.
+    assert background_penalty_kld(_bg_cost_matrix(), "Q8_0") == pytest.approx(
+        0.001)
+    assert background_penalty_kld(_bg_cost_matrix(), "q8_0") == pytest.approx(
+        0.001)  # case-insensitive
+    assert background_penalty_kld(_bg_cost_matrix(), "Q6_K") is None
+    assert background_penalty_kld({"entries": []}, "Q8_0") is None
+    assert background_penalty_kld(_bg_cost_matrix(), None) is None
+
+
+def test_corrected_prediction_removes_n_minus_1_background():
+    # 3 summed cells each carrying 2 other groups' background.
+    assert corrected_prediction_kld(0.033, 3, 0.001) == pytest.approx(0.031)
+    assert corrected_prediction_kld(0.033, 3, None) is None
+    assert corrected_prediction_kld(None, 3, 0.001) is None
+    # Gold-run regression: raw 0.466037 over 380 groups at B=0.001233.
+    assert corrected_prediction_kld(0.466037, 380, 0.001233) == pytest.approx(
+        -0.00127, abs=1e-5)
+
+
+def test_select_frontier_recipes_round_up():
+    from optimizer import select_frontier_recipes
+
+    table = [
+        {"estimated_bytes": 100, "allocation_hash": "a"},
+        {"estimated_bytes": 200, "allocation_hash": "b"},
+        {"estimated_bytes": 300, "allocation_hash": "c"},
+    ]
+    picks = select_frontier_recipes(table, {1.0: 150, 2.0: 200, 3.0: 500})
+    assert picks[1.0]["allocation_hash"] == "b"  # rounded UP, not nearest
+    assert picks[2.0]["allocation_hash"] == "b"  # exact hit
+    assert picks[3.0] is None  # above the frontier top: unfilled
+
+
+def test_frontier_recipes_emitted(tmp_path):
+    from optimizer import BPW_GRID
+
+    catalog = tiny_catalog()
+    out = tmp_path / "frontier"
+    optimize_recipes(
+        model_ref="test", out_dir=out, catalog=catalog,
+        sensitivity=tiny_measured_sensitivity(catalog), budget_ratio=0.8,
+    )
+    manifest = json.loads((out / "optimize_manifest.json").read_text())
+    front = manifest["frontier"]
+    assert front["n_optima"] == len(front["table"]) >= 1
+    assert front["bpw_grid"] == list(BPW_GRID)
+    sel = front["selection"]
+    # Budget point is the primary recipe itself.
+    assert sel["budget"]["path"] == "recipe.yaml"
+    for bpw in BPW_GRID:
+        entry = sel[str(bpw)]
+        if entry is None:
+            continue  # unfilled: need above the frontier top
+        p = out / "pareto" / Path(entry["path"]).name
+        assert p.is_file(), entry["path"]
+        assert entry["allocation_hash"]
+    # Round-up property: every filled point sits at/above its byte need.
+    n_w = sum(
+        t["n_elements"] for t in catalog["tensors"].values())
+    for bpw in BPW_GRID:
+        entry = sel[str(bpw)]
+        if entry is None:
+            continue
+        assert entry["estimated_bytes"] >= int(float(bpw) * n_w / 8)
+    # Folded duplicates share one file.
+    paths = [sel[str(b)]["path"] for b in BPW_GRID
+             if sel[str(b)] is not None]
+    assert len(front["recipe_paths"]) == len(set(paths))
