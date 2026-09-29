@@ -315,7 +315,10 @@ def run_sweep(
         tag = f"{i:02d}-{p['budget_bytes'] // 1024}k"
         exp_dir = out_dir / "exports" / tag
         exp_dir.mkdir(parents=True, exist_ok=True)
-        tt = render_tt(p["overrides"], exp_dir / "recipe.tt")
+        # Stage the .tt under a non-colliding name: export_gguf copies
+        # recipe_tt → out_dir/recipe.tt for provenance (SameFileError if
+        # we render directly to that name).
+        tt = render_tt(p["overrides"], exp_dir / "candidate.tt")
         recipe_yaml = Path(p["path"])
         out_gguf = exp_dir / f"pareto-{tag}.gguf"
         rec: dict[str, Any] = {
@@ -336,6 +339,7 @@ def run_sweep(
             llama_quantize=llama_quantize,
         )
         rec["actual_bytes"] = nbytes
+        rec["staged_tt"] = str(tt)
         tier1 = measure_fn(
             Path(produced), heldout_txt=heldout_txt,
             heldout_bin=heldout_bin, out_dir=exp_dir, tag=tag,
@@ -394,7 +398,7 @@ def run_sweep(
                 gguf.unlink(missing_ok=True)
         shutil.copy2(str(winner["recipe_yaml"]),
                      str(out_dir / f"best-under-{cap_mb}MB.recipe.yaml"))
-        shutil.copy2(str(wdir / "recipe.tt"),
+        shutil.copy2(str(winner["staged_tt"]),
                      str(out_dir / f"best-under-{cap_mb}MB.recipe.tt"))
         (out_dir / f"best-under-{cap_mb}MB.provenance.json").write_text(
             json.dumps(winner, indent=2) + "\n", encoding="utf-8")

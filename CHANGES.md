@@ -18,6 +18,25 @@
   pick/cap logic, dry-run shape, full faked flow incl. one-GGUF
   assertion — which caught a real leftover bug).
 
+## Gold run results (2026-09-29, run 20260929-043626)
+
+- **Step 12**: per-tensor × exhaustive × farm = 3040 rows / 380 groups
+  in ~2 h wall (sidecar resume unused — nothing failed). Farm probing
+  is ~20× faster than estimated: a real search method, not just a
+  gold-standard luxury. Source anchor, Q8 background, zero excluded.
+- **Step 13**: 8-ratio grid, all 8 feasible with distinct allocations.
+- **Sweep**: 8/8 exported + Tier-1'd; pick
+  `16_pareto_sweep/best-under-5127MB.gguf` (5,068,684,224 B) at
+  **mean 0.00641 / P99 0.080 / top-1 98.43%** vs XL (5,126,306,944 B)
+  at **0.01715 / 0.255 / 97.25%** — better on every metric at 58 MB
+  smaller, same harness.
+- **Caveats**: (1) DP predicted means (~0.47) are absolute-shifted —
+  every per-tensor cell carries the full Q8-background penalty, summed
+  380×; rank-ordering is what DP uses, and it held (monotone
+  measured frontier). A background-free absolute predictor is future
+  work. (2) Measured PPL(Q) rises slightly with size (2.69→2.75);
+  unexplained, not gated, flagged for follow-up.
+
 ## Per-tensor grouping for the gold run (2026-09-29)
 
 - **`--grouping per-tensor`** (reband/run/fit; stale-check key, step
