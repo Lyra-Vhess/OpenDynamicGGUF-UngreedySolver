@@ -726,6 +726,7 @@ def probe_groups_lazy(
     certificate_mode: str = "bounded",
     kld_objective: str = "mean",
     imatrix_scores: dict[str, float] | None = None,
+    splice_farm: str | Path | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Lazy GPU probing: floor-first, then priced rounds (Spec 2.4 as wired).
 
@@ -740,6 +741,16 @@ def probe_groups_lazy(
     cells, and orphan trial pairs are harvested into the sidecar on start
     (then their .ggufs deleted) — disk steady-state is ~1 in-flight trial.
 
+    ``splice_farm`` swaps the trial backend: instead of running
+    llama-quantize per probe, trials are assembled from the precomputed
+    per-tensor rung shards (see splice_farm.py) and perplexity runs on
+    the assembly. Measured values are interchangeable with pipeline
+    trials (byte-identical assemblies, identical KL), so the sidecar
+    resume works across backends. The anchor still comes from the frozen
+    source file — the farm only replaces trial builds, never the zero
+    point. The farm's rung shards bake in the farm-build imatrix: a farm
+    is valid only for runs of the same model with the same imatrix.
+
     Returns ``(rows, baseline_absolute)`` shaped like probe_groups_llama,
     over probed columns only; baseline_absolute also carries the pricing
     record (reference budget, rounds, lambda history, excluded count).
@@ -749,6 +760,12 @@ def probe_groups_lazy(
     from colgen import bitwidth, run_column_generation
     from llama_probe import measure_column, measure_source_anchor
     from optimizer import LADDER
+
+    farm = None
+    if splice_farm is not None:
+        from splice_farm import load_farm
+
+        farm = load_farm(splice_farm)
 
     fixed = _check_fixed_groups(catalog, fixed_groups)
     tensors = catalog.get("tensors") or {}
@@ -799,6 +816,19 @@ def probe_groups_lazy(
     )
     for key, m_abs in harvested:
         abs_measured[key] = m_abs
+    # Stale farm assemblies (symlink dirs from a killed run) are cleaned
+    # by assemble_trial on next use; drop leftovers for already-cached
+    # cells here so a resumed run leaves no debris.
+    n_farm_dirs = 0
+    if farm is not None:
+        from splice_farm import ASSEMBLY_PREFIX
+
+        for stale in work.glob(f"{ASSEMBLY_PREFIX}*"):
+            if stale.is_dir() and not stale.is_symlink():
+                import shutil
+
+                shutil.rmtree(stale, ignore_errors=True)
+                n_farm_dirs += 1
 
     base_rec = abs_measured.get(("__anchor__", "SOURCE"))
     if base_rec is None:
@@ -821,6 +851,7 @@ def probe_groups_lazy(
         f"sidecar cached={n_cached} harvested={len(harvested)} "
         f"({_deleted_mb(n_deleted, freed)} freed) "
         f"ignored_trailing={sidecar_ignored}"
+        + (f" farm_stale_dirs={n_farm_dirs}" if farm is not None else "")
     )
 
     def gpu_probe(gid: str, q: str) -> dict[str, Any]:
@@ -831,11 +862,26 @@ def probe_groups_lazy(
             # keep_trial=False: the trial .gguf is deleted right after its
             # bytes/exempt are extracted; the sidecar line is the resume
             # record, so disk stays at ~1 in-flight trial.
-            m_abs = measure_column(
-                group_regex=tensor_type_regex(groups[gid]),
-                probe_type=q, tag=tag,
-                group_tensors=group_tensors[gid], **log_ctx,
-            )
+            if farm is not None:
+                from splice_farm import measure_farm_column
+
+                # Farm trials reuse the farm-build imatrix baked into the
+                # rung shards (no per-probe quantize); values are
+                # interchangeable with pipeline trials (gate-2).
+                m_abs = measure_farm_column(
+                    farm=farm, probe_type=q, baseline_type=baseline_type,
+                    search_txt=search_txt, kl_base_bin=kl_base_bin,
+                    work_dir=work, tag=tag,
+                    llama_perplexity=llama_perplexity,
+                    perplexity_args=perplexity_args,
+                    group_tensors=group_tensors[gid],
+                )
+            else:
+                m_abs = measure_column(
+                    group_regex=tensor_type_regex(groups[gid]),
+                    probe_type=q, tag=tag,
+                    group_tensors=group_tensors[gid], **log_ctx,
+                )
             _sidecar_append(work, {"gid": gid, "q": q, **{
                 k: m_abs.get(k) for k in _SIDECAR_ABS_KEYS
             }})
@@ -902,6 +948,11 @@ def probe_groups_lazy(
         "pricing_sensitivity_source": (
             "imatrix" if imatrix_scores else "uniform"
         ),
+        # Trial backend audit: None = per-probe llama-quantize trials;
+        # otherwise the farm path whose rung shards supplied every trial
+        # (farm-build imatrix baked in — farm valid only for the same
+        # model + imatrix it was built from).
+        "splice_farm": str(splice_farm) if splice_farm is not None else None,
     }
     return rows, baseline_absolute
 
@@ -932,6 +983,7 @@ def build_sensitivity_table(
     lipschitz_L: float | None = None,
     certificate_mode: str = "bounded",
     kld_objective: str = "mean",
+    splice_farm: str | Path | None = None,
 ) -> tuple[SensitivityResult, list[dict[str, Any]]]:
     """
     Write sensitivity.json (+ summary). Returns (result, rows).
@@ -946,6 +998,13 @@ def build_sensitivity_table(
     solve budget is a hard limit and Pareto targets above it are dropped,
     so no solve is ever looser than intended; the CLI passes the derived
     reference so pricing sees real λ).
+    ``splice_farm`` (farm directory path) swaps per-probe llama-quantize
+    trials for precomputed-shard assemblies. The farm only serves the
+    lazy driver: with ``certificate_mode="exhaustive"`` the universe is
+    still measured in full, but through the lazy driver (colgen
+    exhaustive mode probes every column) so the sidecar resume covers
+    the 20-hour sweep; without a farm, exhaustive keeps the legacy
+    direct path.
     """
     log: list[str] = []
     notes: list[str] = []
@@ -1003,7 +1062,7 @@ def build_sensitivity_table(
             perplexity_args=perplexity_args,
             fixed_groups=fixed_groups,
         )
-        if certificate_mode == "exhaustive":
+        if certificate_mode == "exhaustive" and splice_farm is None:
             log.append("3b. certificate=exhaustive — measuring full universe")
             rows, baseline_absolute = probe_groups_llama(**lazy_kwargs)
         else:
@@ -1012,10 +1071,21 @@ def build_sensitivity_table(
             ref_budget = pricing_budget_bytes or pricing_reference_budget(
                 catalog, intended_bytes=default_budget_bytes(catalog),
             )
+            if certificate_mode == "exhaustive":
+                log.append(
+                    "3b. certificate=exhaustive + splice farm — full "
+                    "universe through the priced driver (sidecar resume "
+                    "covers the sweep)"
+                )
             log.append(
                 f"3b. pricing reference budget={ref_budget} bytes "
                 f"({ref_budget / (1024**2):.1f} MiB), "
                 f"certificate={certificate_mode}, objective={kld_objective}"
+                + (
+                    f", splice_farm={splice_farm} (trials reuse the "
+                    "farm-build imatrix)"
+                    if splice_farm is not None else ""
+                )
             )
             rows, baseline_absolute = probe_groups_lazy(
                 **lazy_kwargs,
@@ -1024,6 +1094,7 @@ def build_sensitivity_table(
                 certificate_mode=certificate_mode,
                 kld_objective=kld_objective,
                 imatrix_scores=pricing_scores,
+                splice_farm=splice_farm,
             )
             lam_hist = baseline_absolute.get("pricing_lambda_history") or []
             lam_last = f"{lam_hist[-1]:.3g}" if lam_hist else "n/a"

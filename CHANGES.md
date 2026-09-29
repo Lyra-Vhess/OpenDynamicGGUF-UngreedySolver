@@ -1,5 +1,40 @@
 # Changes: DP-MCKP optimizer with column generation (`feat/dp-mckp-colgen`)
 
+## Splice-farm trial backend for step 12 (2026-09-29)
+
+- **No more per-probe quantize**: `--splice-farm DIR` (sensitivity/run/fit;
+  threaded into the step namespace, recorded in `input.json`, stale-check
+  key) swaps `llama-quantize` trial builds for symlink assemblies from a
+  precomputed per-tensor rung-shard farm (`splice_farm.py`:
+  `load_farm`/`assemble_trial`/`measure_farm_column`). Per-probe cost is
+  720 symlinks + one perplexity run (~4–9 s), zero bulk writes; the
+  source anchor still comes from the frozen file (the farm never
+  replaces the zero point). Return shape matches `measure_column`
+  exactly (parsed KL + `group_bytes_measured`/`probe_exempt_tensors`
+  from the probe rung shards' own headers), so sidecar resume works
+  across backends.
+- **Acceptance (live, E4B)**: farm-vs-pipeline byte-compare, one probe
+  per ladder rung on `embedding@global` — 8/8 rungs 720/720 tensors
+  byte-identical (shape, dtype, data) to fresh Q8-background pipeline
+  trials built with the run imatrix (`/home/lyra/splice-accept/accept.py`,
+  kept outside the repo). This also confirms the farm baked the same
+  imatrix the pipeline uses.
+- **Exhaustive + farm routes through the priced driver**: colgen
+  exhaustive mode probes every column anyway, so with a farm the full
+  universe is measured with the sidecar resume covering the sweep
+  (the legacy no-resume `probe_groups_llama` path is kept only for
+  no-farm exhaustive). Hard farm constraints fail loudly: basename
+  pattern (loader requirement), one-tensor-per-shard, cross-set name
+  parity, farm/model tensor mismatch, unquantizable-group refusal via
+  the shared `assert_probe_applied`.
+- **Caveat**: farm rung shards bake in the farm-build imatrix — a farm
+  is valid only for runs of the same model with the same imatrix. The
+  run manifest records the farm path (`baseline_kl.splice_farm`).
+- **Tests**: 176 green (18 new in `tests/test_splice_farm.py`: farm
+  validation, map cache, assembly layout, return shape, dtype refusal,
+  live-farm map/rung/accounting, lazy-driver backend selection,
+  exhaustive routing both ways, CLI parse/thread/stale-check).
+
 ## Source anchor + Q8 trial background (2026-09-29)
 
 - **Zero point is full precision now**: the run anchor is the frozen

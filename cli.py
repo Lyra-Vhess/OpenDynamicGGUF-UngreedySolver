@@ -373,6 +373,15 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Lipschitz bound L for pricing (default: auto-calibrated x2 margin)",
     )
+    p_sens.add_argument(
+        "--splice-farm",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="Precomputed per-tensor rung-shard farm: assemble probe trials "
+        "by symlink instead of running llama-quantize per probe (llama mode "
+        "lazy driver only). Farm trials reuse the farm-build imatrix.",
+    )
     p_sens.add_argument("--no-explain", action="store_true")
 
     # --- optimize (step 13) ---
@@ -668,6 +677,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Lipschitz bound L (default: auto-calibrated x2 margin)",
     )
     p_run.add_argument(
+        "--splice-farm",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="Precomputed per-tensor rung-shard farm for step-12 trials "
+        "(symlink assembly instead of per-probe llama-quantize)",
+    )
+    p_run.add_argument(
         "--pareto-ratios",
         default=None,
         metavar="RATIOS",
@@ -816,6 +833,7 @@ def main(argv: list[str] | None = None) -> int:
         "--certificate", choices=("bounded", "exhaustive"), default="bounded"
     )
     p_fit.add_argument("--lipschitz", type=float, default=None)
+    p_fit.add_argument("--splice-farm", type=Path, default=None, metavar="DIR")
     p_fit.add_argument("--pareto-ratios", default=None, metavar="RATIOS")
     p_fit.add_argument(
         "--export-mode",
@@ -1093,6 +1111,8 @@ def _pipeline_expected_inputs(step_id: str, args: argparse.Namespace, fmt):
         exp["kld_objective"] = _run_flag(args, "kld_objective", "mean")
         exp["certificate"] = _run_flag(args, "certificate", "bounded")
         exp["lipschitz"] = _run_flag(args, "lipschitz", None)
+        _sf = _run_flag(args, "splice_farm", None)
+        exp["splice_farm"] = str(_sf) if _sf is not None else None
         _sbm = _run_flag(args, "budget_mb", None)
         exp["budget_mb"] = float(_sbm) if _sbm is not None else None
         _sbr = _run_flag(args, "budget_ratio", None)
@@ -1330,6 +1350,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             kld_objective=_run_flag(args, "kld_objective", "mean") or "mean",
             certificate=_run_flag(args, "certificate", "bounded") or "bounded",
             lipschitz=_run_flag(args, "lipschitz", None),
+            splice_farm=_run_flag(args, "splice_farm", None),
             jobs=int(_run_flag(args, "jobs", 1) or 1),
             pareto_ratios=_run_flag(args, "pareto_ratios", None),
             base_type=_run_flag(args, "base_type", None),
@@ -3070,6 +3091,11 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
         "n_catalog_groups": len(catalog.get("groups") or {}),
         "catalog_source": catalog_source,
         "jobs": args.jobs,
+        "splice_farm": (
+            str(getattr(args, "splice_farm", None))
+            if getattr(args, "splice_farm", None) is not None
+            else None
+        ),
     }
     try:
         sens_perplexity_args = split_extra_args(
@@ -3148,6 +3174,7 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
                 kld_objective=getattr(args, "kld_objective", "mean"),
                 lipschitz_L=getattr(args, "lipschitz", None),
                 pricing_budget_bytes=_reference,
+                splice_farm=getattr(args, "splice_farm", None),
             )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "sensitivity", str(exc))
@@ -3867,6 +3894,7 @@ def cmd_fit(args: argparse.Namespace) -> int:
         certificate=_run_flag(args, "certificate", "bounded") or "bounded",
         lipschitz=_run_flag(args, "lipschitz", None),
         pareto_ratios=_run_flag(args, "pareto_ratios", None),
+        splice_farm=_run_flag(args, "splice_farm", None),
         export_mode=_run_flag(args, "export_mode", "auto") or "auto",
         base_type=_run_flag(args, "base_type", None),
         validate_mode=_run_flag(args, "validate_mode", "auto") or "auto",
