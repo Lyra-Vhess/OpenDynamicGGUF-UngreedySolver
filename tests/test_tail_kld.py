@@ -239,6 +239,11 @@ def test_fixed_groups_skipped_llama(tmp_path, monkeypatch):
         }
 
     monkeypatch.setattr(llama_probe, "measure_column", fake_measure_column)
+    monkeypatch.setattr(
+        llama_probe, "measure_source_anchor",
+        lambda **kw: {"kld_mean": 0.0, "kld_tail_1pct": 0.0,
+                      "trial_tag": "anchor"},
+    )
     for name in ("model.gguf", "search.txt", "kl.bin"):
         (tmp_path / name).write_bytes(b"x")
     rows, base = probe_groups_llama(
@@ -252,6 +257,7 @@ def test_fixed_groups_skipped_llama(tmp_path, monkeypatch):
     )
     assert {r["group_id"] for r in rows} == {"attn_q@early"}
     assert base["fixed_skipped"] == ["embedding@global"]
+    assert base["anchor"] == "source"
 
 
 def test_fixed_groups_logged_proxy_table(tmp_path):

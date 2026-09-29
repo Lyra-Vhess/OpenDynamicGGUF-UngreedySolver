@@ -371,14 +371,17 @@ def probe_groups_llama(
     ladder (see group_probe_grid).
     Fixed groups are skipped (accounted at optimize time instead).
 
-    Trial GGUF: everything at ``baseline_type`` except the group's tensors
-    at the probe type. KL is measured vs the step-11 search-split base.
-    Rows store *deltas* vs one all-baseline anchor run. Returns
+    Trial GGUF: everything at ``baseline_type`` (the background rung)
+    except the group's tensors at the probe type. KL is measured vs the
+    step-11 search-split base. Rows store *deltas* vs the source anchor
+    (the frozen file against itself — see
+    ``llama_probe.measure_source_anchor``), so rows are absolute errors
+    vs full precision, not vs a quantized rung. Returns
     ``(rows, baseline_absolute)``. Any tool failure raises (hard error).
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    from llama_probe import measure_column
+    from llama_probe import measure_column, measure_source_anchor
 
     fixed = _check_fixed_groups(catalog, fixed_groups)
     probe_types = probe_types or list(DEFAULT_PROBE_TYPES)
@@ -397,8 +400,10 @@ def probe_groups_llama(
         "llama_perplexity": llama_perplexity, "imatrix": imatrix,
         "perplexity_args": perplexity_args,
     }
-    base = measure_column(
-        group_regex=None, probe_type=baseline_type, tag="baseline", **log_ctx
+    base = measure_source_anchor(
+        model_gguf=model_gguf, search_txt=search_txt,
+        kl_base_bin=kl_base_bin, work_dir=work, tag="anchor",
+        llama_perplexity=llama_perplexity, perplexity_args=perplexity_args,
     )
 
     targets: list[tuple[str, dict[str, Any], str]] = []
@@ -442,6 +447,11 @@ def probe_groups_llama(
     baseline_absolute = {
         "kld_mean": base["kld_mean"],
         "kld_tail_1pct": base["kld_tail_1pct"],
+        # The zero point is the frozen source file against itself
+        # (self-KL ~0, sanity-checked) — rows are absolute errors vs full
+        # precision, not vs a quantized rung.
+        "anchor": "source",
+        "anchor_gguf": str(model_gguf),
         # Columns skipped by the per-group grid (only when an explicit
         # --probe-types narrows the universe) — GPU probes not spent.
         "grid_skipped": grid_skipped,
@@ -720,9 +730,10 @@ def probe_groups_lazy(
     """Lazy GPU probing: floor-first, then priced rounds (Spec 2.4 as wired).
 
     The candidate universe is the grid (default: full uniform ladder —
-    wide costs nothing) intersected per group. Round 0 measures the
-    all-baseline anchor plus every group's floor; then column-generation
-    pricing selects attractive columns only, and only those touch the GPU.
+    wide costs nothing) intersected per group. Round 0 measures the source
+    anchor (the frozen file against itself — the run's zero point) plus
+    every group's floor; then column-generation pricing selects attractive
+    columns only, and only those touch the GPU.
     Unmeasured columns are bound-excluded with the termination certificate,
     exactly like step-13 selection. Resume is sidecar-based
     (``probed.jsonl``): each success appends one line, reruns skip cached
@@ -736,7 +747,7 @@ def probe_groups_lazy(
     from concurrent.futures import ThreadPoolExecutor
 
     from colgen import bitwidth, run_column_generation
-    from llama_probe import measure_column
+    from llama_probe import measure_column, measure_source_anchor
     from optimizer import LADDER
 
     fixed = _check_fixed_groups(catalog, fixed_groups)
@@ -789,16 +800,21 @@ def probe_groups_lazy(
     for key, m_abs in harvested:
         abs_measured[key] = m_abs
 
-    base_rec = abs_measured.get(("__anchor__", baseline_type))
+    base_rec = abs_measured.get(("__anchor__", "SOURCE"))
     if base_rec is None:
-        base = measure_column(
-            group_regex=None, probe_type=baseline_type, tag="baseline",
-            **log_ctx,
+        # The zero point is the frozen source file against itself — never
+        # a quantized trial. No fallback: a run without its source anchor
+        # is a failed run (measure_source_anchor raises loudly).
+        base = measure_source_anchor(
+            model_gguf=model_gguf, search_txt=search_txt,
+            kl_base_bin=kl_base_bin, work_dir=work, tag="anchor",
+            llama_perplexity=llama_perplexity,
+            perplexity_args=perplexity_args,
         )
-        _sidecar_append(work, {"gid": "__anchor__", "q": baseline_type, **{
+        _sidecar_append(work, {"gid": "__anchor__", "q": "SOURCE", **{
             k: base.get(k) for k in _SIDECAR_ABS_KEYS
         }})
-        abs_measured[("__anchor__", baseline_type)] = base
+        abs_measured[("__anchor__", "SOURCE")] = base
     else:
         base = dict(base_rec)
     _resume_note = (
@@ -870,6 +886,10 @@ def probe_groups_lazy(
     baseline_absolute = {
         "kld_mean": base["kld_mean"],
         "kld_tail_1pct": base["kld_tail_1pct"],
+        # Zero point = frozen source against itself (self-KL ~0). Rows
+        # are absolute errors vs full precision.
+        "anchor": "source",
+        "anchor_gguf": str(model_gguf),
         "grid_skipped": total_cols - len(rows),
         "fixed_skipped": sorted(fixed),
         "lazy_probing": True,
@@ -917,7 +937,8 @@ def build_sensitivity_table(
     Write sensitivity.json (+ summary). Returns (result, rows).
 
     In llama mode the default is lazy probing (pricing decides what the
-    GPU measures: anchor + floors first, then attractive columns only).
+    GPU measures: source anchor + floors first, then attractive columns
+    only).
     ``certificate_mode="exhaustive"`` keeps the legacy full-universe
     measurement. ``pricing_budget_bytes`` is the intended solve budget
     for pricing (the tightness λ should assume; defaults to the derived
@@ -1020,12 +1041,13 @@ def build_sensitivity_table(
             f"4. Measured groups={len({r['group_id'] for r in rows})} "
             f"rows={len(rows)} grid_skipped={baseline_absolute['grid_skipped']} "
             f"fixed_skipped={baseline_absolute['fixed_skipped']} "
-            f"baseline_mean={baseline_absolute['kld_mean']:.4f} "
-            f"baseline_p99={baseline_absolute['kld_tail_1pct']:.4f}"
+            f"anchor_mean={baseline_absolute['kld_mean']:.6f} (source) "
+            f"anchor_p99={baseline_absolute['kld_tail_1pct']:.4f}"
         )
         notes.append(
             "Measured per-group trial quants vs the step-11 search KL base; "
-            "rows are deltas vs the all-baseline anchor run."
+            "rows are deltas vs the frozen-source anchor (absolute errors "
+            "vs full precision)."
         )
         return _finish_table(
             model_ref=model_ref, out_dir=out_dir, catalog=catalog,

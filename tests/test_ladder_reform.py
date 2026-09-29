@@ -139,20 +139,40 @@ def _fake_measure_factory(log):
     return fake
 
 
+def _fake_anchor_factory(log=None, mean=0.0, tail=0.0):
+    """Stub measure_source_anchor: the frozen file against itself (~0)."""
+    def fake(**kw):
+        if log is not None:
+            log.append(("anchor", kw.get("tag", "anchor")))
+        return {
+            "kld_mean": mean, "kld_tail_1pct": tail, "kld_p999": tail,
+            "same_top_p": 1.0, "perplexity": 9.0, "trial_tag": "anchor",
+        }
+
+    return fake
+
+
+def _patch_probing(monkeypatch, log, anchor_log=None):
+    """Patch both probe entry points used by the lazy driver."""
+    import llama_probe
+
+    monkeypatch.setattr(
+        llama_probe, "measure_column", _fake_measure_factory(log))
+    monkeypatch.setattr(
+        llama_probe, "measure_source_anchor", _fake_anchor_factory(anchor_log))
+
+
 def test_lazy_driver_skips_unattractive_ceiling(tmp_path, monkeypatch):
     """    Tight pricing budget: floors measured, the F32/F16/Q8 ceiling priced
     out before touching the GPU (zero marginal gain over Q8 at prohibitive
     byte cost). Rows cover probed columns only.
     """
-    import llama_probe
-
     catalog = _catalog()
     for g in catalog["groups"].values():
         name = g["tensor_names"][0]
         catalog["tensors"][name]["n_elements"] = 100_000_000
     log: list = []
-    monkeypatch.setattr(
-        llama_probe, "measure_column", _fake_measure_factory(log))
+    _patch_probing(monkeypatch, log)
 
     n = 100_000_000
     floor_total = 3 * estimate_group_nbytes(n, "Q2_K")
@@ -180,8 +200,8 @@ def test_lazy_driver_resume_skips_measured(tmp_path, monkeypatch):
 
     catalog = _catalog()
     log: list = []
-    monkeypatch.setattr(
-        llama_probe, "measure_column", _fake_measure_factory(log))
+    anchor_log: list = []
+    _patch_probing(monkeypatch, log, anchor_log)
 
     n = 1_000_000
     kwargs = dict(
@@ -193,6 +213,7 @@ def test_lazy_driver_resume_skips_measured(tmp_path, monkeypatch):
     )
     rows1, _ = probe_groups_lazy(catalog, **kwargs)
     assert [c for c in log if c[0]]  # something real was measured
+    assert anchor_log == [("anchor", "anchor")]  # zero point measured once
     sidecar = tmp_path / "trials" / "probed.jsonl"
     assert sidecar.is_file()
     log.clear()
@@ -241,12 +262,9 @@ def test_imatrix_group_scores_aggregate_per_group(tmp_path, monkeypatch):
 
 def test_lazy_driver_uses_imatrix_scales(tmp_path, monkeypatch):
     """Scores passed through: audit records the imatrix source."""
-    import llama_probe
-
     catalog = _catalog()
     log: list = []
-    monkeypatch.setattr(
-        llama_probe, "measure_column", _fake_measure_factory(log))
+    _patch_probing(monkeypatch, log)
     n = 1_000_000
     _, absinfo = probe_groups_lazy(
         catalog, model_gguf="m.gguf", search_txt="s.txt",

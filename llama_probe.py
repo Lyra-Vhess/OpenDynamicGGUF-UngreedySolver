@@ -79,6 +79,66 @@ def _run(cmd: list[str], *, what: str) -> str:
     return log
 
 
+def measure_source_anchor(
+    *,
+    model_gguf: str | Path,
+    search_txt: str | Path,
+    kl_base_bin: str | Path,
+    work_dir: str | Path,
+    tag: str = "anchor",
+    llama_perplexity: str | Path | None = None,
+    perplexity_args: list[str] | None = None,
+) -> dict[str, Any]:
+    """Measure the run's anchor KL: the frozen source file against itself.
+
+    The anchor is the zero point every trial delta is measured from, so it
+    is the full-precision reference — never a quantized trial. Runs stock
+    ``llama-perplexity --kl-divergence`` directly on the frozen GGUF (no
+    trial build, no quantize step) with the step-11 search-split base, and
+    parses the KL lines (hard error when missing, same as probes).
+
+    Self-KL must be ~0: the same file scored against its own logits. A
+    mean past ``ANCHOR_SANITY_MAX`` means the reference chain is corrupt
+    (wrong base bin, wrong file) and raises loudly — there is no fallback
+    anchor, a run without its source zero point is a failed run.
+    """
+    from logits import find_llama_perplexity as find_ppl
+
+    pbin = find_ppl(llama_perplexity)
+    if pbin is None:
+        raise RuntimeError(
+            "llama-perplexity not found (PATH, LLAMA_CPP_DIR, or --llama-perplexity)."
+        )
+    work = Path(work_dir)
+    work.mkdir(parents=True, exist_ok=True)
+    pcmd = [
+        str(pbin), "-m", str(model_gguf), "-f", str(search_txt),
+        "--kl-divergence", "--kl-divergence-base", str(kl_base_bin),
+    ]
+    if perplexity_args:
+        pcmd += list(perplexity_args)
+    plog = _run(pcmd, what=f"llama-perplexity source anchor {tag}")
+    (work / f"trial-{tag}.perplexity.log").write_text(plog, encoding="utf-8")
+
+    measured = parse_llama_perplexity_kl(plog)  # hard error if lines missing
+    mean = measured.get("kld_mean")
+    if mean is None or mean > ANCHOR_SANITY_MAX:
+        raise RuntimeError(
+            f"Source anchor KL mean {mean} exceeds {ANCHOR_SANITY_MAX}: "
+            "the frozen file does not reproduce its own reference logits "
+            f"({kl_base_bin}). Wrong base bin or wrong file — refusing to "
+            "anchor deltas on a corrupt zero point."
+        )
+    measured["trial_tag"] = tag
+    return measured
+
+
+#: Self-KL of the frozen source vs its own logits must be ~0. Past this,
+#: the reference chain (file vs base bin) is corrupt — hard error, no
+#: fallback: a run without its source zero point is a failed run.
+ANCHOR_SANITY_MAX = 0.1
+
+
 def measure_column(
     *,
     model_gguf: str | Path,
@@ -98,8 +158,11 @@ def measure_column(
 ) -> dict[str, Any]:
     """Quantize one trial and measure its KL vs the reference base.
 
-    ``group_regex=None`` measures the all-baseline config (the run's anchor
-    for deltas). Returns absolute (non-delta) metrics: ``kld_mean``,
+    The trial is everything at ``baseline_type`` (the background rung)
+    except the group's tensors at the probe type; ``group_regex=None``
+    builds the all-background trial (a legitimate grid data point, not
+    the anchor — the anchor is the frozen source via
+    ``measure_source_anchor``). Returns absolute (non-delta) metrics: ``kld_mean``,
     ``kld_tail_1pct`` (P99), plus ``same_top_p``/``perplexity`` when the
     log has them. When ``group_tensors`` is given, the trial GGUF's own
     metadata is read (before any deletion) and the group's actual payload
