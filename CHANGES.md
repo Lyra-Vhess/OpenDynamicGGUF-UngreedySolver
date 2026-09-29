@@ -1,5 +1,23 @@
 # Changes: DP-MCKP optimizer with column generation (`feat/dp-mckp-colgen`)
 
+## Pareto sweep tool (2026-09-29)
+
+- **New committed `pareto_sweep.py`** (standalone, reads step artifacts):
+  parse step-13 pareto recipes (line-based, no yaml dep), dedupe by
+  allocation hash, export each survivor via the step-14 path,
+  Tier-1 each on heldout via `_tier1_llama`, plot 4 PNGs (mean / P99 /
+  top-1 / PPL vs MiB) with predicted-mean overlay + XL marker, crown
+  the lowest measured mean at or under `--size-cap` (default
+  5,127,000,000 B).
+- **Transient exports**: losers deleted after measuring; the winner's
+  working export is removed after copying to its final
+  `best-under-<cap>MB.gguf` (+ recipe.yaml/.tt/provenance.json) — one
+  GGUF on disk total.
+- **Tests**: 187 green (6 new in `tests/test_pareto_sweep.py`: real
+  recipe parsing, manifest dedupe incl. the old dup-hash case,
+  pick/cap logic, dry-run shape, full faked flow incl. one-GGUF
+  assertion — which caught a real leftover bug).
+
 ## Per-tensor grouping for the gold run (2026-09-29)
 
 - **`--grouping per-tensor`** (reband/run/fit; stale-check key, step
