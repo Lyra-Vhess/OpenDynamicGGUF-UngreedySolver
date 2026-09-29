@@ -260,6 +260,7 @@ def test_run_threads_flags_to_step_namespaces(monkeypatch, tmp_path):
         "--probe-types", "Q2_K,Q4_K",
         "--certificate", "exhaustive",
         "--bands-per-role", "4",
+        "--grouping", "per-tensor",
         "--budget-mb", "4888",
         "--strict",
     ])
@@ -284,11 +285,39 @@ def test_run_threads_flags_to_step_namespaces(monkeypatch, tmp_path):
     assert seen["cmd_imatrix"].imatrix_args == "-ngl 99"
     assert seen["cmd_reference_logits"].perplexity_args == "-ngl 99"
     assert seen["cmd_reband"].bands_per_role == 4
+    assert seen["cmd_reband"].grouping == "per-tensor"
     assert seen["cmd_export"].mode == "auto"
     assert seen["cmd_validate"].strict is True
     # Global probe mode reaches the llama-capable steps untouched.
     assert seen["cmd_imatrix"].mode == "auto"
     assert seen["cmd_sensitivity"].mode == "auto"
+
+
+def test_grouping_flag_parsers_and_stale_key(monkeypatch, tmp_path):
+    """--grouping exists on reband/run/fit and joins the reband stale-check."""
+    seen: dict[str, argparse.Namespace] = {}
+
+    def fake(name):
+        def _fn(args: argparse.Namespace) -> int:
+            seen[name] = args
+            return 0
+        return _fn
+
+    monkeypatch.setattr(cli, "cmd_reband", fake("cmd_reband"))
+    assert cli.main(["reband", "--model", "m",
+                     "--grouping", "per-tensor"]) == 0
+    assert seen["cmd_reband"].grouping == "per-tensor"
+
+    monkeypatch.setattr(cli, "cmd_fit", fake("cmd_fit"))
+    assert cli.main(["fit", "--model", "m", "--device", "d",
+                     "--grouping", "per-tensor"]) == 0
+    assert seen["cmd_fit"].grouping == "per-tensor"
+
+    exp = _pipeline_expected_inputs(
+        "reband", _pipeline_ns(grouping="per-tensor"), fmt=None)
+    assert exp["grouping"] == "per-tensor"
+    exp = _pipeline_expected_inputs("reband", _pipeline_ns(), fmt=None)
+    assert exp["grouping"] == "banded"
 
 
 def test_no_pins_flag_is_gone():

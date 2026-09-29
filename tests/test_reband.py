@@ -7,6 +7,7 @@ import pytest
 from reband import (
     BANDS_PER_ROLE,
     band_index,
+    explode_per_tensor,
     fisher_jenks_breaks,
     reband_catalog,
     role_layer_scores,
@@ -165,3 +166,69 @@ def test_real_imatrix_aggregation(monkeypatch):
     out = reband.real_imatrix_scores("dummy.gguf", catalog_tensors)
     # sum(in_sum2)=16 / sum(counts)=4 → 4.0; junk name absent from catalog.
     assert out == {("attn_q", 3): pytest.approx(4.0)}
+
+
+def _shaped_catalog():
+    catalog, proxy = tiny_catalog_proxy()
+    for name, t in catalog["tensors"].items():
+        t["shape"] = [8, 8]  # non-flat 2-D
+    # A 1-D bias and a norm: both must ride at source precision.
+    catalog["tensors"]["blk.0.attn_q.bias"] = {
+        "role": "attn_q", "layer": 0, "group_id": "attn_q@middle",
+        "depth": "middle", "shape": [8], "nbytes": 32, "n_elements": 8,
+        "quantizable": True,
+    }
+    catalog["tensors"]["blk.0.attn_norm.weight"] = {
+        "role": "norm", "layer": 0, "group_id": "norm@middle",
+        "depth": "middle", "shape": [8], "nbytes": 32, "n_elements": 8,
+        "quantizable": False,
+    }
+    catalog["groups"]["norm@middle"] = {}
+    return catalog, proxy
+
+
+def test_explode_per_tensor_groups():
+    catalog, proxy = _shaped_catalog()
+    new, report = explode_per_tensor(catalog)
+    tensors = catalog["tensors"]
+    # One group per tensor, gid = tensor name, full coverage.
+    assert report["n_groups_after"] == len(tensors)
+    assert sorted(new["groups"]) == sorted(tensors)
+    names = [n for g in new["groups"].values() for n in g["tensor_names"]]
+    assert sorted(names) == sorted(tensors)
+    # Singletons carry role/depth and exact byte totals.
+    g = new["groups"]["blk.0.attn_q.weight"]
+    assert g["n_tensors"] == 1 and g["role"] == "attn_q"
+    assert g["total_nbytes"] == 1000
+    assert g["quantizable"] is True
+    assert report["n_groups_before"] == 4
+    assert new["catalog_sha256"] != "prev"
+
+
+def test_explode_flat_tensors_ride_fixed():
+    catalog, proxy = _shaped_catalog()
+    new, report = explode_per_tensor(catalog)
+    # 1-D bias: quantizable tensor but unprobed group (no zero-delta row).
+    assert new["groups"]["blk.0.attn_q.bias"]["quantizable"] is False
+    assert new["groups"]["blk.0.attn_norm.weight"]["quantizable"] is False
+    assert sorted(report["forced_fixed_flat"]) == [
+        "blk.0.attn_norm.weight", "blk.0.attn_q.bias",
+    ]
+
+
+def test_explode_missing_shape_raises():
+    catalog, proxy = tiny_catalog_proxy()  # no shapes
+    with pytest.raises(ValueError, match="[Ss]hape"):
+        explode_per_tensor(catalog)
+
+
+def test_reband_per_tensor_flag_bypasses_banding():
+    catalog, proxy = _shaped_catalog()
+    new, report = reband_catalog(catalog, proxy, per_tensor=True)
+    assert report["grouping"] == "per-tensor"
+    assert report["n_groups_after"] == len(catalog["tensors"])
+    # Banded path untouched by the flag's existence (clean catalog: the
+    # shaped one carries an extra bias tensor that would join the band).
+    clean, proxy2 = tiny_catalog_proxy()
+    new2, _ = reband_catalog(clean, proxy2)
+    assert new2["groups"]["attn_q@early"]["n_tensors"] == 3

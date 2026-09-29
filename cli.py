@@ -289,6 +289,14 @@ def main(argv: list[str] | None = None) -> int:
         default=3,
         help="Contiguous bands per role (default 3, same count as thirds)",
     )
+    p_reband.add_argument(
+        "--grouping",
+        choices=("banded", "per-tensor"),
+        default="banded",
+        help="banded: imatrix Fisher-Jenks bands (default); per-tensor: "
+        "one group per tensor for the gold run (skips banding; 1-D "
+        "tensors ride at source precision)",
+    )
     p_reband.add_argument("--no-explain", action="store_true")
 
     # --- sensitivity (step 12) ---
@@ -634,6 +642,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Reband contiguous bands per role (default 3)",
     )
     p_run.add_argument(
+        "--grouping",
+        choices=("banded", "per-tensor"),
+        default="banded",
+        help="Group granularity for steps 11b+ (default banded; per-tensor "
+        "for the gold run)",
+    )
+    p_run.add_argument(
         "--jobs",
         type=int,
         default=1,
@@ -820,6 +835,9 @@ def main(argv: list[str] | None = None) -> int:
     p_fit.add_argument("--imatrix-args", default=None, metavar="ARGS")
     p_fit.add_argument("--perplexity-args", default=None, metavar="ARGS")
     p_fit.add_argument("--bands-per-role", type=int, default=3)
+    p_fit.add_argument(
+        "--grouping", choices=("banded", "per-tensor"), default="banded"
+    )
     p_fit.add_argument("--jobs", type=int, default=1)
     p_fit.add_argument("--probe-types", default=None, metavar="TYPES")
     p_fit.add_argument("--fixed-groups", default=None, metavar="GIDS")
@@ -1088,6 +1106,7 @@ def _pipeline_expected_inputs(step_id: str, args: argparse.Namespace, fmt):
         )
     elif step_id == "reband":
         exp["bands_per_role"] = int(_run_flag(args, "bands_per_role", 3) or 3)
+        exp["grouping"] = _run_flag(args, "grouping", "banded") or "banded"
     elif step_id == "reference_logits":
         exp["mode"] = _run_flag(args, "mode", "auto") or "auto"
         exp["perplexity_args"] = split_extra_args(
@@ -1332,6 +1351,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             mode=step_mode,
             max_docs=int(_run_flag(args, "max_docs", 32) or 32),
             bands_per_role=int(_run_flag(args, "bands_per_role", 3) or 3),
+            grouping=_run_flag(args, "grouping", "banded") or "banded",
             convert_script=_run_flag(args, "convert_script", None),
             require_bf16=bool(_run_flag(args, "require_bf16", False)),
             llama_imatrix=None,
@@ -2737,6 +2757,7 @@ def cmd_reband(args: argparse.Namespace) -> int:
     input_data = {
         "from_steps": ["imatrix", "activation_features"],
         "bands_per_role": bands,
+        "grouping": getattr(args, "grouping", "banded") or "banded",
         "imatrix_gguf": imatrix_gguf_arg,
         "n_groups_before": len(catalog.get("groups") or {}),
     }
@@ -2752,6 +2773,7 @@ def cmd_reband(args: argparse.Namespace) -> int:
             new_catalog, report = reband_catalog(
                 catalog, proxy, bands_per_role=bands,
                 imatrix_gguf=imatrix_gguf_arg,
+                per_tensor=(input_data["grouping"] == "per-tensor"),
             )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "reband", str(exc))
@@ -2765,6 +2787,7 @@ def cmd_reband(args: argparse.Namespace) -> int:
         json.dumps(report, indent=2) + "\n", encoding="utf-8"
     )
     payload = {
+        "grouping": input_data["grouping"],
         "n_groups_before": report["n_groups_before"],
         "n_groups_after": report["n_groups_after"],
         "score_source": report["score_source"],
@@ -3886,6 +3909,7 @@ def cmd_fit(args: argparse.Namespace) -> int:
         imatrix_args=_run_flag(args, "imatrix_args", None),
         perplexity_args=_run_flag(args, "perplexity_args", None),
         bands_per_role=int(_run_flag(args, "bands_per_role", 3) or 3),
+        grouping=_run_flag(args, "grouping", "banded") or "banded",
         jobs=int(_run_flag(args, "jobs", 1) or 1),
         probe_types=_run_flag(args, "probe_types", None),
         fixed_groups=_run_flag(args, "fixed_groups", None),

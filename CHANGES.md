@@ -1,5 +1,26 @@
 # Changes: DP-MCKP optimizer with column generation (`feat/dp-mckp-colgen`)
 
+## Per-tensor grouping for the gold run (2026-09-29)
+
+- **`--grouping per-tensor`** (reband/run/fit; stale-check key, step
+  namespace, payload + `input.json`): explodes the catalog to one group
+  per tensor (gid = tensor name) instead of Fisher-Jenks bands.
+  `reband.py` shares one `_rebuild_groups` helper for both paths so
+  group records are computed identically.
+- **Flat tensors ride fixed**: 1-D tensors (same flat rule as the probe
+  assertion; missing shape is a loud error, never a guess) become
+  `quantizable=False` singletons — a probe of an all-flat group would
+  record a bogus zero-delta "free compression" row. Bytes ride at
+  source precision like norm groups. On E4B: 720 groups, 339 forced
+  fixed (296 norm + 43 other) — exactly the farm's 339 F32 flats,
+  independent cross-check. 381 groups remain quantizable.
+- **Operator note**: banded-era `--fixed-groups other@global` no longer
+  matches; the tool-refused `per_layer_model_proj.weight` (non-flat,
+  refuses every rung) must be named directly.
+- **Tests**: 181 green (5 new: explode counts/coverage, flat ride-fixed,
+  missing-shape error, flag bypass + banded invariance, CLI
+  parse/thread/stale).
+
 ## Splice-farm trial backend for step 12 (2026-09-29)
 
 - **No more per-probe quantize**: `--splice-farm DIR` (sensitivity/run/fit;

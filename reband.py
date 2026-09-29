@@ -189,6 +189,124 @@ def band_index(layer_pos: int, breaks: list[int]) -> int:
     return len(breaks)
 
 
+def _is_flat_tensor(t: dict[str, Any]) -> bool:
+    """1-D (or scalar) tensors llama.cpp never quantizes, by design.
+
+    Same rule as ``llama_probe.assert_probe_applied``: at most one dim
+    above 1. Such tensors must never form a probed group on their own —
+    the probe would measure a no-op and record a bogus zero-delta row.
+    """
+    shape = t.get("shape")
+    if shape is None:
+        raise ValueError(
+            f"Per-tensor grouping needs tensor shapes; {t.get('name')!r} "
+            "has none. Refusing instead of guessing flat vs quantizable."
+        )
+    return sum(1 for d in shape if d and d > 1) <= 1
+
+
+def _rebuild_groups(
+    tensors: dict[str, Any],
+) -> dict[str, Any]:
+    """Rebuild group records from tensor membership (group_id on tensors).
+
+    Shared by the banded path and the per-tensor explode path so group
+    records (aggregates, byte totals, quantizable flag) are computed one
+    way.
+    """
+    from activation_features import aggregate_activation_group
+    from weight_features import aggregate_group_features
+
+    members: dict[str, list[str]] = {}
+    for name, t in tensors.items():
+        members.setdefault(str(t.get("group_id")), []).append(name)
+    groups: dict[str, Any] = {}
+    for gid in sorted(members):
+        names = sorted(members[gid])
+        m0 = tensors[names[0]]
+        wfeats = [
+            tensors[n].get("weight_features")
+            for n in names
+            if tensors[n].get("weight_features")
+        ]
+        afeats = [
+            tensors[n].get("activation_features")
+            for n in names
+            if tensors[n].get("activation_features")
+        ]
+        g: dict[str, Any] = {
+            "group_id": gid,
+            "role": m0.get("role"),
+            "depth": m0.get("depth"),
+            "quantizable": any(
+                bool(tensors[n].get("quantizable", True)) for n in names
+            ),
+            "n_tensors": len(names),
+            "total_nbytes": sum(
+                int(tensors[n].get("nbytes") or 0) for n in names
+            ),
+            "tensor_names": names,
+        }
+        if wfeats:
+            g["weight_features"] = aggregate_group_features(wfeats)
+        if afeats:
+            g["activation_features"] = aggregate_activation_group(afeats)
+        groups[gid] = g
+    return groups
+
+
+def explode_per_tensor(
+    catalog: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Explode every group into single-tensor groups (gold-run grouping).
+
+    Group id = tensor name; role/depth ride along for display and
+    imatrix mapping. Tensors llama.cpp cannot quantize (1-D/flat, same
+    rule as the probe assertion) become ``quantizable=False`` singletons
+    instead of probed groups: a probe of an all-flat group measures a
+    no-op and would record a bogus zero-delta "free compression" row
+    that corrupts the DP. Their bytes ride along at source precision
+    exactly like norm groups today. Non-flat singletons keep the
+    tensor's own quantizable flag.
+
+    Returns (new_catalog, report).
+    """
+    from weight_features import _catalog_sha256
+
+    catalog = copy.deepcopy(catalog)
+    tensors = catalog.get("tensors") or {}
+    prev_groups = sorted((catalog.get("groups") or {}).keys())
+    prev_sha = catalog.get("catalog_sha256")
+
+    for name, t in tensors.items():
+        t["group_id"] = name
+    groups = _rebuild_groups(tensors)
+
+    forced_fixed: list[str] = []
+    for gid, g in groups.items():
+        names = g.get("tensor_names") or []
+        if len(names) == 1 and _is_flat_tensor(tensors[names[0]]):
+            g["quantizable"] = False
+            forced_fixed.append(gid)
+    catalog["groups"] = groups
+    catalog["catalog_sha256"] = _catalog_sha256(catalog)
+    report = {
+        "grouping": "per-tensor",
+        "score_source": "per-tensor (no banding)",
+        "roles_rebanded": [],
+        "skipped_roles": {},
+        "assumed_layers": {},
+        "boundaries": {},
+        "n_groups_before": len(prev_groups),
+        "n_groups_after": len(groups),
+        "forced_fixed_flat": sorted(forced_fixed),
+        "prev_groups": prev_groups,
+        "prev_sha256": prev_sha,
+        "catalog_sha256": catalog["catalog_sha256"],
+    }
+    return catalog, report
+
+
 def reband_catalog(
     catalog: dict[str, Any],
     proxy: dict[str, Any],
@@ -196,6 +314,7 @@ def reband_catalog(
     bands_per_role: int = BANDS_PER_ROLE,
     imatrix_gguf: str | None = None,
     min_ss_reduction: float = MIN_SS_REDUCTION,
+    per_tensor: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Rewrite group membership by imatrix-guided bands.
 
@@ -209,7 +328,12 @@ def reband_catalog(
     Returns (new_catalog, report). The report records per-role boundaries,
     skipped roles with reasons, score source, previous group ids, and sha
     before/after for auditability.
+
+    ``per_tensor=True`` bypasses banding entirely and explodes to
+    single-tensor groups (gold-run grouping); see ``explode_per_tensor``.
     """
+    if per_tensor:
+        return explode_per_tensor(catalog)
     from activation_features import aggregate_activation_group
     from weight_features import _catalog_sha256, aggregate_group_features
 
@@ -307,42 +431,9 @@ def reband_catalog(
         t["group_id"] = gid
         t["depth"] = depth
 
-    # Rebuild groups from membership.
-    members: dict[str, list[str]] = {}
-    for name, t in tensors.items():
-        members.setdefault(str(t.get("group_id")), []).append(name)
-    groups: dict[str, Any] = {}
-    for gid in sorted(members):
-        names = sorted(members[gid])
-        m0 = tensors[names[0]]
-        wfeats = [
-            tensors[n].get("weight_features")
-            for n in names
-            if tensors[n].get("weight_features")
-        ]
-        afeats = [
-            tensors[n].get("activation_features")
-            for n in names
-            if tensors[n].get("activation_features")
-        ]
-        g: dict[str, Any] = {
-            "group_id": gid,
-            "role": m0.get("role"),
-            "depth": m0.get("depth"),
-            "quantizable": any(
-                bool(tensors[n].get("quantizable", True)) for n in names
-            ),
-            "n_tensors": len(names),
-            "total_nbytes": sum(
-                int(tensors[n].get("nbytes") or 0) for n in names
-            ),
-            "tensor_names": names,
-        }
-        if wfeats:
-            g["weight_features"] = aggregate_group_features(wfeats)
-        if afeats:
-            g["activation_features"] = aggregate_activation_group(afeats)
-        groups[gid] = g
+    # Rebuild groups from membership (shared helper: identical records
+    # whether banded or exploded).
+    groups = _rebuild_groups(tensors)
     catalog["groups"] = groups
     catalog["catalog_sha256"] = _catalog_sha256(catalog)
 
