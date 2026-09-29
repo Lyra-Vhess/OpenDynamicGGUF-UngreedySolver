@@ -81,6 +81,16 @@ def test_anchor_missing_binary_fails(tmp_path, monkeypatch):
         )
 
 
+def test_q8_is_default_background():
+    """Phase-0 verdict: trials build on Q8 unless --baseline overrides."""
+    from quant_formats import FORMATS
+    from sensitivity import BASELINE_TYPE
+
+    assert BASELINE_TYPE == "Q8_0"
+    assert FORMATS[0].baseline_type == "Q8_0"  # q4_k_m production default
+    assert all(f.baseline_type == "Q8_0" for f in FORMATS)
+
+
 def test_dp_cost_shift_invariance():
     """Adding a constant to every cost cannot move the DP optimum.
 

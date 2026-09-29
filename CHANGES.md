@@ -1,5 +1,24 @@
 # Changes: DP-MCKP optimizer with column generation (`feat/dp-mckp-colgen`)
 
+## Source anchor + Q8 trial background (2026-09-29)
+
+- **Zero point is full precision now**: the run anchor is the frozen
+  source file measured against itself (`measure_source_anchor`, one
+  sequential pass, no trial build), replacing the all-Q6_K trial. Rows
+  are absolute errors vs source; the DP is provably shift-invariant
+  (new test), so allocation/Pareto/guardrail/pricing are untouched —
+  only reported absolutes move (~+0.003). No fallback: a failed anchor
+  fails the run loudly. Sidecar key rekeyed to `('__anchor__','SOURCE')`.
+- **Trials build on Q8_0 by default** (was Q6_K): Phase-0 experiment
+  (12 groups x 3 rungs x both backgrounds, 72 GPU probes) showed the
+  background shifts every reading ~-0.0016 — decision-scale — with one
+  DP flip confined to the known `other@early` cliff group. Per user
+  decision, Q8 is the default (all quant profiles + `BASELINE_TYPE`;
+  `--baseline` still overrides). Trial disk/time grows ~1.5x.
+- **Tests**: 158 green, incl. anchor hard-error paths, DP
+  shift-invariance, anchor subtraction, background threading, Q8-default
+  pin.
+
 ## Bisection pricing reverted: invalid exclusions (2026-09-28)
 
 - **Verdict** (user decision): commit `19f6c19` (local-secant bound, tiered

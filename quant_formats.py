@@ -49,7 +49,7 @@ FORMATS: tuple[QuantFormat, ...] = (
         technique="Dynamic K-quant",
         base_type="q4_k_m",
         budget_ratio=0.72,
-        baseline_type="Q6_K",
+        baseline_type="Q8_0",
         probe_types=("Q3_K", "Q4_K", "Q5_K", "Q6_K"),
         recommended=True,
     ),
@@ -64,7 +64,7 @@ FORMATS: tuple[QuantFormat, ...] = (
         technique="Dynamic K-quant",
         base_type="q5_k_m",
         budget_ratio=0.85,
-        baseline_type="Q6_K",
+        baseline_type="Q8_0",
         probe_types=("Q4_K", "Q5_K", "Q6_K", "Q8_0"),
     ),
     QuantFormat(
@@ -78,7 +78,7 @@ FORMATS: tuple[QuantFormat, ...] = (
         technique="Dynamic K-quant",
         base_type="q3_k_m",
         budget_ratio=0.55,
-        baseline_type="Q6_K",
+        baseline_type="Q8_0",
         probe_types=("Q2_K", "Q3_K", "Q4_K", "Q5_K"),
     ),
     QuantFormat(
@@ -92,7 +92,7 @@ FORMATS: tuple[QuantFormat, ...] = (
         technique="Dynamic K-quant",
         base_type="q4_k_s",
         budget_ratio=0.66,
-        baseline_type="Q6_K",
+        baseline_type="Q8_0",
         probe_types=("Q3_K", "Q4_K", "Q5_K", "Q6_K"),
     ),
     QuantFormat(
@@ -106,7 +106,7 @@ FORMATS: tuple[QuantFormat, ...] = (
         technique="Dynamic K-quant",
         base_type="q5_k_s",
         budget_ratio=0.80,
-        baseline_type="Q6_K",
+        baseline_type="Q8_0",
         probe_types=("Q4_K", "Q5_K", "Q6_K", "Q8_0"),
     ),
     QuantFormat(
@@ -148,7 +148,7 @@ FORMATS: tuple[QuantFormat, ...] = (
         technique="Dynamic K-quant",
         base_type="q2_k",
         budget_ratio=0.42,
-        baseline_type="Q6_K",
+        baseline_type="Q8_0",
         probe_types=("Q2_K", "Q3_K", "Q4_K"),
     ),
     QuantFormat(
@@ -162,7 +162,7 @@ FORMATS: tuple[QuantFormat, ...] = (
         technique="Dynamic + imatrix (I-quant)",
         base_type="iq4_xs",
         budget_ratio=0.70,
-        baseline_type="Q6_K",
+        baseline_type="Q8_0",
         probe_types=("Q3_K", "Q4_K", "Q5_K", "Q6_K"),
     ),
     QuantFormat(
@@ -176,7 +176,7 @@ FORMATS: tuple[QuantFormat, ...] = (
         technique="Dynamic + imatrix (I-quant)",
         base_type="iq4_nl",
         budget_ratio=0.74,
-        baseline_type="Q6_K",
+        baseline_type="Q8_0",
         probe_types=("Q3_K", "Q4_K", "Q5_K", "Q6_K"),
     ),
     QuantFormat(
@@ -190,7 +190,7 @@ FORMATS: tuple[QuantFormat, ...] = (
         technique="Dynamic + imatrix (I-quant)",
         base_type="iq3_m",
         budget_ratio=0.52,
-        baseline_type="Q6_K",
+        baseline_type="Q8_0",
         probe_types=("Q2_K", "Q3_K", "Q4_K", "Q5_K"),
     ),
     QuantFormat(
@@ -204,7 +204,7 @@ FORMATS: tuple[QuantFormat, ...] = (
         technique="Dynamic + imatrix (I-quant)",
         base_type="iq2_xxs",
         budget_ratio=0.38,
-        baseline_type="Q6_K",
+        baseline_type="Q8_0",
         probe_types=("Q2_K", "Q3_K", "Q4_K"),
     ),
     QuantFormat(
@@ -218,7 +218,7 @@ FORMATS: tuple[QuantFormat, ...] = (
         technique="Dynamic legacy quant",
         base_type="q4_0",
         budget_ratio=0.70,
-        baseline_type="Q6_K",
+        baseline_type="Q8_0",
         probe_types=("Q3_K", "Q4_K", "Q5_K", "Q6_K"),
     ),
 )

@@ -45,7 +45,7 @@ BYTES_PER_ELEM: dict[str, float] = {
 
 # Default trial ladder (easy → hard groups try lower first in ranking, not here)
 DEFAULT_PROBE_TYPES = ["Q3_K", "Q4_K", "Q5_K", "Q6_K"]
-BASELINE_TYPE = "Q6_K"
+BASELINE_TYPE = "Q8_0"
 
 # Role → base ΔKLD scale at Q4_K (heuristic)
 _ROLE_KLD: dict[str, float] = {
