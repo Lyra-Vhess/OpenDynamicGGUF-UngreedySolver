@@ -21,8 +21,19 @@ evaluation/results/*
 !evaluation/results/.gitkeep
 # Local model checkouts (HF repos; GBs of weights — inputs, never sources).
 # *.safetensors covers the weights in any current/future checkout; named dirs
-# cover their tokenizer/config sidecars.
+# cover whole checkouts; the sidecar patterns below cover tokenizer/config
+# files wherever a checkout lands (a stray `git add -A` must never sweep a
+# 32MB tokenizer.json or model weights into git or git-lfs).
 *.safetensors
+tokenizer.json
+tokenizer_config.json
+tokenizer.model
+special_tokens_map.json
+added_tokens.json
+generation_config.json
+processor_config.json
+chat_template.jinja
+*.safetensors.index.json
 functiongemma-270m-it/
 gemma-4-E4B-it/
 # Local-only docs (kept in working tree, never pushed).
