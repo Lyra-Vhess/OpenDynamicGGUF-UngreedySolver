@@ -1,5 +1,32 @@
 # Changes: DP-MCKP optimizer with column generation (`feat/dp-mckp-colgen`)
 
+## PPL(Q)-vs-size: explained, not a regression (2026-09-29)
+
+- **Observation** (gold sweep, 8 points): held-out `Mean PPL(Q)` rises
+  2.686 → 2.748 with recipe size while mean KLD falls 0.088 → 0.0064
+  and top-1 agreement rises 93.8% → 98.5%.
+- **Reference confirmed**: every Tier-1 log prints `Mean PPL(base) =
+  2.722208` — the frozen BF16 GGUF (step-09 conversion of the google
+  safetensors, sha-pinned through `logits_manifest.json`). Same value
+  in all 8 logs: one shared reference, as designed.
+- **Mechanism**: `PPL(Q)` is the candidate's *self*-perplexity, not a
+  divergence from the reference — it can sit below `PPL(P)`, and here
+  it does (paired ratio 0.9865 at the small end). Low-bit quants
+  sharpen the output distribution: more mass on the realized tokens
+  (lower NLL on *every* one of the 26 heldout chunks) with the tail cut
+  off (14x mean KLD, 3x the argmax flips). Growing precision relaxes
+  the distribution back to P's calibrated uncertainty, so `PPL(Q)`
+  converges to `PPL(P)` from below and ends ~1% above on residual
+  noise. Ruled out: recipe nestedness is perfect except 5 reshuffles
+  between the top two near-identical budgets, and per-cell ceiling
+  non-monotonicity is ±1e-4 background-floor noise (irrelevant at the
+  6e-2 PPL scale).
+- **Consequence**: `PPL(Q)` must never rank recipes — it crowns the
+  3.4 GB file over the 5.1 GB winner and XL. The gates correctly ignore
+  it (KLD lines only). Magnitude is ±1.5%; winner-vs-XL is noise.
+  Direct entropy proof would need per-token distributions (not dumped
+  by stock perplexity) — open, low priority.
+
 ## Exhaustive integration: correction + frontier recipes + step-15 sweep (2026-09-29)
 
 - **Background correction (report-only)**: summed DP predictions
