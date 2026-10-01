@@ -9,23 +9,31 @@
   2.722208` — the frozen BF16 GGUF (step-09 conversion of the google
   safetensors, sha-pinned through `logits_manifest.json`). Same value
   in all 8 logs: one shared reference, as designed.
-- **Mechanism**: `PPL(Q)` is the candidate's *self*-perplexity, not a
+- **Mechanism (corrected 2026-10-01 — the sharpening story below was
+  wrong)**: `PPL(Q)` is the candidate's *self*-perplexity, not a
   divergence from the reference — it can sit below `PPL(P)`, and here
   it does (paired ratio 0.9865 at the small end). Low-bit quants
-  sharpen the output distribution: more mass on the realized tokens
-  (lower NLL on *every* one of the 26 heldout chunks) with the tail cut
-  off (14x mean KLD, 3x the argmax flips). Growing precision relaxes
-  the distribution back to P's calibrated uncertainty, so `PPL(Q)`
-  converges to `PPL(P)` from below and ends ~1% above on residual
+  *flatten* the output distribution (see entropy proof): mass moves off
+  P's (sometimes wrong) argmax peaks onto the true tokens, so mean NLL
+  falls even as the distribution gets worse by every divergence
+  measure. Growing precision converges Q back onto P, so `PPL(Q)`
+  climbs back to `PPL(P)` from below and ends ~1% above on residual
   noise. Ruled out: recipe nestedness is perfect except 5 reshuffles
   between the top two near-identical budgets, and per-cell ceiling
   non-monotonicity is ±1e-4 background-floor noise (irrelevant at the
   6e-2 PPL scale).
+- **Entropy proof** (`logit_entropy.py` on `--save-all-logits` dumps;
+  KL formula mirror-verified against the tool to 1e-6): mean Shannon
+  entropy H(P)=1.0115 bits, H(small/3.4GB)=1.0915 (+0.080),
+  H(winner/5.1GB)=1.0146 (+0.003), H(XL)=1.0118 (+0.0003). The
+  H(small)<H(P) sharpening prediction is rejected — the small
+  candidate is *higher*-entropy (top-1 mass 0.880 vs P's 0.895, 6.2%
+  argmax flips) yet scores truth better (NLL 0.988 vs 1.001 nats).
+  XL sits essentially on P by every distributional measure while
+  losing on KLD (0.0171 vs 0.0064) — calibration shape is not fidelity.
 - **Consequence**: `PPL(Q)` must never rank recipes — it crowns the
   3.4 GB file over the 5.1 GB winner and XL. The gates correctly ignore
   it (KLD lines only). Magnitude is ±1.5%; winner-vs-XL is noise.
-  Direct entropy proof would need per-token distributions (not dumped
-  by stock perplexity) — open, low priority.
 
 ## Exhaustive integration: correction + frontier recipes + step-15 sweep (2026-09-29)
 
