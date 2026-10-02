@@ -1223,13 +1223,14 @@ def _optimize_dp_mckp(
             "allocation_hash": ahash, "feasible": True,
         })
 
-    # Full DP frontier + BPW recipe selection. One extra solve at the
-    # adjusted budget yields every distinct optimum at or below it (the
-    # backtracks are free); each BPW grid point rounds UP to the smallest
-    # frontier allocation at/above its byte need, so a selected recipe
-    # never promises a size below its point. Points with no frontier
-    # entry at/above need stay unfilled; duplicate hashes fold onto one
-    # file. The user's budget point is the primary recipe.yaml itself.
+    # Full DP frontier + BPW recipe selection. One extra solve — at the
+    # max of the adjusted budget and the richest BPW grid need — yields
+    # every distinct optimum at or below it (the backtracks are free);
+    # each BPW grid point rounds UP to the smallest frontier allocation
+    # at/above its byte need, so a selected recipe never promises a size
+    # below its point. Points with no frontier entry at/above need stay
+    # unfilled; duplicate hashes fold onto one file. The user's budget
+    # point is the primary recipe.yaml itself.
     # Allocations live in memory only (the manifest table holds scalars;
     # selected allocations ship as yaml files).
     from dp_mckp import pareto_frontier
@@ -1240,12 +1241,24 @@ def _optimize_dp_mckp(
     frontier_allocs: dict[str, dict[str, str]] = {}
     full_adj = budget_bytes - fixed_total - kept_total - overhead
     group_tensors = catalog.get("tensors") or {}
+    # The frontier table must span the whole BPW grid: solve at the max
+    # of the user budget and the richest grid need, or top grid points
+    # stay unfilled (round-UP needs an entry at/above need). The primary
+    # recipe still solves at the user budget — only this table is wider.
+    n_w = sum(
+        _group_n_elements(groups[g], group_tensors) for g in p_groups
+    )
+    bpw_targets = {
+        bpw: int(bpw * n_w / 8) + fixed_total + kept_total + overhead
+        for bpw in BPW_GRID
+    }
+    frontier_budget = max(full_adj, max(bpw_targets.values()))
     try:
         if full_adj < 0:
             raise InfeasibleBudget(0, None, full_adj)
         full = solve_mckp(
             groups=p_groups, candidates=p_cand, size_bytes=p_size,
-            cost_tail=p_cost, budget_bytes=full_adj,
+            cost_tail=p_cost, budget_bytes=frontier_budget,
         )
         for entry in pareto_frontier(
             groups=p_groups, candidates=p_cand, size_bytes=p_size,
@@ -1270,13 +1283,6 @@ def _optimize_dp_mckp(
                 "predicted_tail_kld": fat,
                 "allocation_hash": fah,
             })
-        n_w = sum(
-            _group_n_elements(groups[g], group_tensors) for g in p_groups
-        )
-        bpw_targets = {
-            bpw: int(bpw * n_w / 8) + fixed_total + kept_total + overhead
-            for bpw in BPW_GRID
-        }
         picks = select_frontier_recipes(frontier_table, bpw_targets)
         seen_hashes: dict[str, str] = {}
         for bpw in BPW_GRID:
@@ -1455,6 +1461,7 @@ def _optimize_dp_mckp(
                 "dropped_pareto_above_budget": dropped_above_budget,
                 "frontier": {
                     "bpw_grid": list(BPW_GRID),
+                    "solve_budget_bytes": frontier_budget,
                     "n_optima": len(frontier_table),
                     "table": frontier_table,
                     "selection": frontier_selection,

@@ -123,6 +123,7 @@ def test_validate_frontier_flags(monkeypatch, tmp_path):
     assert seen["cmd_validate"].frontier is True
     assert seen["cmd_validate"].budget_mb == "frontier"
 
+
     for step_fn in ("cmd_resolve", "cmd_load", "cmd_enumerate", "cmd_classify",
                     "cmd_catalog", "cmd_weight_features", "cmd_corpus",
                     "cmd_activation_features", "cmd_freeze_gguf", "cmd_imatrix",

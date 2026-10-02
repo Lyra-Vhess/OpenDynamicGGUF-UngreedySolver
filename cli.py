@@ -3735,6 +3735,48 @@ def _validate_frontier(
     if not heldout_bin or not Path(heldout_bin).is_file():
         raise ValueError("Held-out logits missing (step 11 --mode llama).")
 
+    # KLD noise floor: the all-background trial reads identically in every
+    # probed background-rung cell, so the cell means are the run's own
+    # measurement-noise estimate — per metric (mean and P99 floors differ).
+    # Missing/partial data → no line, not a lie.
+    noise_floor: float | None = None
+    noise_floor_p99: float | None = None
+    try:
+        sens_raw = json.loads(
+            (store.step_path(meta.run_id, "sensitivity")
+             / "sensitivity.json").read_text(encoding="utf-8"))
+        base = str(sens_raw.get("baseline_type") or "").upper()
+        bg = [r for r in sens_raw.get("rows") or []
+              if str(r.get("probe") or "").upper() == base]
+        means = [float(r["kld_mean"]) for r in bg
+                 if r.get("kld_mean") is not None]
+        tails = [float(r["kld_tail_1pct"]) for r in bg
+                 if r.get("kld_tail_1pct") is not None]
+        noise_floor = sum(means) / len(means) if means else None
+        noise_floor_p99 = sum(tails) / len(tails) if tails else None
+    except (OSError, ValueError, json.JSONDecodeError):
+        noise_floor = None
+        noise_floor_p99 = None
+    # Total params for per-dot real-bpw labels (catalog tensor elements).
+    n_params: int | None = None
+    try:
+        catalog = None
+        for step_id, fname in (
+            ("activation_features", "tensor_catalog.json"),
+            ("weight_features", "tensor_catalog.json"),
+            ("catalog", "tensor_catalog.json"),
+        ):
+            cand = store.step_path(meta.run_id, step_id) / fname
+            if cand.is_file():
+                catalog = json.loads(cand.read_text(encoding="utf-8"))
+                break
+        if catalog:
+            total = sum(int(t.get("n_elements") or 0)
+                        for t in (catalog.get("tensors") or {}).values())
+            n_params = total or None
+    except (OSError, ValueError, json.JSONDecodeError):
+        n_params = None
+
     return run_sweep(
         optimize_dir=opt_dir,
         gguf_in=Path(gguf_in),
@@ -3752,6 +3794,9 @@ def _validate_frontier(
             getattr(args, "perplexity_args", None), "--perplexity-args"),
         recipe_files=[Path(f) for f in files],
         keep_winner=keep_winner,
+        noise_floor_kld=noise_floor,
+        noise_floor_p99=noise_floor_p99,
+        n_params=n_params,
     )
 
 
