@@ -188,16 +188,22 @@ def extract_pareto(run_root: Path) -> dict[str, Any]:
     manifest = _read_json(_steps_dir(run_root) / "13_optimize" / "optimize_manifest.json")
     if not manifest or not manifest.get("pareto"):
         return {"available": False}
-    chosen_bytes = (manifest.get("primary") or {}).get("estimated_bytes")
-    points = [
-        {
+    points = []
+    for p in manifest["pareto"]:
+        if p.get("estimated_bytes") is None:
+            continue
+        kld = p.get("predicted_delta_kld")
+        if kld is None:
+            kld = p.get("predicted_mean_kld")
+        if kld is None:
+            continue
+        points.append({
             "size_mb": p["estimated_bytes"] / (1024**2),
-            "kld": p["predicted_delta_kld"],
-            "chosen": p["estimated_bytes"] == chosen_bytes,
+            "kld": kld,
             "meets_budget": p.get("meets_budget"),
-        }
-        for p in manifest["pareto"]
-    ]
+        })
+    if not points:
+        return {"available": False}
     return {
         "available": True,
         "source": "steps/13_optimize/optimize_manifest.json",
@@ -281,6 +287,133 @@ def extract_reproducibility(run_root: Path) -> dict[str, Any]:
     }
 
 
+def _find_sweep_record(run_root: Path) -> tuple[dict[str, Any], str, Path] | None:
+    """First sweep frontier.json with measured points + its source caption."""
+    for rel in ("15_validate/frontier/frontier.json",
+                "16_pareto_sweep/frontier.json"):
+        data = _read_json(_steps_dir(Path(run_root)) / rel)
+        if data and data.get("points"):
+            return data, f"steps/{rel}", _steps_dir(Path(run_root)) / rel
+    return None
+
+
+def _sweep_noise_floor(run_root: Path) -> tuple[float | None, float | None]:
+    """Per-metric noise over probed background-rung cells (mean, P99)."""
+    sens = _read_json(
+        _steps_dir(Path(run_root)) / "12_sensitivity" / "sensitivity.json") or {}
+    base = str(sens.get("baseline_type") or "").upper()
+    if not base:
+        return None, None
+    bg = [r for r in sens.get("rows") or []
+          if str(r.get("probe") or "").upper() == base]
+    means = [float(r["kld_mean"]) for r in bg
+             if r.get("kld_mean") is not None]
+    tails = [float(r["kld_tail_1pct"]) for r in bg
+             if r.get("kld_tail_1pct") is not None]
+    return ((sum(means) / len(means)) if means else None,
+            (sum(tails) / len(tails)) if tails else None)
+
+
+def _sweep_ppl_base(sweep_file: Path) -> float | None:
+    """Best-effort BF16 PPL(base) from sibling Tier-1 logs."""
+    import re as _re
+
+    for log in sorted(sweep_file.parent.glob("exports/*/llama-perplexity-tier1.log")):
+        try:
+            m = _re.search(r"Mean PPL\(base\)\s*:\s*([-\d.eE+]+)",
+                           log.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        if m:
+            return float(m.group(1))
+    return None
+
+
+def extract_sweep(run_root: Path) -> dict[str, Any]:
+    """Measured sweep frontier (all four Tier-1 metrics) for charting."""
+    run_root = Path(run_root)
+    found = _find_sweep_record(run_root)
+    if not found:
+        return {"available": False}
+    data, source, sweep_file = found
+    pts = sorted(
+        (m for m in data["points"]
+         if m.get("actual_bytes") and (m.get("tier1") or {}).get("metrics")),
+        key=lambda m: int(m["actual_bytes"]),
+    )
+    if not pts:
+        return {"available": False}
+    n_params = data.get("n_params")
+    if not n_params:
+        catalog = _load_catalog(run_root) or {}
+        total = sum(int(t.get("n_elements") or 0)
+                    for t in (catalog.get("tensors") or {}).values())
+        n_params = total or None
+
+    def bpw(nbytes: int) -> str | None:
+        if not n_params:
+            return None
+        return f"{int(nbytes) * 8 / int(n_params):.2f}"
+
+    noise = data.get("noise_floor_kld")
+    noise_p99 = data.get("noise_floor_p99")
+    if noise is None or noise_p99 is None:
+        fb_mean, fb_p99 = _sweep_noise_floor(run_root)
+        noise = noise if noise is not None else fb_mean
+        noise_p99 = noise_p99 if noise_p99 is not None else fb_p99
+    ppl_base = data.get("ppl_base")
+    if ppl_base is None:
+        ppl_base = _sweep_ppl_base(sweep_file)
+    xl_rec = data.get("xl") or {}
+
+    def series(key: str, tier1_level: bool) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        out = []
+        for m in pts:
+            v = (m["tier1"].get(key) if tier1_level
+                 else m["tier1"]["metrics"].get(key))
+            if v is None:
+                continue
+            out.append({"size_mb": int(m["actual_bytes"]) / (1024**2),
+                        "kld": float(v),
+                        "bpw": bpw(int(m["actual_bytes"]))})
+        xlp = None
+        if xl_rec.get("actual_bytes") and xl_rec.get("tier1"):
+            xv = (xl_rec["tier1"].get(key) if tier1_level
+                  else (xl_rec["tier1"].get("metrics") or {}).get(key))
+            if xv is not None:
+                xlp = {"size_mb": int(xl_rec["actual_bytes"]) / (1024**2),
+                       "kld": float(xv),
+                       "bpw": bpw(int(xl_rec["actual_bytes"])),
+                       "xl": True}
+        return out, xlp
+
+    # Perplexity and top-1 need 3 sig figs (their action lives in the
+    # 3rd digit); the KLD pair reads cleanly at 2.
+    specs = [
+        ("mean_kld", "Mean KLD", False, True,
+         noise, "noise floor (all-Q8 background)", 2),
+        ("p99_kld", "99% KLD", False, True,
+         noise_p99 if noise_p99 is not None else noise,
+         "noise floor (all-Q8 background)", 2),
+        ("top1_agree", "Top-1 agreement", False, False, None, None, 3),
+        ("perplexity", "Perplexity", True, False,
+         ppl_base, "BF16 base", 3),
+    ]
+    charts = []
+    for key, title, tier1_level, log_y, ref, ref_label, sig_figs in specs:
+        spts, xlp = series(key, tier1_level)
+        if not spts:
+            continue
+        charts.append({"key": key, "title": title, "log_y": log_y,
+                       "ref": ref, "ref_label": ref_label,
+                       "sig_figs": sig_figs,
+                       "points": spts + ([xlp] if xlp else [])})
+    if not charts:
+        return {"available": False}
+    return {"available": True, "source": source,
+            "n_params": n_params, "charts": charts}
+
+
 def build_report_data(run_root: Path) -> dict[str, Any]:
     run_root = Path(run_root)
     return {
@@ -288,6 +421,7 @@ def build_report_data(run_root: Path) -> dict[str, Any]:
         "allocations": extract_allocations(run_root),
         "sensitivity": extract_sensitivity(run_root),
         "pareto": extract_pareto(run_root),
+        "sweep": extract_sweep(run_root),
         "gates": extract_gates(run_root),
         "benchmarks": extract_benchmarks(run_root),
         "reproducibility": extract_reproducibility(run_root),
@@ -365,52 +499,44 @@ def _heatmap_table(sens: dict[str, Any]) -> str:
     )
 
 
-def _svg_scatter(points: list[dict[str, Any]], *, width: int = 640, height: int = 320) -> str:
-    if not points:
+def _svg_scatter(
+    points: list[dict[str, Any]],
+    *,
+    width: int = 640,
+    height: int = 320,
+    log_y: bool = False,
+    ref_value: float | None = None,
+    ref_label: str | None = None,
+    ylabel: str = "predicted ΔKLD",
+    sig_figs: int = 2,
+) -> str:
+    """Frontier scatter as inline SVG — rendered by the shared
+    matplotlib figure builder, so the report charts use the same engine
+    and adjustText label placement as the PNGs.
+
+    ``points``: {size_mb, kld, bpw? (real bits-per-weight label), xl?}.
+    No winner highlight anywhere — the frontier speaks.
+    """
+    from pareto_sweep import frontier_svg
+
+    def _fmt(v: float) -> str:
+        return f"{v:.{sig_figs}g}"
+
+    items: list[tuple[float, float, str | None]] = []
+    xlp: tuple[float, float, str | None] | None = None
+    for p in sorted(points, key=lambda p: p["size_mb"]):
+        lab = (f"{_fmt(p['kld'])}, {p['bpw']} bpw"
+               if p.get("bpw") else None)
+        if p.get("xl"):
+            xlp = (p["size_mb"], p["kld"],
+                   f"XL {lab}" if lab is not None else None)
+        else:
+            items.append((p["size_mb"], p["kld"], lab))
+    if not items:
         return ""
-    pad = 52
-    xs = [p["size_mb"] for p in points]
-    ys = [p["kld"] for p in points]
-    x0, x1 = min(xs), max(xs)
-    y0, y1 = min(ys), max(ys)
-    xr = (x1 - x0) or 1.0
-    yr = (y1 - y0) or 1.0
-
-    def sx(v: float) -> float:
-        return pad + (v - x0) / xr * (width - 2 * pad)
-
-    def sy(v: float) -> float:
-        return height - pad - (v - y0) / yr * (height - 2 * pad)
-
-    ordered = sorted(points, key=lambda p: p["size_mb"])
-    path = " ".join(
-        f"{'M' if i == 0 else 'L'}{sx(p['size_mb']):.1f},{sy(p['kld']):.1f}"
-        for i, p in enumerate(ordered)
-    )
-    dots = []
-    for p in ordered:
-        chosen = p.get("chosen")
-        dots.append(
-            f'<circle cx="{sx(p["size_mb"]):.1f}" cy="{sy(p["kld"]):.1f}" '
-            f'r="{9 if chosen else 5}" fill="{"#f2c14e" if chosen else "#59b8e6"}" '
-            f'stroke="#0b1220" stroke-width="1.5"/>'
-        )
-        if chosen:
-            dots.append(
-                f'<text x="{sx(p["size_mb"]) + 12:.1f}" y="{sy(p["kld"]) + 4:.1f}" '
-                f'class="svgt">chosen · {p["size_mb"]:.0f} MB</text>'
-            )
-    return (
-        f'<svg viewBox="0 0 {width} {height}" width="{width}" '
-        f'xmlns="http://www.w3.org/2000/svg" role="img">'
-        f'<line x1="{pad}" y1="{height - pad}" x2="{width - pad}" y2="{height - pad}" class="ax"/>'
-        f'<line x1="{pad}" y1="{pad}" x2="{pad}" y2="{height - pad}" class="ax"/>'
-        f'<text x="{width / 2:.0f}" y="{height - 12}" text-anchor="middle" class="svgt dim">size (MB)</text>'
-        f'<text x="16" y="{height / 2:.0f}" transform="rotate(-90 16 {height / 2:.0f})" '
-        f'text-anchor="middle" class="svgt dim">predicted ΔKLD</text>'
-        f'<path d="{path}" fill="none" stroke="#3a4a63" stroke-width="1.5" stroke-dasharray="4 3"/>'
-        f"{''.join(dots)}</svg>"
-    )
+    return frontier_svg(items, title=None, ylabel=ylabel, log_y=log_y,
+                        ref_value=ref_value, ref_label=ref_label, xl=xlp,
+                        figsize=(6.4, 3.2))
 
 
 def _section(title: str, source: str | None, inner: str) -> str:
@@ -453,7 +579,7 @@ tbody th { font-weight: 500; color: #c6d4e6; white-space: nowrap; }
 .cap.src { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .svgt { font: 12px -apple-system, sans-serif; fill: #c6d4e6; }
 .svgt.dim { fill: #71829c; }
-.ax { stroke: #2a3a55; stroke-width: 1; }
+
 .qtag { display: inline-block; min-width: 46px; text-align: center; padding: 1px 7px;
   border-radius: 5px; font-weight: 700; font-size: 12px; color: #0b1220; }
 .kv { display: grid; grid-template-columns: 180px 1fr; gap: 3px 14px; font-size: 14px; }
@@ -568,20 +694,49 @@ def render_html(data: dict[str, Any]) -> str:
     else:
         parts.append(_not_run("Sensitivity heatmap", "step 12 (sensitivity) has not run"))
 
-    # --- pareto ---
-    p = data["pareto"]
-    if p.get("available"):
-        parts.append(
-            _section(
-                "Size ↔ quality frontier",
-                p.get("source"),
-                _svg_scatter(p["points"])
-                + '<p class="cap">Each point is a full recipe optimized at a '
-                "different budget; the highlighted point is the shipped one.</p>",
+    # --- sweep frontier (measured) over predicted pareto fallback ---
+    sw = data.get("sweep") or {}
+    if sw.get("available"):
+        for chart in sw["charts"]:
+            parts.append(
+                _section(
+                    f"Frontier — {chart['title']} vs size",
+                    sw.get("source"),
+                    _svg_scatter(chart["points"], log_y=chart["log_y"],
+                                 ref_value=chart["ref"],
+                                 ref_label=chart["ref_label"],
+                                 ylabel=f"measured {chart['title']}",
+                                 sig_figs=chart.get("sig_figs", 2))
+                    + '<p class="cap">Each point is a full recipe measured '
+                    "on held-out Tier-1; ★ is the Unsloth XL reference. "
+                    "Labels are real bits-per-weight.</p>",
+                )
             )
-        )
+        p = data["pareto"]
+        if p.get("available"):
+            parts.append(
+                _section(
+                    "Size ↔ quality frontier (predicted)",
+                    p.get("source"),
+                    _svg_scatter(p["points"])
+                    + '<p class="cap">DP-predicted allocations at each '
+                    "budget (estimates, not measurements).</p>",
+                )
+            )
     else:
-        parts.append(_not_run("Size ↔ quality frontier", "no Pareto set from step 13"))
+        p = data["pareto"]
+        if p.get("available"):
+            parts.append(
+                _section(
+                    "Size ↔ quality frontier",
+                    p.get("source"),
+                    _svg_scatter(p["points"])
+                    + '<p class="cap">Each point is a full recipe optimized at a '
+                    "different budget (DP-predicted).</p>",
+                )
+            )
+        else:
+            parts.append(_not_run("Size ↔ quality frontier", "no Pareto set from step 13"))
 
     # --- gates ---
     g = data["gates"]

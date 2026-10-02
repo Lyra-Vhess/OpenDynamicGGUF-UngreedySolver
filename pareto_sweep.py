@@ -208,17 +208,170 @@ def pick_winner(
                key=lambda m: float(m["tier1"]["metrics"]["mean_kld"]))
 
 
+_PPL_BASE_RE = re.compile(r"Mean PPL\(base\)\s*:\s*([-\d.eE+]+)")
+
+
+def parse_ppl_base(text: str) -> float | None:
+    """Best-effort ``Mean PPL(base)`` from a llama-perplexity Tier-1 log."""
+    m = _PPL_BASE_RE.search(text)
+    return float(m.group(1)) if m else None
+
+
+def _bpw_label(actual_bytes: int, n_params: int | None) -> str | None:
+    """Real bits-per-weight: actual file bytes over total params."""
+    if not n_params:
+        return None
+    return f"{int(actual_bytes) * 8 / int(n_params):.2f}"
+
+
+def _place_labels(ax, texts, dot_xs, dot_ys, line_xs, line_ys):
+    """Force-directed label placement (adjustText — the standard tool).
+
+    Labels repel each other, the dots, and virtual points sampled along
+    the frontier polyline; a weak pull keeps them near their dots and
+    everything stays inside the axes. adjustText draws thin leaders for
+    displaced labels itself.
+    """
+    from adjustText import adjust_text
+
+    adjust_text(
+        texts,
+        x=list(dot_xs) + list(line_xs),
+        y=list(dot_ys) + list(line_ys),
+        arrowprops=dict(arrowstyle="-", color="#777777", linewidth=0.7),
+        ax=ax,
+    )
+
+
+def frontier_figure(points: list[tuple[float, float, str | None]],
+                    *, title: str | None, ylabel: str, log_y: bool = False,
+                    ref_value: float | None = None,
+                    ref_label: str | None = None,
+                    xl: tuple[float, float, str | None] | None = None,
+                    figsize: tuple[float, float] = (6.4, 4.8)):
+    """One frontier chart (shared by the PNG and report-SVG backends).
+
+    ``points``: ``(x, y, label)`` measured dots in x order (``label``
+    may be None — the dot still plots); ``xl`` is an optional
+    ``(x, y, label)`` star. Returns the placed Figure.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    fig, ax = plt.subplots(figsize=figsize)
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    ax.plot(xs, ys, "o-", label="measured frontier")
+    if xl is not None:
+        ax.scatter([xl[0]], [xl[1]], marker="*", s=200, label="Unsloth XL")
+    if ref_value is not None:
+        ax.axhline(float(ref_value), color="grey", linestyle="--",
+                   linewidth=1.2, label=ref_label)
+    use_log = bool(log_y) and all(float(y) > 0 for y in ys)
+    if use_log:
+        ax.set_yscale("log")
+    ax.grid(True, which="both", alpha=0.25, linewidth=0.6)
+    ax.set_xlabel("Size (MiB)")
+    ax.set_ylabel(f"{ylabel} (log scale)" if use_log else ylabel)
+    if title is not None:
+        ax.set_title(f"Pareto frontier — {title} vs size (held-out Tier-1)")
+    ax.legend()
+    fig.tight_layout()
+    # Labels last: adjustText needs final display coords (tight_layout
+    # moves the axes; anything earlier would be stale).
+    fig.canvas.draw()
+    all_pts = list(points) + ([xl] if xl is not None else [])
+    texts = [ax.text(x, y, lab, fontsize=6, fontweight="bold",
+                     color="#555555") for x, y, lab in all_pts
+             if lab is not None]
+    if texts:
+        # Virtual points along the polyline repel labels from the line
+        # itself (the adjustText-docs recipe); xs is monotonic in x.
+        lx = np.linspace(min(xs), max(xs), 200).tolist()
+        line = [(x, float(np.interp(x, xs, ys))) for x in lx]
+        _place_labels(ax, texts,
+                      [p[0] for p in all_pts], [p[1] for p in all_pts],
+                      [p[0] for p in line], [p[1] for p in line])
+    return fig
+
+
+def frontier_svg(points: list[tuple[float, float, str]], **kwargs) -> str:
+    """Inline-SVG twin of one :func:`frontier_figure` chart for report.html."""
+    import io
+
+    import matplotlib.pyplot as plt
+
+    fig = frontier_figure(points, **kwargs)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="svg")
+    plt.close(fig)
+    svg = buf.getvalue().decode("utf-8")
+    svg = svg[svg.index("<svg"):]
+    # Responsive width; keep the viewBox for aspect.
+    import re as _re
+
+    svg = _re.sub(r'width="[\d.]+pt" height="[\d.]+pt"', 'width="100%"',
+                  svg, count=1)
+    return svg
+
+
+def _chart_points(pts, key: str, tier1_level: bool, fmt: str,
+                  n_params: int | None
+                  ) -> list[tuple[float, float, str | None]]:
+    """``(x-miB, y, "v, bpw bpw")`` tuples for one chart metric.
+
+    The label is None when ``n_params`` is unknown — the dot still
+    plots, it just goes unlabeled.
+    """
+    out = []
+    for m in pts:
+        y = (m["tier1"].get(key) if tier1_level
+             else m["tier1"]["metrics"].get(key))
+        if y is None:
+            continue
+        x = int(m["actual_bytes"]) / (1024 * 1024)
+        lab = _bpw_label(int(m["actual_bytes"]), n_params)
+        out.append((x, float(y),
+                    f"{float(y):{fmt}}, {lab} bpw" if lab is not None else None))
+    return out
+
+
+def _chart_xl(xl: dict[str, Any] | None, key: str, tier1_level: bool,
+              fmt: str, n_params: int | None
+              ) -> tuple[float, float, str | None] | None:
+    if not xl or xl.get("actual_bytes") is None:
+        return None
+    xval = ((xl.get("tier1") or {}).get(key) if tier1_level
+            else ((xl.get("tier1") or {}).get("metrics") or {}).get(key))
+    if xval is None:
+        return None
+    lab = _bpw_label(int(xl["actual_bytes"]), n_params)
+    return (int(xl["actual_bytes"]) / (1024 * 1024), float(xval),
+            f"XL {float(xval):{fmt}}, {lab} bpw" if lab is not None else None)
+
+
 def plot_frontier(
     measured: list[dict[str, Any]],
     out_dir: Path,
     *,
     xl: dict[str, Any] | None = None,
-    winner_hash: str | None = None,
+    noise_floor_kld: float | None = None,
+    noise_floor_p99: float | None = None,
+    ppl_base: float | None = None,
+    n_params: int | None = None,
 ) -> list[str]:
-    """Four PNGs: mean / p99 / top1 / ppl vs MiB + predicted overlay."""
-    import matplotlib
+    """Four PNGs: mean / p99 / top1 / ppl vs MiB (measured Tier-1).
 
-    matplotlib.use("Agg")
+    KLD plots use a log y-scale; the KLD pair carries the background
+    noise floor and the perplexity plot the BF16 base as a grey dashed
+    reference. Every dot is labelled with its real bits-per-weight
+    (``actual_bytes * 8 / n_params``) when ``n_params`` is known, placed
+    by adjustText. No DP-predicted overlay, no winner marker — the
+    frontier speaks.
+    """
     import matplotlib.pyplot as plt
 
     pts = sorted(
@@ -228,56 +381,30 @@ def plot_frontier(
     )
     if not pts:
         raise RuntimeError("Nothing measured — no plots to draw.")
-    mib = [int(m["actual_bytes"]) / (1024 * 1024) for m in pts]
+    # (fname, title, key, tier1-level?, log_y, ref_value, ref_label, fmt)
+    # Perplexity and top-1 need 3 sig figs (their action lives in the
+    # 3rd digit); the KLD pair reads cleanly at 2.
     specs = [
-        ("pareto-mean.png", "Mean KLD", "mean_kld", None),
-        ("pareto-p99.png", "99% KLD", "p99_kld", None),
-        ("pareto-top1.png", "Top-1 agreement", "top1_agree", None),
-        ("pareto-ppl.png", "Perplexity", "perplexity", "tier1"),
+        ("pareto-mean.png", "Mean KLD", "mean_kld", False, True,
+         noise_floor_kld, "noise floor (all-Q8 background)", ".2g"),
+        ("pareto-p99.png", "99% KLD", "p99_kld", False, True,
+         noise_floor_p99
+         if noise_floor_p99 is not None else noise_floor_kld,
+         "noise floor (all-Q8 background)", ".2g"),
+        ("pareto-top1.png", "Top-1 agreement", "top1_agree", False, False,
+         None, None, ".3g"),
+        ("pareto-ppl.png", "Perplexity", "perplexity", True, False,
+         ppl_base, "BF16 base", ".3g"),
     ]
     written = []
-    for fname, title, key, where in specs:
-        fig, ax = plt.subplots()
-        if where == "tier1":
-            ys = [m["tier1"].get(key) for m in pts]
-        else:
-            ys = [m["tier1"]["metrics"].get(key) for m in pts]
-        ok = [(x, y) for x, y in zip(mib, ys) if y is not None]
-        if not ok:
-            plt.close(fig)
+    for fname, title, key, tier1_level, log_y, ref_val, ref_label, fmt in specs:
+        items = _chart_points(pts, key, tier1_level, fmt, n_params)
+        if not items:
             continue
-        xs, yv = zip(*ok)
-        ax.plot(xs, yv, "o-", label="measured frontier")
-        # Predicted-mean overlay on the mean plot (additivity audit).
-        if key == "mean_kld":
-            pred = [(int(m["actual_bytes"]) / (1024 * 1024),
-                     m.get("predicted_mean_kld")) for m in pts
-                    if m.get("predicted_mean_kld") is not None]
-            if pred:
-                px, py = zip(*pred)
-                ax.plot(px, py, "x--", label="DP predicted (additive)")
-        if xl and xl.get("actual_bytes") is not None:
-            xval = None
-            if where == "tier1":
-                xval = (xl.get("tier1") or {}).get(key)
-            else:
-                xval = ((xl.get("tier1") or {}).get("metrics") or {}).get(key)
-            if xval is not None:
-                ax.scatter([int(xl["actual_bytes"]) / (1024 * 1024)], [xval],
-                           marker="*", s=200, label="Unsloth XL")
-        if winner_hash:
-            for m in pts:
-                if m.get("hash") == winner_hash:
-                    y0 = (m["tier1"].get(key) if where == "tier1"
-                          else m["tier1"]["metrics"].get(key))
-                    if y0 is not None:
-                        ax.scatter([int(m["actual_bytes"]) / (1024 * 1024)],
-                                   [y0], marker="D", s=120, label="pick")
-        ax.set_xlabel("Size (MiB)")
-        ax.set_ylabel(title)
-        ax.set_title(f"Pareto frontier — {title} vs size (held-out Tier-1)")
-        ax.legend()
-        fig.tight_layout()
+        fig = frontier_figure(
+            items, title=title, ylabel=title, log_y=log_y,
+            ref_value=ref_val, ref_label=ref_label,
+            xl=_chart_xl(xl, key, tier1_level, fmt, n_params))
         dest = out_dir / fname
         fig.savefig(dest, dpi=150)
         plt.close(fig)
@@ -304,6 +431,10 @@ def run_sweep(
     measure_fn=measure_candidate,
     recipe_files: list[Path] | None = None,
     keep_winner: bool = True,
+    noise_floor_kld: float | None = None,
+    noise_floor_p99: float | None = None,
+    ppl_base: float | None = None,
+    n_params: int | None = None,
 ) -> dict[str, Any]:
     """Full sweep. Returns the frontier record (also written to disk).
 
@@ -440,9 +571,23 @@ def run_sweep(
             json.dumps(winner, indent=2) + "\n", encoding="utf-8")
         winner["kept_gguf"] = str(final)
 
+    if ppl_base is None and not dry_run:
+        # Best-effort BF16 reference: the first Tier-1 log that prints it.
+        # Stub measure functions (tests) write no logs — then there is
+        # simply no PPL baseline line.
+        for log in sorted(out_dir.glob("exports/*/llama-perplexity-tier1.log")):
+            try:
+                ppl_base = parse_ppl_base(log.read_text(encoding="utf-8"))
+            except OSError:
+                continue
+            if ppl_base is not None:
+                break
     plots = [] if dry_run else plot_frontier(
         measured, out_dir, xl=xl_rec,
-        winner_hash=(winner or {}).get("hash"),
+        noise_floor_kld=noise_floor_kld,
+        noise_floor_p99=noise_floor_p99,
+        ppl_base=ppl_base,
+        n_params=n_params,
     )
     record = {
         "optimize_dir": str(optimize_dir),
@@ -453,6 +598,10 @@ def run_sweep(
         "xl": xl_rec,
         "winner": winner,
         "plots": plots,
+        "noise_floor_kld": noise_floor_kld,
+        "noise_floor_p99": noise_floor_p99,
+        "ppl_base": ppl_base,
+        "n_params": n_params,
     }
     (out_dir / "frontier.json").write_text(
         json.dumps(record, indent=2) + "\n", encoding="utf-8")
@@ -479,6 +628,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--recipe-file", type=Path, action="append", default=None,
                     help="Measure exactly these recipes (repeatable); "
                     "skips the pareto-dir glob. The step-15 frontier set.")
+    ap.add_argument("--noise-floor-kld", type=float, default=None,
+                    help="Background mean KLD for the grey dashed noise-floor "
+                    "line on the KLD plots (default: no line).")
+
+    ap.add_argument("--ppl-base", type=float, default=None,
+                    help="BF16 base perplexity for the grey dashed line on "
+                    "the PPL plot (default: parsed from Tier-1 logs).")
+    ap.add_argument("--n-params", type=int, default=None,
+                    help="Total model params for per-dot real-bpw labels "
+                    "(default: no bpw labels).")
     ap.add_argument("--drop-winner", action="store_true",
                     help="Delete every export after measuring (export "
                     "deferred — keep plots + frontier.json only).")
@@ -503,6 +662,9 @@ def main(argv: list[str] | None = None) -> int:
         dry_run=args.dry_run,
         recipe_files=args.recipe_file,
         keep_winner=not args.drop_winner,
+        noise_floor_kld=args.noise_floor_kld,
+        ppl_base=args.ppl_base,
+        n_params=args.n_params,
     )
     w = record["winner"] or {}
     print(json.dumps({
