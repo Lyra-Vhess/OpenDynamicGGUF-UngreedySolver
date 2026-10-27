@@ -91,17 +91,19 @@ def solve_mckp(
         prev = V[i - 1]
         cur = V[i]
         ch = choice[i]
-        for b in range(b_bins + 1):
-            best = INF
-            best_j = -1
-            for j, (s, c) in enumerate(zip(sizes, costs)):
-                if s <= b:
-                    v = prev[b - s] + c
-                    if v < best:
-                        best = v
-                        best_j = j
-            cur[b] = best
-            ch[b] = best_j
+        cur[:] = INF
+        ch[:] = -1
+        # Vectorized over budget bins: one shifted-min per candidate.
+        # Candidates processed in order with strict `<`, so ties resolve to
+        # the lowest candidate index — identical to the scalar recurrence.
+        for j, (s, c) in enumerate(zip(sizes, costs)):
+            if s > b_bins:
+                continue
+            vals = prev[: b_bins + 1 - s] + c
+            seg = cur[s:]
+            mask = vals < seg
+            seg[mask] = vals[mask]
+            ch[s:][mask] = j
 
     if not np.isfinite(V[n, b_bins]):
         min_bytes = sum(
