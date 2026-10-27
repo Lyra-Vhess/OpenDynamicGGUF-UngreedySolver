@@ -1,5 +1,17 @@
 # Changes: DP-MCKP optimizer with column generation (`feat/dp-mckp-colgen`)
 
+## Standalone script cleanup (2026-10-27)
+
+- **Removed** `benchmark/compare.py`: it only forwarded to
+  `experiment.main(["compare", ...])`, and `benchmark/run_all.sh` already
+  runs `python -m experiment compare`. The platform doc layout was updated.
+- **Folded** `logit_entropy.py` into `kld.py`: the `--save-all-logits`
+  dump reader and entropy/KL helpers now live with the KLD metric. The
+  diagnostic CLI is preserved as `python -m kld --ref ... [--cand ...]`.
+- **Packaging**: added `llama_probe`, `reband`, and `splice_farm` to
+  `pyproject.toml`'s `py-modules`. Installed packages were missing modules
+  imported by `sensitivity.py` and `cli.py`.
+
 ## Pareto sweep folded into `validate.py` (2026-10-26)
 
 - **Consolidation**: `pareto_sweep.py` is gone. Its recipe parsing,

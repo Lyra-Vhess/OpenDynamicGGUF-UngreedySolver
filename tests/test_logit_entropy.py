@@ -1,10 +1,10 @@
-"""logit_entropy.py: u16 dump parsing, entropy/KL math."""
+"""kld.py: llama.cpp u16 dump parsing, entropy/KL math."""
 import struct
 
 import numpy as np
 import pytest
 
-from logit_entropy import block_stats, read_logit_dump
+from kld import block_stats, read_logit_dump
 
 NV = 257
 

@@ -79,7 +79,6 @@ benchmark/
 ├── run_q6.sh
 ├── run_odg.sh
 ├── run_all.sh
-├── compare.py
 ├── config.json
 └── results/
 ```
