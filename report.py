@@ -288,12 +288,12 @@ def extract_reproducibility(run_root: Path) -> dict[str, Any]:
 
 
 def _find_sweep_record(run_root: Path) -> tuple[dict[str, Any], str, Path] | None:
-    """First sweep frontier.json with measured points + its source caption."""
-    for rel in ("15_validate/frontier/frontier.json",
-                "16_pareto_sweep/frontier.json"):
-        data = _read_json(_steps_dir(Path(run_root)) / rel)
-        if data and data.get("points"):
-            return data, f"steps/{rel}", _steps_dir(Path(run_root)) / rel
+    """Sweep frontier.json with measured points + its source caption."""
+    rel = "15_validate/frontier/frontier.json"
+    path = _steps_dir(Path(run_root)) / rel
+    data = _read_json(path)
+    if data and data.get("points"):
+        return data, f"steps/{rel}", path
     return None
 
 
@@ -517,7 +517,7 @@ def _svg_scatter(
     ``points``: {size_mb, kld, bpw? (real bits-per-weight label), xl?}.
     No winner highlight anywhere — the frontier speaks.
     """
-    from pareto_sweep import frontier_svg
+    from validate import frontier_svg
 
     def _fmt(v: float) -> str:
         return f"{v:.{sig_figs}g}"

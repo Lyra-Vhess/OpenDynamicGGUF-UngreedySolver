@@ -110,7 +110,7 @@ def run_dir(tmp_path):
         },
     )
     _write(
-        root / "steps/16_pareto_sweep/frontier.json",
+        root / "steps/15_validate/frontier/frontier.json",
         {
             "n_measured": 2,
             "n_params": 1500,
@@ -285,13 +285,13 @@ class TestRendering:
                {"baseline_type": "Q8_0",
                 "rows": [{"probe": "Q8_0", "kld_mean": 0.002},
                          {"probe": "Q4_K", "kld_mean": 0.05}]})
-        _write(root / "steps/16_pareto_sweep/frontier.json",
+        _write(root / "steps/15_validate/frontier/frontier.json",
                {"points": [{"actual_bytes": 1000,
                              "tier1": {"metrics": {"mean_kld": 0.02,
                                                    "p99_kld": 0.2,
                                                    "top1_agree": 0.9},
                                        "perplexity": 9.0}}]})
-        logdir = root / "steps/16_pareto_sweep/exports/00-1k"
+        logdir = root / "steps/15_validate/frontier/exports/00-1k"
         logdir.mkdir(parents=True)
         (logdir / "llama-perplexity-tier1.log").write_text(
             "Mean PPL(Q)                   :   9.000000\n"

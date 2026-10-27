@@ -12,8 +12,7 @@ import pytest
 
 matplotlib.use("Agg")
 
-import pareto_sweep
-from pareto_sweep import _bpw_label, parse_ppl_base, plot_frontier
+from validate import _bpw_label, parse_ppl_base, plot_frontier, run_sweep
 
 
 def _measured():
@@ -233,7 +232,7 @@ def test_run_sweep_records_plot_inputs(tmp_path):
         "overrides:\n  \"a\": Q4_K\nestimate:\n  size_bytes: 90\n"
         "  predicted_mean_delta_kld: 0.020000\nvalidation: {}\n")
     (opt / "optimize_manifest.json").write_text(json.dumps({"pareto": []}))
-    rec = pareto_sweep.run_sweep(
+    rec = run_sweep(
         optimize_dir=opt, gguf_in=tmp_path / "f.gguf", imatrix=None,
         heldout_txt=tmp_path / "h.txt", heldout_bin=tmp_path / "h.bin",
         out_dir=tmp_path / "sweep", size_cap=10**12,
@@ -278,7 +277,7 @@ def test_run_sweep_parses_ppl_base_from_logs(tmp_path):
         "overrides:\n  \"a\": Q4_K\nestimate:\n  size_bytes: 90\n"
         "  predicted_mean_delta_kld: 0.020000\nvalidation: {}\n")
     (opt / "optimize_manifest.json").write_text(json.dumps({"pareto": []}))
-    rec = pareto_sweep.run_sweep(
+    rec = run_sweep(
         optimize_dir=opt, gguf_in=tmp_path / "f.gguf", imatrix=None,
         heldout_txt=tmp_path / "h.txt", heldout_bin=tmp_path / "h.bin",
         out_dir=tmp_path / "sweep", size_cap=10**12,

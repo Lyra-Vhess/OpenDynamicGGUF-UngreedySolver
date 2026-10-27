@@ -1,5 +1,22 @@
 # Changes: DP-MCKP optimizer with column generation (`feat/dp-mckp-colgen`)
 
+## Pareto sweep folded into `validate.py` (2026-10-26)
+
+- **Consolidation**: `pareto_sweep.py` is gone. Its recipe parsing,
+  dedupe, export/measure wrappers, plotting, and `run_sweep` now live in
+  `validate.py` under the step-15 section; `cli.py` and `report.py`
+  import from there.
+- **Removed**: the standalone `pareto_sweep.py` CLI (`main()`), the
+  `16_pareto_sweep` output convention, and the report's step-16
+  fallback. `report.py` now reads only
+  `15_validate/frontier/frontier.json`.
+- **Trimmed**: the unused `dry_run` and `ppl_base` inputs to
+  `run_sweep`; the PPL baseline is still parsed from the Tier-1 logs.
+  XL handling and `size_cap` are unchanged.
+- **Tests**: sweep parsing/dedupe/pick coverage folded into
+  `tests/test_frontier_validate.py`; the plot tests import from
+  `validate`.
+
 ## Tier-1 gates loosened to v2 (2026-10-21)
 
 - **Change** (`validate.py: _tier1_llama`): mean KLD ≤ 0.05 → **0.10**,

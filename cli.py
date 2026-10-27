@@ -3678,7 +3678,7 @@ def _validate_frontier(
     keep_winner=False every GGUF is deleted after measuring (export
     deferred — plots + frontier.json stay).
     """
-    from pareto_sweep import run_sweep
+    from validate import run_sweep
 
     opt_dir = store.step_path(meta.run_id, "optimize")
     manifest = optimize_manifest or {}
