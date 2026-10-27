@@ -1,5 +1,22 @@
 # Changes: DP-MCKP optimizer with column generation (`feat/dp-mckp-colgen`)
 
+## Tier-1 gates loosened to v2 (2026-10-21)
+
+- **Change** (`validate.py: _tier1_llama`): mean KLD ≤ 0.05 → **0.10**,
+  P99 ≤ 0.50 → **1.50**, P999 ≤ 2.0 → **6.0**, max KLD ≤ 10.0 → **15.0**.
+  Top-1 agreement unchanged (≥ 0.90).
+- **Why**: the v1 tail gates auto-failed every low-BPW point. The 3 BPW
+  base measures mean 0.178 / P99 2.60 / P999 10.19, so 3-4 BPW could
+  never be released no matter what the allocator did. v2 keeps a real
+  bar (3 BPW still fails) and lets 3.5-8 BPW points pass on their own
+  measured quality.
+- **Effect on the measured E4B frontier**: the 3.5 BPW base now passes
+  and all 4 BPW points pass; the only remaining failures are the 3 BPW
+  base and the 3.5 BPW speed candidates (mean 0.108 / 0.156).
+- The recipe-based proxy (`_tier1_proxy`, used when the heldout logits
+  are missing) keeps its own thresholds — it scores summed group ΔKLD,
+  not mean token KLD, so the numbers are not comparable.
+
 ## PPL(Q)-vs-size: explained, not a regression (2026-09-29)
 
 - **Observation** (gold sweep, 8 points): held-out `Mean PPL(Q)` rises

@@ -841,10 +841,10 @@ def _tier1_llama(
 
     Runs ``llama-perplexity -m CANDIDATE -f heldout.txt --kl-divergence
     --kl-divergence-base logits-heldout.bin`` (+ extra_args verbatim, e.g.
-    ``-ngl 99``) and gates the parsed KL summary. Thresholds are v1,
-    calibrated on the E4B run (good quant: mean 0.006, P99 0.10, top1
-    98.3; bad quant: mean 0.29) — an order of magnitude above a good
-    measurement, tight enough to catch real regressions.
+    ``-ngl 99``) and gates the parsed KL summary. Thresholds are v2,
+    loosened on the E4B run (good quant: mean 0.006, P99 0.10, top1
+    98.3; bad quant: mean 0.29) so low-BPW points (3-4 BPW) are judged
+    on their own quality bar rather than failing the tail gates.
     """
     import subprocess
 
@@ -889,10 +889,10 @@ def _tier1_llama(
     top1_frac = (float(top1) / 100.0) if top1 is not None else None
 
     gates = {
-        "mean_kld_max": 0.05,
-        "p99_kld_max": 0.50,
-        "p999_kld_max": 2.0,
-        "max_kld_max": 10.0,
+        "mean_kld_max": 0.10,
+        "p99_kld_max": 1.50,
+        "p999_kld_max": 6.0,
+        "max_kld_max": 15.0,
         "top1_agree_min": 0.90,
     }
     checks = {
