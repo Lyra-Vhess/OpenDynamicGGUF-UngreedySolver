@@ -87,7 +87,7 @@ benchmark/
 
 ## Done when
 
-- [x] Old single-GGUF `odg benchmark` / `benchmark.py` removed
+- [x] Old single-GGUF `odg benchmark` command removed; `benchmark.py` remains the HF-free local evaluator
 - [x] `./benchmark/run_all.sh` produces `results/comparison.md`
 - [x] BF16, Q4_K_M, Q5_K_M, Q6_K, ODG share one eval command except `model_args`
 - [x] Size / bytes-per-parameter sit next to quality

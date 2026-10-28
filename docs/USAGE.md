@@ -289,10 +289,13 @@ estimate:
   size_bytes: 226696704
   size_mb: 216.19
   predicted_mean_delta_kld: 0.120092
-  method: greedy_knapsack_v1
+  method: dp_mckp_colgen_v1
 ```
 
-`recipe.tt` is the same assignment rendered for `llama-quantize --tensor-type-file`.
+Current DP recipes also record `optimizer`, `totals`, `certificate`, and
+`guardrail` blocks; the sketch above shows the fields shared with legacy
+recipes. `recipe.tt` is the same assignment rendered for
+`llama-quantize --tensor-type-file`.
 
 ---
 

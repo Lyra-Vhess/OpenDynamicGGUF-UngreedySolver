@@ -85,11 +85,11 @@ users share (and feature 06 uploads to HF alongside the GGUF).
 
 ## Done when
 
-- [ ] `odg report` on an existing run emits one self-contained `report.html`
-- [ ] Works with a partial run (e.g. stopped at step 12) — sections degrade, never crash
-- [ ] All six core visualizations render from real run data
-- [ ] Every section captions its source artifact + hash
-- [ ] File opens correctly offline from `file://`
+- [x] `odg report` on an existing run emits one self-contained `report.html`
+- [x] Works with a partial run (e.g. stopped at step 12) — sections degrade, never crash
+- [x] All six core visualizations render from real run data
+- [ ] Every section captions its source artifact + hash — source paths are captioned; per-section hashes are pending
+- [x] File opens correctly offline from `file://`
 
 ## Next
 

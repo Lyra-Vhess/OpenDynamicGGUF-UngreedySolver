@@ -35,7 +35,7 @@
 Give OpenDynamicGGUF any model reference — a Hugging Face repo, an Ollama tag like `functiongemma:latest`, an MLX repo like `gemma4:e2b-mlx`, or a local checkpoint — and it traces it back to the original full-precision weights, measures how sensitive each tensor group is to quantization, and searches for the bit assignment that costs the least quality per byte saved.
 
 ```bash
-odg quantize --model functiongemma:latest --target-size 3.2GB
+odg run --model functiongemma:latest --budget-mb 3200
 
   → functiongemma-UD.gguf     # the dynamic-quantized model
   → recipe.yaml               # fully reproducible quantization recipe
@@ -199,7 +199,7 @@ Useful flags:
 
 ## Project status
 
-The pipeline is split into 16 small steps, each with its own design doc. Start at **[`docs/steps/README.md`](docs/steps/README.md)**.
+The pipeline is split into 16 numbered stages (00–15), plus 11b (imatrix re-banding); each stage has a design doc. Start at **[`docs/steps/README.md`](docs/steps/README.md)**.
 
 | # | Step | Doc | CLI | State |
 |---|---|---|---|---|
@@ -215,7 +215,7 @@ The pipeline is split into 16 small steps, each with its own design doc. Start a
 | 09 | Freeze BF16 GGUF | [doc](docs/steps/09-freeze-bf16-gguf.md) | `odg freeze-gguf` | ✅ Implemented (promote; HF convert optional) |
 | 10 | Build imatrix | [doc](docs/steps/10-build-imatrix.md) | `odg imatrix` | ✅ Implemented (proxy; llama-imatrix optional) |
 | 11 | Cache reference logits | [doc](docs/steps/11-cache-reference-logits.md) | `odg reference-logits` | ✅ Implemented (proxy; llama-perplexity optional) |
-| 11b | Imatrix re-banding | — | `odg reband` | ✅ Implemented (Fisher-Jenks bands; runs in `odg run` after imatrix) |
+| 11b | Imatrix re-banding | [doc](docs/steps/11b-imatrix-rebanding.md) | `odg reband` | ✅ Implemented (Fisher-Jenks bands; runs in `odg run` after imatrix) |
 | 12 | Sensitivity probe | [doc](docs/steps/12-sensitivity-probe.md) | `odg sensitivity` | ✅ Implemented (proxy table; llama probes TBD) |
 | 13 | Optimize recipe | [doc](docs/steps/13-optimize-recipe.md) | `odg optimize` | ✅ Implemented (dp_mckp + greedy + Pareto) |
 | 14 | Export GGUF | [doc](docs/steps/14-export-gguf.md) | `odg export` | ✅ Implemented (dry-run; llama-quantize optional) |
@@ -712,13 +712,9 @@ If the Q3 probe returns ΔKLD ≈ 0.003 → keep Q3. If it returns ΔKLD ≈ 0.1
 
 ### Stage 7 — Recipe optimizer
 
-Bit assignment under a byte budget is (approximately) a **knapsack problem**:
+Bit assignment under a byte budget is a **multiple-choice knapsack problem**. The default optimizer (`--optimizer dp_mckp`) solves it exactly by dynamic programming over the probed cost matrix, with an automatic P99 guardrail and a termination certificate. A legacy greedy optimizer is kept only as an A/B baseline (`--optimizer greedy`); it is not the default and has no separate refinement phase.
 
-1. **Greedy phase** — repeatedly downgrade the group with the best ratio of *bytes saved per unit of KLD incurred* until the size/VRAM budget is met. Per-group effects are roughly additive, so greedy gets ~90% of the way.
-2. **Refinement phase** — short local search (single-group swaps, ±1 quant level) with *joint* measurement: quantize the full candidate and measure real KLD, correcting for interaction effects the additivity assumption misses.
-3. **Output** — not one config, but the top few candidates along the **size ↔ quality Pareto frontier**.
-
-v1 deliberately skips Bayesian optimization and evolutionary search: each objective evaluation costs a quantize + eval pass, and the published evidence says greedy-plus-refinement captures what matters. Fancier search is a later experiment, not a prerequisite.
+The output is not one config but the top few candidates along the **size ↔ quality Pareto frontier**.
 
 **Failure prevented:** a single opaque config. Emitting the whole frontier lets the user pick the trade-off and keeps every choice auditable.
 
@@ -875,7 +871,7 @@ validation:
   tier3: { mmlu_paired_delta: -0.2, ci95: [-0.9, 0.5], pass: true }
 ```
 
-`odg build recipe.yaml` reproduces the GGUF bit-for-bit from the same inputs.
+`odg export --model <model> --recipe recipe.yaml` reproduces the GGUF bit-for-bit from the same inputs.
 
 ---
 
@@ -902,12 +898,26 @@ OpenDynamicGGUF/
 ├── activation_features.py  # 08 · activation stats (forward or proxy)
 ├── freeze.py               # 09 · freeze reference GGUF
 ├── imatrix.py              # 10 · importance matrix
+├── reband.py               # 11b · imatrix-guided depth re-banding
 ├── logits.py               # 11 · reference logits cache
+├── kld.py                  # KL log parsing + logit dump/entropy diagnostic
+├── dp_mckp.py              # exact MCKP dynamic-programming solver
+├── colgen.py               # column-generation pricing
+├── llama_probe.py          # llama.cpp probe backend
+├── splice_farm.py          # farm-based trial assembly
 ├── sensitivity.py          # 12 · ΔKLD / Δbytes probes
 ├── optimizer.py            # 13 · mixed-precision recipe
 ├── export.py               # 14 · export candidate GGUF
-├── validate.py             # 15 · gates + report card
-├── docs/steps/             # design docs (00–15)
+├── validate.py             # 15 · gates + report card + frontier sweep
+├── hardware.py             # odg fit hardware profiles / budget derivation
+├── experiment.py           # odg experiment (lm-eval comparison)
+├── report.py               # odg report (self-contained HTML)
+├── evaluation/             # HF-free local evaluator (original test splits)
+├── benchmark/              # experiment scripts + results
+├── benchmarks/             # original benchmark datasets
+├── docs/steps/             # design docs (00–15, plus 11b)
+├── docs/platform/          # platform feature design docs
+├── tests/
 ├── artifacts/              # run store (git-ignored)
 ├── LICENSE
 └── pyproject.toml
@@ -925,9 +935,9 @@ Three shippable milestones — each independently useful before the next exists:
 |---|---|---|
 | **M1** | Resolver + catalog + corpus + features + llama.cpp runners + Tier-1 KLD harness | Inspect any model's tensor map; audit existing GGUFs |
 | **M2** | Freeze BF16 + imatrix + sensitivity prober | Publish ΔKLD/Δbytes tables for any model |
-| **M3** | Optimizer + full gate loop | End-to-end `odg quantize` → GGUF + recipe + report |
+| **M3** | Optimizer + full gate loop | End-to-end `odg run` → GGUF + recipe + report |
 
-**Today:** steps 00–08 ship under M1 (features + corpus). Remaining M1 work is llama.cpp runners + the Tier-1 KLD harness.
+**Today:** the core pipeline (steps 00–15, plus 11b) and platform features 01–03 are implemented. The remaining platform features under `docs/platform/` are design docs for future work.
 
 Later experiments (explicitly *not* v1): smarter search (Bayesian / evolutionary), per-expert bit allocation from usage counts, KV-cache quantization sensitivity, attention-head and neuron-level importance, LLM-in-the-loop failure analysis suggesting recipe changes.
 
@@ -959,7 +969,7 @@ For a 2–8B model on a single decent workstation (e.g. 24 GB GPU, or Apple Sili
 | imatrix + reference logits | tens of minutes (one-time per model/corpus) |
 | One probe (quantize + Tier-1 eval) | ~5–15 minutes |
 | Full ~25-group probe sweep | overnight, embarrassingly parallel |
-| Greedy + refinement (~10 joint evals) | a few hours |
+| DP-MCKP optimizer | seconds (after probes) |
 | Tier 3 benchmarks (final candidates) | hours |
 
 Nothing here needs a cluster. For 70B+ or large MoE models the same pipeline applies — the probe sweep just wants a bigger box or more patience. Catalog construction may need CPU/disk offload or sharding for very large models.
@@ -982,7 +992,7 @@ Nothing here needs a cluster. For 70B+ or large MoE models the same pipeline app
 
 ## Contributing
 
-Contributions are very welcome — especially on the unimplemented steps (09–15), additional model families in the resolver, and role taxonomies for new architectures.
+Contributions are very welcome — especially additional model families in the resolver, role taxonomies for new architectures, and the unimplemented platform features in `docs/platform/` (04–15).
 
 1. Read [`docs/steps/README.md`](docs/steps/README.md) and the doc for the step you want to touch. Each step doc states its goal, inputs/outputs, and a "done when" checklist.
 2. Keep the contract of a step intact: inputs and outputs are JSON artifacts in the run store, so steps stay independently runnable and resumable.

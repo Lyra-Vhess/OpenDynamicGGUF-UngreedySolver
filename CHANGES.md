@@ -1,5 +1,23 @@
 # Changes: DP-MCKP optimizer with column generation (`feat/dp-mckp-colgen`)
 
+## Documentation truth pass (2026-10-28)
+
+- **README:** replaced nonexistent `odg quantize` / `odg build` commands with
+  `odg run` / `odg export`, corrected the implemented-step and roadmap claims,
+  described DP-MCKP as the default optimizer (greedy is legacy A/B), updated
+  the repository layout, and linked the new step-11b doc.
+- **Step docs:** added `docs/steps/11b-imatrix-rebanding.md` and indexed it;
+  fixed the step-13 code fence; updated the step-00 step count, the step-01
+  example, and the step-13 optimizer summary.
+- **Platform docs:** marked the feature-01/03 "done when" criteria that are
+  actually verified, documented the two still-pending checks, and corrected
+  the false claim that `benchmark.py` was removed.
+- **Architecture:** updated the tracked `ARCHITECTURE.md` status note and
+  step counts; it was already tracked and unignored, so no `.gitignore`
+  change was needed.
+- **Local-only notes:** updated `Spec.md` and `TESTING.md` for the current test
+  count, module map, dependency list, flag threading, and 256 KiB DP bins.
+
 ## Standalone script cleanup (2026-10-27)
 
 - **Removed** `benchmark/compare.py`: it only forwarded to

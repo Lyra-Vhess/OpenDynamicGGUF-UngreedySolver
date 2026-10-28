@@ -84,8 +84,6 @@ writes it as `pareto/frontier-bpw-<bpw>.yaml`; duplicate hashes fold
 onto one file, points above the frontier top stay unfilled. These are
 the user-selectable recipe set step 15 measures (`--frontier`) and
 step 14 exports (`--recipe`).
-  log.txt
-```
 
 ---
 

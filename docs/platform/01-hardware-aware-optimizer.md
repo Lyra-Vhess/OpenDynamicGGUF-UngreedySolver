@@ -111,11 +111,11 @@ Each step is a small PR, independently mergeable.
 
 ## Done when
 
-- [ ] `odg fit --model X --gpu 12GB` runs the full pipeline with a correct derived budget
-- [ ] KV-cache math validated against a real llama.cpp run (within 5%)
-- [ ] Named profiles resolve (`--device rtx-3060`), unknown ids fail with the list
-- [ ] The printed plan shows every subtraction, so the budget is auditable
-- [ ] Ad-hoc, named, and detected profiles all produce an `odg/hardware/v1` artifact stored
+- [x] `odg fit --model X --gpu 12GB` runs the full pipeline with a correct derived budget
+- [ ] KV-cache math validated against a real llama.cpp run (within 5%) — formula is unit-tested; real-run cross-check still pending
+- [x] Named profiles resolve (`--device rtx-3060`), unknown ids fail with the list
+- [x] The printed plan shows every subtraction, so the budget is auditable
+- [x] Ad-hoc, named, and detected profiles all produce an `odg/hardware/v1` artifact stored
       in the run (needed later by reports and model cards)
 
 ## Next

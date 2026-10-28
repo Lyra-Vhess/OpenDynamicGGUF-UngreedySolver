@@ -40,7 +40,7 @@ artifacts/
 # Step 01 — creates/resumes a run and checkpoints resolve
 odg resolve --model functiongemma:latest
 
-# Show board of all 15 steps for the current run
+# Show board of all 16 checkpointed steps (01–15, plus 11b) for the current run
 odg status --model functiongemma:latest
 
 # List runs

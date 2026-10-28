@@ -75,7 +75,7 @@ Write architecture descriptor
 ## Example
 
 ```text
-User:  odg quantize --model functiongemma:latest --target-size 3.2GB
+User:  odg run --model functiongemma:latest --budget-mb 3200
 
 Resolver:
   1. Detect Ollama-style tag

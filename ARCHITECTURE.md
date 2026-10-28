@@ -2,9 +2,14 @@
 
 **From a quantization tool to an open optimization platform for local LLM deployment.**
 
-This document describes the target architecture that grows the existing 15-step pipeline
-(`resolve` → `validate`) into a full platform. The per-feature breakdowns — each feature split
-into small, shippable steps — live in [`docs/platform/`](docs/platform/README.md).
+This document describes the target architecture that grows the existing pipeline
+(`resolve` → `validate`, steps 01–15 plus 11b) into a full platform. The per-feature
+breakdowns — each feature split into small, shippable steps — live in
+[`docs/platform/`](docs/platform/README.md).
+
+**Current status:** the core pipeline (steps 01–15, plus 11b) and platform features
+01–03 are implemented. Modules and commands listed for later phases are target
+architecture, not current code.
 
 The existing pipeline docs are unchanged and remain the core: [`docs/steps/`](docs/steps/README.md).
 
@@ -42,7 +47,7 @@ GGUF                           Analyze     (catalog, features, sensitivity)
                                Publish     (reports, model cards, HF, leaderboard)
 ```
 
-Everything already built (steps 01–15) becomes the **engine** of this platform. Nothing is
+Everything already built (steps 01–15, plus 11b) becomes the **engine** of this platform. Nothing is
 thrown away; new layers are wrapped around it.
 
 ---
@@ -64,7 +69,7 @@ thrown away; new layers are wrapped around it.
 │  Hardware profiles  ·  Multi-objective optimizer  ·  Recipe search   │
 │  (AutoML)  ·  Calibration dataset builder                            │
 ├─────────────────────────────────────────────────────────────────────┤
-│  CORE ENGINE (exists today — steps 01–15)                            │
+│  CORE ENGINE (exists today — steps 01–15, plus 11b)                  │
 │  resolve · load · enumerate · classify · catalog · features ·        │
 │  corpus · freeze · imatrix · logits · sensitivity · optimize ·       │
 │  export · validate  — checkpointed run store (store.py / steps.py)   │
@@ -94,7 +99,7 @@ subsystem has several files:
 
 ```text
 OpenDynamicGGUF/
-├── (existing 15-step modules …)
+├── (existing pipeline modules …)
 │
 │  DECISION LAYER
 ├── hardware.py             # hardware profile DB + detection (--gpu/--ram/--device)

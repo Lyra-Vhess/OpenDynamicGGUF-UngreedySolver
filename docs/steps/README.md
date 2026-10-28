@@ -29,6 +29,7 @@ Each step file answers the same questions:
 08 Compute activation features ────► (needs calib text)
 09 Freeze BF16 GGUF
 10 Build imatrix
+11b Imatrix re-banding ───────────► measured depth bands
 11 Cache reference logits
 12 Sensitivity probe ──────────────► ΔKLD / Δbytes table
 13 Optimize recipe ────────────────► bit assignment under budget
@@ -54,8 +55,9 @@ Each step file answers the same questions:
 | 09 | Freeze BF16 GGUF | [09-freeze-bf16-gguf.md](./09-freeze-bf16-gguf.md) | `odg freeze-gguf` — hashed ref (BF16 or promote) |
 | 10 | Build imatrix | [10-build-imatrix.md](./10-build-imatrix.md) | `odg imatrix` — llama-imatrix or proxy |
 | 11 | Reference logits | [11-cache-reference-logits.md](./11-cache-reference-logits.md) | `odg reference-logits` — KL base caches |
+| 11b | Imatrix re-banding | [11b-imatrix-rebanding.md](./11b-imatrix-rebanding.md) | `odg reband` — Fisher-Jenks depth bands |
 | 12 | Sensitivity probe | [12-sensitivity-probe.md](./12-sensitivity-probe.md) | `odg sensitivity` — Δbytes/ΔKLD table |
-| 13 | Optimize recipe | [13-optimize-recipe.md](./13-optimize-recipe.md) | `odg optimize` — greedy knapsack → recipe.yaml |
+| 13 | Optimize recipe | [13-optimize-recipe.md](./13-optimize-recipe.md) | `odg optimize` — DP-MCKP knapsack → recipe.yaml |
 | 14 | Export GGUF | [14-export-gguf.md](./14-export-gguf.md) | `odg export` — llama-quantize or dry-run |
 | 15 | Validate & release | [15-validate-and-release.md](./15-validate-and-release.md) | `odg validate` — gates + report/release |
 
