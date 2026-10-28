@@ -1,5 +1,13 @@
 # Changes: DP-MCKP optimizer with column generation (`feat/dp-mckp-colgen`)
 
+## Code hygiene (2026-10-28)
+
+- **Imports:** removed duplicate `typing` / `dataclasses` imports in
+  `validate.py`, `sensitivity.py`, and `resolve.py`.
+- **Tests:** renamed `tests/test_logit_entropy.py` to `tests/test_kld.py`.
+- **Help text:** corrected the stale `odg optimize` description in `cli.py`;
+  no CLI restructuring.
+
 ## Documentation truth pass (2026-10-28)
 
 - **README:** replaced nonexistent `odg quantize` / `odg build` commands with

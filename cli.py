@@ -395,7 +395,7 @@ def main(argv: list[str] | None = None) -> int:
     # --- optimize (step 13) ---
     p_opt = sub.add_parser(
         "optimize",
-        help="Step 13: greedy recipe under size budget → recipe.yaml",
+        help="Step 13: DP-MCKP recipe under size budget → recipe.yaml",
     )
     p_opt.add_argument("--model", "-m", default=None)
     p_opt.add_argument("--run", default=None)
