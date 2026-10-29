@@ -1,9 +1,12 @@
 """Same-model experiment: pinned config, metric extraction, comparison table."""
 
 import json
+import os
+import time
 
 import pytest
 
+import freeze
 from experiment import (
     TASKS,
     VARIANTS,
@@ -196,3 +199,143 @@ def test_unknown_variant_rejected(tmp_path):
 
 def test_variants_cover_the_claimed_baselines():
     assert VARIANTS == ("bf16", "q4_k_m", "q5_k_m", "q6_k", "odg")
+
+
+# --- llama.cpp converter cache (offline: fake git on PATH) ---
+
+FAKE_GIT = """#!/usr/bin/env python3
+import os, pathlib, sys
+
+args = sys.argv[1:]
+if log := os.environ.get("FAKE_GIT_LOG"):
+    with open(log, "a", encoding="utf-8") as fh:
+        fh.write(" ".join(args) + "\\n")
+if os.environ.get("FAKE_GIT_FAIL"):
+    sys.exit(1)
+if args[:1] == ["ls-remote"]:
+    sys.stdout.write(os.environ.get("FAKE_GIT_TAGS", ""))
+elif args[:1] == ["clone"]:
+    dest = pathlib.Path(args[-1])
+    (dest / ".git").mkdir(parents=True, exist_ok=True)
+    (dest / "convert_hf_to_gguf.py").write_text("# fake\\n")
+    (dest / "conversion").mkdir(exist_ok=True)
+    (dest / "conversion" / "__init__.py").write_text("")
+    (dest / "gguf-py" / "gguf").mkdir(parents=True, exist_ok=True)
+    (dest / "gguf-py" / "gguf" / "__init__.py").write_text("")
+elif "-C" in args and "rev-parse" in args:
+    print(os.environ.get("FAKE_GIT_SHA", "a" * 40))
+sys.exit(0)
+"""
+
+
+def _wire_git(monkeypatch, tmp_path, *, tags=(), sha="a" * 40, fail=False):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    exe = bindir / "git"
+    exe.write_text(FAKE_GIT, encoding="utf-8")
+    exe.chmod(0o755)
+    log = tmp_path / "git.log"
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.delenv("LLAMA_CPP_DIR", raising=False)
+    monkeypatch.delenv("LLAMA_CPP", raising=False)
+    monkeypatch.setenv("FAKE_GIT_LOG", str(log))
+    monkeypatch.setenv("FAKE_GIT_TAGS", "".join(f"0\trefs/tags/{t}\n" for t in tags))
+    monkeypatch.setenv("FAKE_GIT_SHA", sha)
+    monkeypatch.setenv("FAKE_GIT_FAIL", "1" if fail else "")
+    return log
+
+
+def _seed_cache(tmp_path, *, tag="v0.8.0", sha="a" * 40, checked_at=None):
+    tree = tmp_path / "cache" / "odg" / "llama.cpp" / sha
+    (tree / "conversion").mkdir(parents=True)
+    (tree / "gguf-py" / "gguf").mkdir(parents=True)
+    (tree / "convert_hf_to_gguf.py").write_text("# fake\n", encoding="utf-8")
+    (tree / "meta.json").write_text(json.dumps({"tag": tag, "sha": sha}), encoding="utf-8")
+    state = tmp_path / "cache" / "odg" / "llama.cpp" / "state.json"
+    state.write_text(
+        json.dumps(
+            {
+                "tag": tag,
+                "sha": sha,
+                "checked_at": time.time() if checked_at is None else checked_at,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return tree / "convert_hf_to_gguf.py"
+
+
+def _log_text(log):
+    return log.read_text(encoding="utf-8") if log.exists() else ""
+
+
+def test_latest_stable_tag_uses_numeric_order(monkeypatch, tmp_path):
+    _wire_git(
+        monkeypatch,
+        tmp_path,
+        tags=("v0.9.9", "v0.10.0", "v0.10.0-rc1", "b11976", "v0.8.0"),
+    )
+    assert freeze._latest_stable_tag() == "v0.10.0"
+
+
+def test_converter_cache_hit_never_shells_out(monkeypatch, tmp_path):
+    script = _seed_cache(tmp_path)
+    log = _wire_git(monkeypatch, tmp_path, tags=("v0.8.0",))
+    assert freeze.find_convert_script() == script
+    assert _log_text(log) == ""
+
+
+def test_converter_rechecks_within_ttl_but_reuses_tree(monkeypatch, tmp_path):
+    script = _seed_cache(tmp_path, checked_at=0)
+    log = _wire_git(monkeypatch, tmp_path, tags=("v0.8.0",))
+    assert freeze.find_convert_script() == script
+    text = _log_text(log)
+    assert "ls-remote" in text and "clone" not in text
+
+
+def test_converter_fetches_new_stable_tag(monkeypatch, tmp_path):
+    _seed_cache(tmp_path, checked_at=0)
+    new_sha = "b" * 40
+    log = _wire_git(monkeypatch, tmp_path, tags=("v0.8.0", "v0.9.0"), sha=new_sha)
+    found = freeze.find_convert_script()
+    assert found == tmp_path / "cache" / "odg" / "llama.cpp" / new_sha / "convert_hf_to_gguf.py"
+    assert found.is_file()
+    assert "clone" in _log_text(log)
+    state = json.loads(
+        (tmp_path / "cache" / "odg" / "llama.cpp" / "state.json").read_text(encoding="utf-8")
+    )
+    assert state["tag"] == "v0.9.0" and state["sha"] == new_sha
+
+
+def test_converter_offline_falls_back_to_cached_tree(monkeypatch, tmp_path):
+    script = _seed_cache(tmp_path, checked_at=0)
+    _wire_git(monkeypatch, tmp_path, fail=True)
+    assert freeze.find_convert_script() == script
+
+
+def test_converter_offline_with_empty_cache_returns_none(monkeypatch, tmp_path):
+    _wire_git(monkeypatch, tmp_path, fail=True)
+    assert freeze.find_convert_script() is None
+
+
+def test_local_checkout_beats_cache(monkeypatch, tmp_path):
+    script = _seed_cache(tmp_path)
+    local = tmp_path / "home" / "llama.cpp"
+    local.mkdir(parents=True)
+    (local / "convert_hf_to_gguf.py").write_text("# local\n", encoding="utf-8")
+    log = _wire_git(monkeypatch, tmp_path, tags=("v0.8.0",))
+    assert freeze.find_convert_script() == local / "convert_hf_to_gguf.py"
+    assert _log_text(log) == ""
+
+
+def test_llama_cpp_dir_beats_cache(monkeypatch, tmp_path):
+    _seed_cache(tmp_path)
+    other = tmp_path / "checkout"
+    other.mkdir()
+    (other / "convert_hf_to_gguf.py").write_text("# env\n", encoding="utf-8")
+    log = _wire_git(monkeypatch, tmp_path, tags=("v0.8.0",))
+    monkeypatch.setenv("LLAMA_CPP_DIR", str(other))
+    assert freeze.find_convert_script() == other / "convert_hf_to_gguf.py"
+    assert _log_text(log) == ""

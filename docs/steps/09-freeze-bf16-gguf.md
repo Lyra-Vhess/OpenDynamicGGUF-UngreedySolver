@@ -36,6 +36,10 @@ Requires Step 08 done.
 | `hf-convert` | Fail unless `convert_hf_to_gguf.py` + HF dir work |
 | `promote` | Always hardlink/symlink/copy the resolve/load GGUF |
 
+`hf-convert` uses `LLAMA_CPP_DIR` / `~/llama.cpp` when present. Otherwise it fetches the converter for the
+latest stable llama.cpp release into `~/.cache/odg/llama.cpp/<sha>/` (checked at most once a day, works
+offline once cached).
+
 ---
 
 ## Outputs

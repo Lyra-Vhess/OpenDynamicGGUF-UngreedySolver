@@ -5,9 +5,13 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 import hashlib
+import json
 import os
+import re
 import shutil
 import subprocess
+import tempfile
+import time
 from pathlib import Path
 from typing import Any, Literal
 from gguf_tensors import gguf_tensor_map
@@ -47,6 +51,144 @@ def _sha256_file(path: Path, *, chunk: int = 1024 * 1024) -> str:
     return h.hexdigest()
 
 
+_LLAMA_CPP_REPO = "https://github.com/ggml-org/llama.cpp"
+_CONVERTER_TTL = 24 * 60 * 60
+_CONVERTER_SPARSE_PATHS = (
+    "/convert_hf_to_gguf.py",
+    "/conversion/",
+    "/gguf-py/gguf/",
+)
+_STABLE_TAG = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
+
+
+def _converter_cache_dir() -> Path:
+    root = os.environ.get("XDG_CACHE_HOME")
+    base = Path(root).expanduser() if root else Path.home() / ".cache"
+    return base / "odg" / "llama.cpp"
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _git(*args: str, timeout: int) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args], capture_output=True, text=True, timeout=timeout
+    )
+
+
+def _latest_stable_tag(repo: str = _LLAMA_CPP_REPO) -> str | None:
+    """Highest vMAJOR.MINOR.PATCH tag (llama.cpp releases, not bNNNNN nightlies)."""
+    proc = _git("ls-remote", "--tags", "--refs", repo, "refs/tags/v*", timeout=20)
+    if proc.returncode != 0:
+        return None
+    best: tuple[int, int, int] | None = None
+    tag: str | None = None
+    for line in proc.stdout.splitlines():
+        name = line.partition("\t")[2].strip().removeprefix("refs/tags/")
+        match = _STABLE_TAG.match(name)
+        if not match:
+            continue
+        key = tuple(int(part) for part in match.groups())
+        if best is None or key > best:
+            best, tag = key, name
+    return tag
+
+
+def _converter_tree(path: Path | None) -> Path | None:
+    return path if path and (path / "convert_hf_to_gguf.py").is_file() else None
+
+
+def _newest_cached_converter(cache: Path) -> Path | None:
+    if not cache.is_dir():
+        return None
+    trees = [tree for path in cache.glob("*") if (tree := _converter_tree(path))]
+    return max(trees, key=lambda p: p.stat().st_mtime, default=None)
+
+
+def _fetch_converter(tag: str, cache: Path) -> Path | None:
+    """Shallow, blob-filtered clone of one tag with only the converter paths checked out."""
+    cache.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix=".fetch-", dir=cache))
+    try:
+        steps = [
+            (
+                "clone", "-q", "--depth", "1", "--filter=blob:none",
+                "--no-checkout", "--branch", tag, _LLAMA_CPP_REPO, str(tmp),
+            ),
+            ("-C", str(tmp), "sparse-checkout", "set", "--no-cone", *_CONVERTER_SPARSE_PATHS),
+            ("-C", str(tmp), "checkout", "-q", tag),
+        ]
+        for args in steps:
+            if _git(*args, timeout=120).returncode != 0:
+                return None
+        sha = _git("-C", str(tmp), "rev-parse", "HEAD", timeout=20).stdout.strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", sha):
+            return None
+        shutil.rmtree(tmp / ".git", ignore_errors=True)
+        _write_json(tmp / "meta.json", {"repo": _LLAMA_CPP_REPO, "tag": tag, "sha": sha})
+        dest = cache / sha
+        if dest.exists():
+            shutil.rmtree(tmp, ignore_errors=True)
+        else:
+            os.replace(tmp, dest)
+        _write_json(cache / "state.json", {"tag": tag, "sha": sha, "checked_at": time.time()})
+        older = sorted(
+            (tree for path in cache.glob("*") if (tree := _converter_tree(path))),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for stale in older[3:]:
+            shutil.rmtree(stale, ignore_errors=True)
+        return dest
+    except (OSError, subprocess.SubprocessError):
+        return None
+    finally:
+        if tmp.exists():
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _cached_converter() -> Path | None:
+    """Latest stable llama.cpp converter, fetched on miss or after the TTL expires."""
+    cache = _converter_cache_dir()
+    state = _read_json(cache / "state.json")
+    sha = state.get("sha")
+    current = _converter_tree(cache / sha) if isinstance(sha, str) and sha else None
+    try:
+        age = time.time() - float(state.get("checked_at"))
+    except (TypeError, ValueError):
+        age = float("inf")
+    if current and age < _CONVERTER_TTL:
+        return current / "convert_hf_to_gguf.py"
+
+    try:
+        tag = _latest_stable_tag()
+    except (OSError, subprocess.SubprocessError):
+        tag = None
+
+    if tag is None:
+        fallback = current or _newest_cached_converter(cache)
+        return (fallback / "convert_hf_to_gguf.py") if fallback else None
+    if tag == state.get("tag") and current:
+        _write_json(cache / "state.json", {**state, "checked_at": time.time()})
+        return current / "convert_hf_to_gguf.py"
+
+    fetched = _fetch_converter(tag, cache)
+    fallback = fetched or current or _newest_cached_converter(cache)
+    return (fallback / "convert_hf_to_gguf.py") if fallback else None
+
+
 def find_convert_script(explicit: str | Path | None = None) -> Path | None:
     if explicit:
         p = Path(explicit).expanduser()
@@ -63,12 +205,15 @@ def find_convert_script(explicit: str | Path | None = None) -> Path | None:
     candidates += [
         home / "llama.cpp" / "convert_hf_to_gguf.py",
         home / "src" / "llama.cpp" / "convert_hf_to_gguf.py",
-        Path("/opt/homebrew/share/llama.cpp/convert_hf_to_gguf.py"),
     ]
     for c in candidates:
         if c.is_file():
             return c
-    return None
+    cached = _cached_converter()
+    if cached is not None:
+        return cached
+    brew = Path("/opt/homebrew/share/llama.cpp/convert_hf_to_gguf.py")
+    return brew if brew.is_file() else None
 
 
 def _is_hf_model_dir(path: Path | None) -> bool:
@@ -137,12 +282,20 @@ def convert_hf_to_bf16_gguf(
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
-        raise RuntimeError(
+        message = (
             "convert_hf_to_gguf failed:\n"
             f"cmd: {' '.join(cmd)}\n"
             f"stdout:\n{proc.stdout[-2000:]}\n"
             f"stderr:\n{proc.stderr[-2000:]}"
         )
+        if "is not supported" in proc.stderr:
+            tag = _read_json(convert_script.parent / "meta.json").get("tag")
+            origin = f"llama.cpp {tag}" if tag else "your local llama.cpp"
+            message += (
+                f"\nConverter is from {origin}; if this architecture is newer than "
+                "that release, set LLAMA_CPP_DIR to a newer llama.cpp checkout."
+            )
+        raise RuntimeError(message)
 
 
 def freeze_gguf(
@@ -172,16 +325,14 @@ def freeze_gguf(
 
     hf_dir = Path(hf_local_path).expanduser() if hf_local_path else None
     src = Path(source_path).expanduser() if source_path else None
-    script = find_convert_script(convert_script)
+    wants_hf = mode in {"auto", "hf-convert"} and _is_hf_model_dir(hf_dir)
+    # Only reach for the (possibly downloaded) converter when HF conversion is on the table.
+    script = find_convert_script(convert_script) if (wants_hf or convert_script) else None
 
     method: str | None = None
     gguf_path: Path | None = None
 
-    can_convert = (
-        mode in {"auto", "hf-convert"}
-        and _is_hf_model_dir(hf_dir)
-        and script is not None
-    )
+    can_convert = wants_hf and script is not None
 
     if mode == "hf-convert" and not can_convert:
         reasons = []

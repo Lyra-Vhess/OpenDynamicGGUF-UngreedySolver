@@ -47,6 +47,8 @@ odg formats          # supported target profiles (q4_k_m, q5_k_m, …)
 
 OpenDynamicGGUF does **not** ship quantization kernels. Real export needs `llama-quantize` (and optionally `llama-imatrix`, `llama-perplexity`, `convert_hf_to_gguf.py`).
 
+The HF→GGUF converter is the one exception: if no local llama.cpp checkout is found, `odg` fetches the converter for the latest **stable** llama.cpp release into `~/.cache/odg/llama.cpp/<sha>/` (shallow sparse clone, ~2.3 MB) and reuses it. A local `LLAMA_CPP_DIR` / `~/llama.cpp` always wins.
+
 ### Build (example)
 
 ```bash
