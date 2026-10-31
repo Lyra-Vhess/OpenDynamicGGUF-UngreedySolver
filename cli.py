@@ -386,9 +386,10 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=None,
         metavar="DIR",
-        help="Precomputed per-tensor rung-shard farm: assemble probe trials "
-        "by symlink instead of running llama-quantize per probe (llama mode "
-        "lazy driver only). Farm trials reuse the farm-build imatrix.",
+        help="Per-tensor rung-shard farm: assemble probe trials by symlink "
+        "instead of running llama-quantize per probe (llama mode lazy driver "
+        "only). Built from the run's frozen model and imatrix when DIR is "
+        "missing or incomplete; farm trials reuse that imatrix.",
     )
     p_sens.add_argument("--no-explain", action="store_true")
 
@@ -728,8 +729,9 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=None,
         metavar="DIR",
-        help="Precomputed per-tensor rung-shard farm for step-12 trials "
-        "(symlink assembly instead of per-probe llama-quantize)",
+        help="Per-tensor rung-shard farm for step-12 trials (symlink "
+        "assembly instead of per-probe llama-quantize). Built from the run's "
+        "frozen model and imatrix when DIR is missing or incomplete.",
     )
     p_run.add_argument(
         "--pareto-ratios",
@@ -3043,6 +3045,64 @@ def resolve_probe_catalog(store, run_id):
     return None, None
 
 
+def _ensure_splice_farm(
+    args: argparse.Namespace,
+    *,
+    model_gguf: str | None,
+    gguf_sha256: str | None,
+    imatrix_gguf: str | None,
+    explain: bool,
+) -> None:
+    """Build a missing farm, then verify it matches this run's inputs.
+
+    A farm bakes in the model, the imatrix and the quantize build, so the
+    manifest check is the only thing standing between a run and silently
+    reusing rungs quantized with someone else's importance weights.
+    """
+    from splice_farm import build_farm, farm_status, load_farm, sha256_file
+
+    farm_root = Path(args.splice_farm).expanduser()
+    if model_gguf is None or not Path(model_gguf).is_file():
+        raise RuntimeError(
+            "--splice-farm needs the frozen BF16 GGUF from step 09, and it is "
+            "missing. Nothing to build a farm from."
+        )
+    if not imatrix_gguf or not Path(imatrix_gguf).is_file():
+        raise RuntimeError(
+            "--splice-farm needs the step-10 imatrix.gguf, and it is missing. "
+            "The farm bakes in that imatrix, so build the imatrix first."
+        )
+    status = farm_status(farm_root)
+    if not status["complete"]:
+        detail = (
+            "missing"
+            if not status["exists"]
+            else "incomplete ("
+            + (", ".join(status["missing"]) or "uneven shard counts")
+            + ")"
+        )
+        if explain:
+            print(
+                f"Splice farm {farm_root} is {detail}. Building it from "
+                f"{Path(model_gguf).name} + imatrix.gguf now. Expect roughly "
+                "6 GB of shards per GB of model and about ten minutes.",
+                flush=True,
+            )
+        build_farm(
+            model_gguf,
+            imatrix_gguf,
+            farm_root,
+            model_sha256=gguf_sha256,
+            log=(lambda message: print(message, flush=True)) if explain else None,
+        )
+    load_farm(
+        farm_root,
+        expected_model_sha256=gguf_sha256,
+        expected_imatrix_sha256=sha256_file(Path(imatrix_gguf)),
+        warn_legacy=True,
+    )
+
+
 def cmd_sensitivity(args: argparse.Namespace) -> int:
     from sensitivity import build_sensitivity_table
     from store import StepAlreadyDone
@@ -3220,6 +3280,19 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
     _reference = _sens_ref(catalog, intended_bytes=_intended)
     input_data["intended_bytes"] = _intended
     input_data["pricing_reference_bytes"] = _reference
+
+    if getattr(args, "splice_farm", None) is not None:
+        try:
+            _ensure_splice_farm(
+                args,
+                model_gguf=model_gguf,
+                gguf_sha256=freeze_out.get("gguf_sha256"),
+                imatrix_gguf=input_data["imatrix_gguf"],
+                explain=print_explain,
+            )
+        except (RuntimeError, OSError, ValueError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
 
     try:
         step_dir = store.begin_step(

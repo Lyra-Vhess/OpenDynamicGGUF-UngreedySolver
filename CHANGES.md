@@ -1,5 +1,32 @@
 # Changes: DP-MCKP optimizer with column generation (`feat/dp-mckp-colgen`)
 
+## Splice-farm builder (2026-10-30)
+
+- **Builder:** `splice_farm.build_farm()` now generates the farm that the
+  module previously only consumed. It splits the frozen BF16 GGUF into 720
+  single-tensor shards (`llama-gguf-split --split-max-tensors 1`) and
+  quantizes each full ladder into its own shard set with
+  `llama-quantize --keep-split`, a `.*=<rung>` tensor-type file, and the
+  run imatrix. This is the recipe the original farm was built with by hand;
+  without it the module had no way to create a farm.
+- **Resume:** a rung set that already passes the census is kept, so an
+  interrupted build continues where it stopped. `force=True` rebuilds rungs
+  in place.
+- **Manifest:** each build writes `farm_manifest.json` with the model and
+  imatrix sha256, shard and tensor counts, per-rung byte sizes, type
+  histograms, tool versions and wall time. `SpliceFarm` verifies it and
+  refuses a farm built for another model or imatrix. The old docstring
+  stated that rule but nothing enforced it.
+- **CLI:** `--splice-farm DIR` now builds the farm on first use from step 09
+  and step 10 outputs when `DIR` is missing or incomplete, then verifies it.
+  This covers `odg run`, `odg fit`, and `odg sensitivity`, so the exhaustive
+  per-tensor path needs one invocation. A complete farm without a manifest
+  is accepted with a warning after its structure is checked.
+- **Tests:** command construction, manifest round trip, model and imatrix
+  mismatch refusal, legacy-farm refusal under `require_manifest`, incomplete
+  farm reporting, two-tensor-shard census rejection, and a fake-binary build
+  that verifies resume behaviour.
+
 ## Code hygiene (2026-10-28)
 
 - **Imports:** removed duplicate `typing` / `dataclasses` imports in

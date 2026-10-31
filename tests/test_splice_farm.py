@@ -424,3 +424,240 @@ def test_splice_farm_in_stale_check():
     args = argparse.Namespace()
     exp = cli._pipeline_expected_inputs("sensitivity", args, fmt=None)
     assert exp["splice_farm"] is None
+
+
+# --- farm construction ------------------------------------------------------
+
+
+def _manifest_dict(
+    *,
+    model_sha256: str = "model-sha",
+    imatrix_sha256: str = "imatrix-sha",
+    n_shards: int = 3,
+    tensor_order: list[str] | None = None,
+) -> dict:
+    from splice_farm import MANIFEST_VERSION, RUNG_SUBDIR
+
+    return {
+        "version": MANIFEST_VERSION,
+        "model": {
+            "path": "/model.gguf",
+            "size": 10,
+            "sha256": model_sha256,
+            "n_tensors": n_shards,
+        },
+        "imatrix": {"path": "/imatrix.gguf", "size": 5, "sha256": imatrix_sha256},
+        "n_shards": n_shards,
+        "n_tensors": n_shards,
+        "rungs": {
+            rung: {"dir": sub, "n_shards": n_shards}
+            for rung, sub in RUNG_SUBDIR.items()
+        },
+        "tensor_order": tensor_order or [f"t{i}" for i in range(1, n_shards + 1)],
+    }
+
+
+def test_split_and_quantize_commands():
+    split = splice_farm._split_command(
+        "/b/llama-gguf-split", Path("/m.gguf"), Path("/f/base720/t")
+    )
+    assert split == [
+        "/b/llama-gguf-split", "--split-max-tensors", "1",
+        "/m.gguf", "/f/base720/t",
+    ]
+    quant = splice_farm._quantize_command(
+        "/b/llama-quantize",
+        type_file=Path("/f/tensor_types/q4_k.tt"),
+        imatrix=Path("/f/imatrix.gguf"),
+        first_shard=Path("/f/base720/t-00001-of-00720.gguf"),
+        out_file=Path("/f/rung720-q4_k/q.gguf"),
+    )
+    assert quant == [
+        "/b/llama-quantize",
+        "--keep-split",
+        "--tensor-type-file", "/f/tensor_types/q4_k.tt",
+        "--imatrix", "/f/imatrix.gguf",
+        "/f/base720/t-00001-of-00720.gguf",
+        "/f/rung720-q4_k/q.gguf",
+        "q8_0",
+    ]
+
+
+def test_type_file_line_is_catch_all():
+    assert splice_farm._type_file_line("Q6_K") == ".*=q6_k\n"
+    assert splice_farm._type_file_line("F32") == ".*=f32\n"
+
+
+def test_manifest_round_trip_and_missing(tmp_path):
+    root = _mini_farm(tmp_path)
+    assert splice_farm.read_manifest(root) is None
+    assert splice_farm.farm_status(root)["complete"] is True
+    assert splice_farm.farm_status(root)["manifest"] is None
+
+    manifest = _manifest_dict()
+    path = splice_farm.write_manifest(root, manifest)
+    assert path == root / splice_farm.MANIFEST_FILENAME
+    assert splice_farm.read_manifest(root) == manifest
+
+
+def test_manifest_map_avoids_header_scan(tmp_path, monkeypatch):
+    root = _mini_farm(tmp_path)
+    splice_farm.write_manifest(root, _manifest_dict())
+
+    import gguf_tensors
+
+    def boom(path):
+        raise AssertionError("manifest map should not read shard headers")
+
+    monkeypatch.setattr(gguf_tensors, "gguf_tensor_map", boom)
+    farm = load_farm(root)
+    assert farm.tensor_to_idx == {"t1": 1, "t2": 2, "t3": 3}
+
+
+def test_manifest_rejects_model_mismatch(tmp_path):
+    root = _mini_farm(tmp_path)
+    splice_farm.write_manifest(root, _manifest_dict(model_sha256="other"))
+    with pytest.raises(RuntimeError, match="model sha256"):
+        load_farm(root, expected_model_sha256="this-run")
+
+
+def test_manifest_rejects_imatrix_mismatch(tmp_path):
+    root = _mini_farm(tmp_path)
+    splice_farm.write_manifest(root, _manifest_dict(imatrix_sha256="other"))
+    with pytest.raises(RuntimeError, match="imatrix sha256"):
+        load_farm(root, expected_imatrix_sha256="this-run")
+
+
+def test_manifest_requires_full_ladder(tmp_path):
+    root = _mini_farm(tmp_path)
+    manifest = _manifest_dict()
+    manifest["rungs"].pop("Q2_K")
+    splice_farm.write_manifest(root, manifest)
+    with pytest.raises(RuntimeError, match="full ladder"):
+        load_farm(root)
+
+
+def test_require_manifest_rejects_legacy_farm(tmp_path, monkeypatch):
+    _patch_headers(monkeypatch, 3)
+    root = _mini_farm(tmp_path)
+    with pytest.raises(RuntimeError, match="no farm_manifest"):
+        load_farm(root, require_manifest=True)
+
+
+def test_farm_status_reports_missing_rungs(tmp_path):
+    root = _mini_farm(tmp_path)
+    import shutil
+
+    shutil.rmtree(root / "rung720-f16")
+    status = splice_farm.farm_status(root)
+    assert status["complete"] is False
+    assert status["missing"] == ["rung720-f16"]
+
+
+def test_census_rejects_two_tensors_per_shard(tmp_path, monkeypatch):
+    root = _mini_farm(tmp_path)
+    import gguf_tensors
+
+    def fake(path):
+        return {"tensors": {"a": {"ggml_type": 12, "nbytes": 1},
+                            "b": {"ggml_type": 12, "nbytes": 1}}}
+
+    monkeypatch.setattr(gguf_tensors, "gguf_tensor_map", fake)
+    with pytest.raises(RuntimeError, match="not 1"):
+        splice_farm._census_set(
+            root / "rung720-q4_k", 3, what="test"
+        )
+
+
+def test_build_farm_commands_and_resume(tmp_path, monkeypatch):
+    import gguf_tensors
+    import llama_bins
+
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"m" * 10)
+    imatrix = tmp_path / "imatrix.gguf"
+    imatrix.write_bytes(b"i" * 5)
+    root = tmp_path / "farm"
+
+    def fake_map(path):
+        p = Path(path)
+        if p.name == "model.gguf":
+            return {"tensors": {f"t{i}": {} for i in range(1, 4)}}
+        idx = int(p.name.split("-")[1])
+        return {"tensors": {f"t{idx}": {"ggml_type": 12, "nbytes": 100}}}
+
+    monkeypatch.setattr(gguf_tensors, "gguf_tensor_map", fake_map)
+    monkeypatch.setattr(
+        llama_bins, "find_llama_binary",
+        lambda name, explicit=None: f"/usr/bin/{name}",
+    )
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, *, what):
+        calls.append(list(cmd))
+        if cmd[0].endswith("llama-gguf-split"):
+            out = Path(cmd[-1])
+            for i in range(1, 4):
+                (out.parent / f"t-{i:05d}-of-00003.gguf").write_bytes(b"")
+        else:
+            out = Path(cmd[-2])
+            for i in range(1, 4):
+                (out.parent / f"q-{i:05d}-of-00003.gguf").write_bytes(b"")
+        return ""
+
+    monkeypatch.setattr(splice_farm, "_run", fake_run)
+    manifest = splice_farm.build_farm(model, imatrix, root, log=None)
+
+    assert manifest["n_shards"] == 3
+    assert set(manifest["rungs"]) == set(splice_farm.RUNG_SUBDIR)
+    assert manifest["tensor_order"] == ["t1", "t2", "t3"]
+    assert len(calls) == 1 + len(splice_farm.RUNG_SUBDIR)
+    assert calls[0] == [
+        "/usr/bin/llama-gguf-split", "--split-max-tensors", "1",
+        str(model), str(root / "base720" / "t"),
+    ]
+    assert (root / "tensor_types" / "q4_k.tt").read_text() == ".*=q4_k\n"
+    assert (root / splice_farm.MANIFEST_FILENAME).is_file()
+
+    # Second call resumes: no new split, no new quantize.
+    calls.clear()
+    again = splice_farm.build_farm(model, imatrix, root, log=None)
+    assert calls == []
+    assert again["rungs"]["Q4_K"]["reused"] is True
+    assert again["tools"] == manifest["tools"]
+    assert again["created_at"] == manifest["created_at"]
+    farm = load_farm(root)
+    assert farm.tensor_to_idx == {"t1": 1, "t2": 2, "t3": 3}
+
+
+def test_build_farm_refuses_other_imatrix(tmp_path, monkeypatch):
+    import gguf_tensors
+    import llama_bins
+
+    model = tmp_path / "model.gguf"
+    model.write_bytes(b"m" * 10)
+    imatrix = tmp_path / "imatrix.gguf"
+    imatrix.write_bytes(b"i" * 5)
+    other = tmp_path / "other.gguf"
+    other.write_bytes(b"o" * 5)
+    root = _mini_farm(tmp_path)
+    (root / "base720").mkdir()
+    for i in range(1, 4):
+        (root / "base720" / f"t-{i:05d}-of-00003.gguf").write_bytes(b"")
+
+    monkeypatch.setattr(
+        gguf_tensors, "gguf_tensor_map",
+        lambda path: {"tensors": {str(Path(path).stem): {"ggml_type": 12, "nbytes": 1}}},
+    )
+    monkeypatch.setattr(
+        llama_bins, "find_llama_binary",
+        lambda name, explicit=None: f"/usr/bin/{name}",
+    )
+    splice_farm.write_manifest(
+        root, _manifest_dict(imatrix_sha256=splice_farm.sha256_file(imatrix))
+    )
+    with pytest.raises(RuntimeError, match="imatrix sha256"):
+        splice_farm.build_farm(
+            model, other, root, imatrix_sha256="different"
+        )

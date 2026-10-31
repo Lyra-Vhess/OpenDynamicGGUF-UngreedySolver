@@ -14,6 +14,12 @@ shard-set assemblies with KL identical to full-file trials (gate-1),
 and a 720-symlink assembly is byte-identical to the equivalent
 pipeline trial on all 720 tensors with identical KL logs (gate-2).
 
+A farm is built once per model + imatrix by ``build_farm`` and carries a
+``farm_manifest.json`` (model and imatrix hashes, shard counts, per-rung
+byte sizes and type histograms). Builds are resumable: a rung whose shard
+set already passes the census is kept, so an interrupted build continues
+where it stopped.
+
 Hard constraints (violations raise loudly, never silently degrade):
 - Symlinks MUST preserve the source shard basenames (``q-%05d-of-%05d``):
   the GGUF split loader checks the internal split index against the
@@ -22,18 +28,23 @@ Hard constraints (violations raise loudly, never silently degrade):
   co-resident tensors and fail exactness, so the farm is per-tensor.
 - The farm bakes in the model + imatrix + quantize build it was made
   from: rung shards carry the importance weights of the farm-build
-  imatrix. A farm is valid only for runs of the same model with the
-  same imatrix; the run manifest records the farm path for audit.
+  imatrix. ``SpliceFarm`` refuses a farm whose manifest records a
+  different model or imatrix; a farm without a manifest is accepted only
+  with a warning, after its shard structure is checked.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import subprocess
+import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Sequence
 
 from kld import parse_llama_perplexity_kl
 
@@ -53,6 +64,18 @@ RUNG_SUBDIR = {
 
 #: Cached tensor→shard map filename inside the farm root.
 MAP_FILENAME = "tensor_shard_map.json"
+
+#: Build manifest filename inside the farm root (written by build_farm).
+MANIFEST_FILENAME = "farm_manifest.json"
+
+#: Manifest schema version.
+MANIFEST_VERSION = 1
+
+#: Directory holding the per-tensor reference split of the frozen model.
+BASE_DIRNAME = "base720"
+
+#: Directory holding the generated tensor-type files ("<rung>.tt").
+TYPE_DIRNAME = "tensor_types"
 
 #: Assembled-trial directory prefix inside the probe work dir.
 ASSEMBLY_PREFIX = "farm-"
@@ -105,7 +128,15 @@ def _scan_shard_map(ref_dir: Path, n_shards: int) -> dict[str, int]:
 class SpliceFarm:
     """A validated splice farm rooted at ``root``."""
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        expected_model_sha256: str | None = None,
+        expected_imatrix_sha256: str | None = None,
+        require_manifest: bool = False,
+        warn_legacy: bool = False,
+    ) -> None:
         self.root = Path(root).expanduser()
         if not self.root.is_dir():
             raise RuntimeError(
@@ -153,22 +184,135 @@ class SpliceFarm:
                     "bg720-q8_0 — sibling pairing would break. Refusing."
                 )
         self.n_shards = n_shards
+        self.manifest = read_manifest(self.root)
+        if self.manifest is not None:
+            self._verify_manifest(
+                expected_model_sha256=expected_model_sha256,
+                expected_imatrix_sha256=expected_imatrix_sha256,
+            )
+        elif require_manifest:
+            raise RuntimeError(
+                f"Splice farm {self.root} has no {MANIFEST_FILENAME}, so it "
+                "cannot be checked against this run's model and imatrix. "
+                "Rebuild it by passing --splice-farm (the pipeline builds a "
+                "farm automatically when the directory is missing), or point "
+                "--splice-farm at a farm that has a manifest."
+            )
+        elif warn_legacy:
+            print(
+                f"WARNING: splice farm {self.root} has no {MANIFEST_FILENAME}. "
+                "Cannot prove it was built from this run's model and imatrix; "
+                "only the shard structure was checked.",
+                file=sys.stderr,
+            )
         self.tensor_to_idx: dict[str, int] = self._load_or_build_map()
 
+    def _verify_manifest(
+        self,
+        *,
+        expected_model_sha256: str | None,
+        expected_imatrix_sha256: str | None,
+    ) -> None:
+        manifest = self.manifest or {}
+        version = manifest.get("version")
+        if version != MANIFEST_VERSION:
+            raise RuntimeError(
+                f"Farm manifest {self.root / MANIFEST_FILENAME} has version "
+                f"{version!r}, expected {MANIFEST_VERSION}. Rebuild the farm."
+            )
+        if int(manifest.get("n_shards", -1)) != self.n_shards:
+            raise RuntimeError(
+                f"Farm manifest {self.root / MANIFEST_FILENAME} records "
+                f"{manifest.get('n_shards')} shards, directory holds "
+                f"{self.n_shards}. Rebuild the farm."
+            )
+        rungs = manifest.get("rungs")
+        if not isinstance(rungs, dict) or set(rungs) != set(RUNG_SUBDIR):
+            raise RuntimeError(
+                f"Farm manifest {self.root / MANIFEST_FILENAME} does not "
+                f"describe the full ladder (rungs: "
+                f"{sorted(rungs) if isinstance(rungs, dict) else rungs!r})."
+            )
+        for rung, sub in RUNG_SUBDIR.items():
+            recorded = (rungs.get(rung) or {}).get("dir")
+            if recorded != sub:
+                raise RuntimeError(
+                    f"Farm manifest maps rung {rung} to {recorded!r}, "
+                    f"expected {sub!r}. Refusing."
+                )
+        recorded_model = manifest.get("model") or {}
+        if expected_model_sha256 is not None:
+            recorded_sha = recorded_model.get("sha256")
+            if recorded_sha is None:
+                raise RuntimeError(
+                    f"Farm manifest {self.root / MANIFEST_FILENAME} has no model "
+                    "sha256, so it cannot be matched to this run's frozen model."
+                )
+            if recorded_sha != expected_model_sha256:
+                raise RuntimeError(
+                    f"Splice farm {self.root} was built from model sha256 "
+                    f"{recorded_sha}, but this run's frozen model is "
+                    f"{expected_model_sha256}. Rung shards carry the farm's "
+                    "imatrix and quantize results, so the two cannot be mixed. "
+                    "Point --splice-farm at a farm for this model."
+                )
+        recorded_imatrix = manifest.get("imatrix") or {}
+        if expected_imatrix_sha256 is not None:
+            recorded_sha = recorded_imatrix.get("sha256")
+            if recorded_sha is None:
+                raise RuntimeError(
+                    f"Farm manifest {self.root / MANIFEST_FILENAME} has no imatrix "
+                    "sha256, so it cannot be matched to this run's imatrix."
+                )
+            if recorded_sha != expected_imatrix_sha256:
+                raise RuntimeError(
+                    f"Splice farm {self.root} was built with imatrix sha256 "
+                    f"{recorded_sha}, but this run uses "
+                    f"{expected_imatrix_sha256}. The rung shards embed the "
+                    "farm-build importance weights. Point --splice-farm at a "
+                    "farm for this imatrix."
+                )
+
+    def _manifest_map(self) -> dict[str, int] | None:
+        """Tensor→shard map from the manifest's recorded shard order."""
+        if self.manifest is None:
+            return None
+        order = self.manifest.get("tensor_order")
+        if not isinstance(order, list) or len(order) != self.n_shards:
+            return None
+        names = [str(name) for name in order]
+        if len(set(names)) != len(names):
+            raise RuntimeError(
+                f"Farm manifest in {self.root} repeats tensor names; the "
+                "recorded shard order is corrupt. Refusing."
+            )
+        return {name: idx for idx, name in enumerate(names, start=1)}
+
     def _load_or_build_map(self) -> dict[str, int]:
+        from_manifest = self._manifest_map()
         cache = self.root / MAP_FILENAME
+        saved: dict[str, int] | None = None
         if cache.is_file():
             try:
-                saved = json.loads(cache.read_text(encoding="utf-8"))
+                raw = json.loads(cache.read_text(encoding="utf-8"))
             except (ValueError, OSError):
-                saved = None
+                raw = None
             if (
-                isinstance(saved, dict)
-                and saved.get("n_shards") == self.n_shards
-                and isinstance(saved.get("map"), dict)
-                and len(saved["map"]) == self.n_shards
+                isinstance(raw, dict)
+                and raw.get("n_shards") == self.n_shards
+                and isinstance(raw.get("map"), dict)
+                and len(raw["map"]) == self.n_shards
             ):
-                return {str(k): int(v) for k, v in saved["map"].items()}
+                saved = {str(k): int(v) for k, v in raw["map"].items()}
+        if from_manifest is not None:
+            if saved is not None and saved != from_manifest:
+                raise RuntimeError(
+                    f"Farm map cache {cache} disagrees with {MANIFEST_FILENAME} "
+                    "tensor order. One of them is stale; rebuild the farm."
+                )
+            return from_manifest
+        if saved is not None:
+            return saved
         mapping = _scan_shard_map(self.root / "bg720-q8_0", self.n_shards)
         cache.write_text(
             json.dumps(
@@ -201,9 +345,472 @@ class SpliceFarm:
             ) from None
 
 
-def load_farm(root: str | Path) -> SpliceFarm:
+def load_farm(
+    root: str | Path,
+    *,
+    expected_model_sha256: str | None = None,
+    expected_imatrix_sha256: str | None = None,
+    require_manifest: bool = False,
+    warn_legacy: bool = False,
+) -> SpliceFarm:
     """Validate a farm directory and return its handle (scans + caches map)."""
-    return SpliceFarm(root)
+    return SpliceFarm(
+        root,
+        expected_model_sha256=expected_model_sha256,
+        expected_imatrix_sha256=expected_imatrix_sha256,
+        require_manifest=require_manifest,
+        warn_legacy=warn_legacy,
+    )
+
+
+# --- farm construction -----------------------------------------------------
+
+
+def _names_for(prefix: str, n_shards: int) -> list[str]:
+    """Shard basenames for a split whose output prefix is ``prefix``."""
+    return [
+        f"{prefix}-{i:05d}-of-{n_shards:05d}.gguf"
+        for i in range(1, n_shards + 1)
+    ]
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _tool_version(binary: str | None) -> str | None:
+    if not binary:
+        return None
+    try:
+        proc = subprocess.run(
+            [binary, "--version"], capture_output=True, text=True, timeout=30
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in ((proc.stdout or "") + (proc.stderr or "")).splitlines():
+        if line.strip():
+            return line.strip()[:200]
+    return None
+
+
+def _type_file_line(rung: str) -> str:
+    """Catch-all tensor-type rule: every quantizable tensor gets ``rung``."""
+    return f".*={rung.lower()}\n"
+
+
+def _split_command(split_bin: str, model: Path, out_prefix: Path) -> list[str]:
+    """One-tensor-per-shard split. The prefix determines the shard names."""
+    return [
+        split_bin,
+        "--split-max-tensors",
+        "1",
+        str(model),
+        str(out_prefix),
+    ]
+
+
+def _quantize_command(
+    quantize_bin: str,
+    *,
+    type_file: Path,
+    imatrix: Path,
+    first_shard: Path,
+    out_file: Path,
+) -> list[str]:
+    """Quantize a whole shard set from its first shard, keeping the split.
+
+    ``llama-quantize`` refuses any shard but the first. The trailing
+    positional ``q8_0`` is a dummy default: the ``.*=<rung>`` catch-all in
+    the tensor-type file overrides every tensor the tool will quantize.
+    """
+    return [
+        quantize_bin,
+        "--keep-split",
+        "--tensor-type-file",
+        str(type_file),
+        "--imatrix",
+        str(imatrix),
+        str(first_shard),
+        str(out_file),
+        "q8_0",
+    ]
+
+
+def _set_complete(directory: Path, n_shards: int, prefix: str = "q") -> bool:
+    if not directory.is_dir():
+        return False
+    names = sorted(p.name for p in directory.glob("*.gguf"))
+    return names == _names_for(prefix, n_shards)
+
+
+def _census_set(
+    directory: Path, n_shards: int, *, what: str, prefix: str = "q"
+) -> dict[str, Any]:
+    """Check a shard set holds exactly one tensor per shard, in file order.
+
+    Returns the tensor order, ggml-type histogram and total tensor bytes.
+    Raises on any structural deviation.
+    """
+    from gguf_tensors import gguf_tensor_map
+
+    names = sorted(p.name for p in directory.glob("*.gguf"))
+    expected = _names_for(prefix, n_shards)
+    if names != expected:
+        raise RuntimeError(
+            f"{what}: shard set in {directory} does not match "
+            f"{expected[0]}..{expected[-1]} (found {len(names)} file(s), "
+            f"first/last {names[:1]}/{names[-1:]}). Refusing."
+        )
+    order: list[str] = []
+    histogram: dict[str, int] = {}
+    total_bytes = 0
+    for name in names:
+        tensors = gguf_tensor_map(directory / name)["tensors"]
+        if len(tensors) != 1:
+            raise RuntimeError(
+                f"{what}: shard {name} holds {len(tensors)} tensors, not 1. "
+                "Coarse shards over-quantize co-resident tensors (see module "
+                "docstring). Refusing."
+            )
+        tensor_name, meta = next(iter(tensors.items()))
+        order.append(tensor_name)
+        key = str(meta["ggml_type"])
+        histogram[key] = histogram.get(key, 0) + 1
+        total_bytes += int(meta["nbytes"])
+    if len(set(order)) != len(order):
+        raise RuntimeError(
+            f"{what}: tensor names repeat across shards in {directory}. Refusing."
+        )
+    return {
+        "tensors": order,
+        "type_histogram": histogram,
+        "nbytes": total_bytes,
+    }
+
+
+def read_manifest(root: str | Path) -> dict[str, Any] | None:
+    """Read ``farm_manifest.json``; returns None when absent, raises when bad."""
+    path = Path(root).expanduser() / MANIFEST_FILENAME
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Farm manifest {path} is unreadable: {exc}") from None
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Farm manifest {path} is not a JSON object")
+    return data
+
+
+def write_manifest(root: str | Path, manifest: dict[str, Any]) -> Path:
+    """Atomically write ``farm_manifest.json`` under ``root``."""
+    path = Path(root).expanduser() / MANIFEST_FILENAME
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
+def farm_status(root: str | Path) -> dict[str, Any]:
+    """Describe a farm directory without raising on an incomplete one.
+
+    ``complete`` only means every rung directory exists with the same
+    non-zero shard count. ``load_farm`` and ``build_farm`` still check the
+    basenames, tensor order and manifest.
+    """
+    root_p = Path(root).expanduser()
+    status: dict[str, Any] = {
+        "root": str(root_p),
+        "exists": root_p.is_dir(),
+        "complete": False,
+        "missing": [],
+        "counts": {},
+        "manifest": None,
+    }
+    if not status["exists"]:
+        status["missing"] = sorted(set(RUNG_SUBDIR.values()))
+        return status
+    status["missing"] = sorted(
+        d for d in set(RUNG_SUBDIR.values()) if not (root_p / d).is_dir()
+    )
+    status["counts"] = {
+        d: len(list((root_p / d).glob("*.gguf")))
+        for d in set(RUNG_SUBDIR.values())
+        if d not in status["missing"]
+    }
+    counts = status["counts"]
+    status["complete"] = (
+        not status["missing"]
+        and len(set(counts.values())) == 1
+        and next(iter(counts.values()), 0) > 0
+    )
+    status["manifest"] = read_manifest(root_p)
+    return status
+
+
+def _identity_clashes(
+    manifest: dict[str, Any],
+    model: Path,
+    model_sha256: str | None,
+    imatrix: Path,
+    imatrix_sha256: str | None,
+) -> list[str]:
+    clashes: list[str] = []
+    recorded_model = manifest.get("model") or {}
+    recorded_size = recorded_model.get("size")
+    if recorded_size is not None and int(recorded_size) != model.stat().st_size:
+        clashes.append(
+            f"model size {model.stat().st_size} != recorded {recorded_size}"
+        )
+    if model_sha256 and recorded_model.get("sha256") not in (None, model_sha256):
+        clashes.append("model sha256 differs")
+    recorded_imatrix = manifest.get("imatrix") or {}
+    recorded_imatrix_size = recorded_imatrix.get("size")
+    if (
+        recorded_imatrix_size is not None
+        and int(recorded_imatrix_size) != imatrix.stat().st_size
+    ):
+        clashes.append(
+            f"imatrix size {imatrix.stat().st_size} != recorded {recorded_imatrix_size}"
+        )
+    if imatrix_sha256 and recorded_imatrix.get("sha256") not in (
+        None, imatrix_sha256
+    ):
+        clashes.append("imatrix sha256 differs")
+    return clashes
+
+
+def build_farm(
+    model_gguf: str | Path,
+    imatrix: str | Path,
+    root: str | Path,
+    *,
+    rungs: Sequence[str] | None = None,
+    llama_split: str | Path | None = None,
+    llama_quantize: str | Path | None = None,
+    force: bool = False,
+    model_sha256: str | None = None,
+    imatrix_sha256: str | None = None,
+    log: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Build (or resume) a per-tensor rung-shard farm and write its manifest.
+
+    Recipe, all of it load-bearing:
+
+    1. ``llama-gguf-split --split-max-tensors 1`` on the frozen model, so
+       every shard holds one tensor.
+    2. Per rung, ``llama-quantize --keep-split`` fed the *first* shard (the
+       tool refuses any other) with a ``.*=<rung>`` tensor-type file and
+       the run imatrix. ``--keep-split`` writes one shard per input shard,
+       so the rung set keeps the one-tensor-per-shard shape.
+
+    Existing complete rung sets are kept unless ``force``; an existing
+    manifest for a different model or imatrix is refused, because rung
+    shards are quantized with that imatrix and cannot be mixed.
+    """
+    from gguf_tensors import gguf_tensor_map
+    from llama_bins import find_llama_binary
+
+    emit = log or (lambda _message: None)
+    model = Path(model_gguf).expanduser()
+    imatrix_path = Path(imatrix).expanduser()
+    root_path = Path(root).expanduser().resolve()
+
+    if not model.is_file():
+        raise RuntimeError(
+            f"Splice farm needs the frozen model GGUF; not found: {model}"
+        )
+    if not imatrix_path.is_file():
+        raise RuntimeError(
+            f"Splice farm needs imatrix.gguf; not found: {imatrix_path}"
+        )
+
+    known_rungs = list(RUNG_SUBDIR)
+    if rungs is None:
+        selected = known_rungs
+    else:
+        selected = []
+        for raw in rungs:
+            rung = str(raw).upper()
+            if rung not in RUNG_SUBDIR:
+                raise RuntimeError(
+                    f"Unknown farm rung {raw!r} (known: {sorted(RUNG_SUBDIR)})"
+                )
+            if rung not in selected:
+                selected.append(rung)
+        missing = [r for r in known_rungs if r not in selected]
+        if missing:
+            raise RuntimeError(
+                "A splice farm must carry the full ladder; missing rung(s): "
+                f"{missing}. SpliceFarm refuses partial farms, so build all "
+                "eight or none."
+            )
+
+    existing = read_manifest(root_path)
+    if existing is not None:
+        clashes = _identity_clashes(
+            existing, model, model_sha256, imatrix_path, imatrix_sha256
+        )
+        if clashes:
+            raise RuntimeError(
+                f"Splice farm {root_path} was built from different inputs: "
+                + "; ".join(clashes)
+                + ". Build the farm in a different directory. --force rebuilds "
+                "rungs in place and will not mix models or imatrices."
+            )
+
+    n_tensors = len(gguf_tensor_map(model)["tensors"])
+    root_path.mkdir(parents=True, exist_ok=True)
+
+    started = time.monotonic()
+    previous_tools = (existing or {}).get("tools") or {}
+    split_bin: str | None = previous_tools.get("llama_split")
+    split_version: str | None = previous_tools.get("llama_split_version")
+    base = root_path / BASE_DIRNAME
+    if force or not _set_complete(base, n_tensors, prefix="t"):
+        resolved = find_llama_binary("llama-gguf-split", llama_split)
+        if resolved is None:
+            raise RuntimeError(
+                "llama-gguf-split not found (PATH, LLAMA_CPP_DIR, or "
+                "llama_split=). A farm is built with the llama.cpp tools."
+            )
+        split_bin = str(resolved)
+        split_version = _tool_version(split_bin)
+        emit(
+            f"splice farm: splitting {model.name} into {n_tensors} "
+            "single-tensor shards"
+        )
+        shutil.rmtree(base, ignore_errors=True)
+        base.mkdir(parents=True)
+        split_started = time.monotonic()
+        _run(
+            _split_command(split_bin, model, base / "t"),
+            what="llama-gguf-split (per-tensor split)",
+        )
+        emit(f"splice farm: split done in {time.monotonic() - split_started:.1f}s")
+        if not _set_complete(base, n_tensors, prefix="t"):
+            found = len(list(base.glob("*.gguf")))
+            raise RuntimeError(
+                f"llama-gguf-split wrote {found} shard(s) under {base}, expected "
+                f"{n_tensors} one-tensor shards. Refusing."
+            )
+    else:
+        emit(f"splice farm: reusing per-tensor split in {base}")
+
+    first_shard = base / _names_for("t", n_tensors)[0]
+    type_dir = root_path / TYPE_DIRNAME
+    type_dir.mkdir(parents=True, exist_ok=True)
+
+    quantize_bin: str | None = previous_tools.get("llama_quantize")
+    quantize_version: str | None = previous_tools.get("llama_quantize_version")
+    rung_info: dict[str, Any] = {}
+    tensor_order: list[str] | None = None
+    for rung in selected:
+        sub = RUNG_SUBDIR[rung]
+        out_dir = root_path / sub
+        reused = not force and _set_complete(out_dir, n_tensors)
+        seconds = 0.0
+        if not reused:
+            if quantize_bin is None:
+                resolved_quantize = find_llama_binary(
+                    "llama-quantize", llama_quantize
+                )
+                if resolved_quantize is None:
+                    raise RuntimeError(
+                        "llama-quantize not found (PATH, LLAMA_CPP_DIR, or "
+                        "llama_quantize=). A farm is built with the llama.cpp tools."
+                    )
+                quantize_bin = str(resolved_quantize)
+                quantize_version = _tool_version(quantize_bin)
+            type_file = type_dir / f"{rung.lower()}.tt"
+            type_file.write_text(_type_file_line(rung), encoding="utf-8")
+            emit(
+                f"splice farm: quantizing rung {rung} into {sub}/ "
+                f"({n_tensors} shards, catch-all .*={rung.lower()})"
+            )
+            shutil.rmtree(out_dir, ignore_errors=True)
+            out_dir.mkdir(parents=True)
+            rung_started = time.monotonic()
+            _run(
+                _quantize_command(
+                    quantize_bin,
+                    type_file=type_file,
+                    imatrix=imatrix_path,
+                    first_shard=first_shard,
+                    out_file=out_dir / "q.gguf",
+                ),
+                what=f"llama-quantize (rung {rung})",
+            )
+            seconds = time.monotonic() - rung_started
+            emit(f"splice farm: rung {rung} done in {seconds:.1f}s")
+        else:
+            emit(f"splice farm: reusing rung {rung} in {sub}/")
+        census = _census_set(out_dir, n_tensors, what=f"rung {rung}")
+        if tensor_order is None:
+            tensor_order = census["tensors"]
+        elif census["tensors"] != tensor_order:
+            raise RuntimeError(
+                f"Splice farm rung {rung} tensor order differs from the first "
+                "rung set. Sibling pairing would be wrong. Refusing."
+            )
+        rung_info[rung] = {
+            "dir": sub,
+            "n_shards": n_tensors,
+            "n_tensors": len(census["tensors"]),
+            "nbytes": census["nbytes"],
+            "type_histogram": census["type_histogram"],
+            "reused": reused,
+            "seconds": round(seconds, 1),
+        }
+
+    if model_sha256 is None:
+        emit("splice farm: hashing frozen model for the manifest")
+        model_sha256 = sha256_file(model)
+    if imatrix_sha256 is None:
+        imatrix_sha256 = sha256_file(imatrix_path)
+
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    manifest = {
+        "version": MANIFEST_VERSION,
+        "created_at": (existing or {}).get("created_at") or now_iso,
+        "updated_at": now_iso,
+        "model": {
+            "path": str(model),
+            "size": model.stat().st_size,
+            "sha256": model_sha256,
+            "n_tensors": n_tensors,
+        },
+        "imatrix": {
+            "path": str(imatrix_path),
+            "size": imatrix_path.stat().st_size,
+            "sha256": imatrix_sha256,
+        },
+        "n_shards": n_tensors,
+        "n_tensors": n_tensors,
+        "base": {"dir": BASE_DIRNAME, "prefix": "t", "n_shards": n_tensors},
+        "rungs": rung_info,
+        "tensor_order": tensor_order,
+        "tools": {
+            "llama_split": split_bin,
+            "llama_quantize": quantize_bin,
+            "llama_split_version": split_version,
+            "llama_quantize_version": quantize_version,
+        },
+        "seconds": (existing or {}).get("seconds")
+        or round(time.monotonic() - started, 1),
+        "last_run_seconds": round(time.monotonic() - started, 1),
+    }
+    write_manifest(root_path, manifest)
+    total_bytes = sum(int(info["nbytes"]) for info in rung_info.values())
+    emit(
+        f"splice farm: ready at {root_path} "
+        f"({len(selected)} rungs, {total_bytes / 1e9:.1f} GB of tensor data)"
+    )
+    return manifest
 
 
 def assemble_trial(
