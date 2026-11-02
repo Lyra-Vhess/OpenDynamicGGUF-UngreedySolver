@@ -16,10 +16,10 @@ Gate the candidate on held-out criteria, write a report, and stage a release —
 odg validate --model functiongemma:latest
 odg validate --model functiongemma:latest --strict   # FAIL if no real GGUF
 
-# primary + full frontier sweep (9 recipes, Tier-1 each, plots):
+# primary + frontier sweep (frontier selection plus recipe.yaml):
 odg validate --model functiongemma:latest --mode llama --frontier --force
 
-# frontier set only: no primary, exports deferred (plots + JSON stay):
+# frontier set only: no primary, no step-14 export (plots + JSON stay):
 odg validate --model functiongemma:latest --mode llama \
   --budget-mb frontier --force
 ```
@@ -29,7 +29,10 @@ steps 9–13 and exports transiently itself).
 
 `--budget-mb frontier` requires the step-13 exhaustive certificate and
 refuses otherwise: frontier optima are only meaningful over a fully
-measured table.
+measured table. It measures only the frontier selection, not
+`13_optimize/recipe.yaml`, and marks the run done without a release verdict.
+With a numeric budget, `--frontier` includes the primary recipe and keeps
+the winning GGUF.
 
 The **Quantization Report Card** includes: architecture (layers/tensors), size vs the run's trial-background rung (never a hardcoded rung), compression by role, a per-layer matrix (attn_q/k/v/o + ffn_*), per-group Δbytes / ΔKLD, and a measured-vs-predicted quality section (held-out Tier-1 mean/P99/P999/max/top-1/PPL next to the raw and background-corrected summed predictions).
 

@@ -1,5 +1,30 @@
 # Changes: DP-MCKP optimizer with column generation (`feat/dp-mckp-colgen`)
 
+## Single-run frontier pipeline (2026-11-02)
+
+- **Order:** `odg run` now resolves, then freezes, then loads. Steps 02–08
+  index the frozen text GGUF instead of the resolved HF checkpoint, so a
+  multimodal checkpoint's audio/vision towers never enter the catalog. The
+  step numbers and directory names are unchanged; freeze is still step 09.
+- **Freeze inputs:** step 09 now requires only step 01. It always freezes the
+  resolved source, never the already-frozen file written by a previous load.
+  `auto` detects an HF directory and uses the cached llama.cpp converter.
+- **Budget:** `odg run --budget-mb frontier` solves the step-13 primary
+  allocation for the certificate but skips the primary export and primary
+  measurement. Steps 12–13 use the quant-format ratio; step 15 measures only
+  the frontier selection and marks the run done. Step 14 is removed from the
+  pipeline in this mode.
+- **Grouping:** `odg run` and `odg fit` default `--grouping` to `None` and
+  resolve it to `per-tensor` when `--certificate exhaustive` is set, otherwise
+  `banded`. Explicit `banded` with `exhaustive` is rejected. Standalone
+  `odg reband` still defaults to `banded`.
+- **Farm:** a complete farm without `farm_manifest.json` is rebuilt so the
+  manifest is written while the rungs are reused. The build estimate is now
+  20 to 40 minutes, not ten.
+- **Tests:** freeze-before-load, frozen-source load, frontier budget mapping,
+  export skip, automatic per-tensor, primary-free frontier sweep, farm
+  manifest rebuild, and frontier-only run completion.
+
 ## Splice-farm builder (2026-10-30)
 
 - **Builder:** `splice_farm.build_farm()` now generates the farm that the

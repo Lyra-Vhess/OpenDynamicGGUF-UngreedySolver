@@ -142,6 +142,10 @@ odg run -m functiongemma:latest --from-step optimize     # resume mid-pipeline
 # One command, full control: every step flag threads through, e.g.
 odg run -m <ref> --no-ask --mode llama --perplexity-args "-ngl 99" \
   --jobs 2 --fixed-groups other@global --certificate exhaustive
+
+# Frontier set only: no primary export/measurement, no step-14 export
+odg run -m <ref> --no-ask --certificate exhaustive --budget-mb frontier \
+  --splice-farm ~/splice-farm-<model>
 odg formats
 odg status --model functiongemma:latest
 ```

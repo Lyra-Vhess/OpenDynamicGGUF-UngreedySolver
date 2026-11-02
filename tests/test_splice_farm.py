@@ -1,10 +1,12 @@
 """Splice-farm trial backend (splice_farm.py + step-12 wiring)."""
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 import pytest
 
+import cli
 import sensitivity
 import splice_farm
 from splice_farm import (
@@ -552,6 +554,36 @@ def test_farm_status_reports_missing_rungs(tmp_path):
     status = splice_farm.farm_status(root)
     assert status["complete"] is False
     assert status["missing"] == ["rung720-f16"]
+
+
+def test_ensure_rebuilds_complete_farm_without_manifest(tmp_path, monkeypatch):
+    model = tmp_path / "m.gguf"
+    model.write_bytes(b"m")
+    imatrix = tmp_path / "i.gguf"
+    imatrix.write_bytes(b"i")
+    calls: dict[str, bool] = {}
+
+    monkeypatch.setattr(
+        "splice_farm.farm_status",
+        lambda root: {"complete": True, "manifest": None,
+                      "exists": True, "missing": []},
+    )
+    monkeypatch.setattr(
+        "splice_farm.build_farm",
+        lambda *a, **k: calls.setdefault("build", True),
+    )
+    monkeypatch.setattr(
+        "splice_farm.load_farm",
+        lambda *a, **k: calls.setdefault("load", True),
+    )
+    cli._ensure_splice_farm(
+        argparse.Namespace(splice_farm=tmp_path / "farm"),
+        model_gguf=str(model),
+        gguf_sha256="m-sha",
+        imatrix_gguf=str(imatrix),
+        explain=False,
+    )
+    assert calls == {"build": True, "load": True}
 
 
 def test_census_rejects_two_tensors_per_shard(tmp_path, monkeypatch):

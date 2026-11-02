@@ -677,9 +677,9 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument(
         "--grouping",
         choices=("banded", "per-tensor"),
-        default="banded",
-        help="Group granularity for steps 11b+ (default banded; per-tensor "
-        "for the gold run)",
+        default=None,
+        help="Group granularity for steps 11b+ (default: banded, or "
+        "per-tensor when --certificate exhaustive)",
     )
     p_run.add_argument(
         "--jobs",
@@ -742,9 +742,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_run.add_argument(
         "--budget-mb",
-        type=float,
+        type=_budget_mb_arg,
         default=None,
-        help="Target size in MiB (default: from --quant profile ratio)",
+        help="Target size in MiB, or 'frontier' to measure only the step-13 "
+        "frontier set (skips the primary export and measurement)",
     )
     p_run.add_argument(
         "--budget-ratio",
@@ -883,7 +884,8 @@ def main(argv: list[str] | None = None) -> int:
     p_fit.add_argument("--perplexity-args", default=None, metavar="ARGS")
     p_fit.add_argument("--bands-per-role", type=int, default=3)
     p_fit.add_argument(
-        "--grouping", choices=("banded", "per-tensor"), default="banded"
+        "--grouping", choices=("banded", "per-tensor"), default=None,
+        help="Default: banded, or per-tensor when --certificate exhaustive",
     )
     p_fit.add_argument("--jobs", type=int, default=1)
     p_fit.add_argument("--probe-types", default=None, metavar="TYPES")
@@ -1095,6 +1097,51 @@ def _run_flag(args: argparse.Namespace, name: str, default=None):
     return getattr(args, name, default)
 
 
+def _budget_mb_arg(value: str):
+    """Parse a MiB budget, allowing the literal ``frontier``.
+
+    ``frontier`` means: solve and measure the step-13 frontier set only,
+    with no primary export and no primary measurement.
+    """
+    text = str(value).strip()
+    if text.lower() == "frontier":
+        return "frontier"
+    try:
+        return float(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "--budget-mb must be a number of MiB or 'frontier'"
+        ) from exc
+
+
+def _budget_number(value):
+    """Numeric budget for steps that do not accept the frontier sentinel."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.lower() == "frontier":
+            return None
+        return float(text)
+    return float(value)
+
+
+def _effective_grouping(args: argparse.Namespace) -> str:
+    """Resolve banded/per-tensor, defaulting to per-tensor for exhaustive."""
+    certificate = str(
+        _run_flag(args, "certificate", "bounded") or "bounded"
+    ).lower()
+    grouping = _run_flag(args, "grouping", None)
+    if certificate == "exhaustive":
+        if grouping not in (None, "per-tensor"):
+            raise ValueError(
+                "--certificate exhaustive requires --grouping per-tensor "
+                "(or omit --grouping to select it automatically)"
+            )
+        return "per-tensor"
+    return grouping or "banded"
+
+
 def _pipeline_fmt(store, args):
     """Best-effort quant format for pipeline input comparison.
 
@@ -1155,7 +1202,7 @@ def _pipeline_expected_inputs(step_id: str, args: argparse.Namespace, fmt):
         )
     elif step_id == "reband":
         exp["bands_per_role"] = int(_run_flag(args, "bands_per_role", 3) or 3)
-        exp["grouping"] = _run_flag(args, "grouping", "banded") or "banded"
+        exp["grouping"] = _effective_grouping(args)
     elif step_id == "reference_logits":
         exp["mode"] = _run_flag(args, "mode", "auto") or "auto"
         exp["perplexity_args"] = split_extra_args(
@@ -1182,7 +1229,7 @@ def _pipeline_expected_inputs(step_id: str, args: argparse.Namespace, fmt):
         _sf = _run_flag(args, "splice_farm", None)
         exp["splice_farm"] = str(_sf) if _sf is not None else None
         _sbm = _run_flag(args, "budget_mb", None)
-        exp["budget_mb"] = float(_sbm) if _sbm is not None else None
+        exp["budget_mb"] = _budget_number(_sbm)
         _sbr = _run_flag(args, "budget_ratio", None)
         if _sbr is not None:
             exp["budget_ratio"] = float(_sbr)
@@ -1193,7 +1240,7 @@ def _pipeline_expected_inputs(step_id: str, args: argparse.Namespace, fmt):
             exp["quant_format"] = fmt.id
     elif step_id == "optimize":
         bm = _run_flag(args, "budget_mb", None)
-        exp["budget_mb"] = float(bm) if bm is not None else None
+        exp["budget_mb"] = _budget_number(bm)
         br = _run_flag(args, "budget_ratio", None)
         if br is not None:
             exp["budget_ratio"] = float(br)
@@ -1224,8 +1271,13 @@ def _pipeline_expected_inputs(step_id: str, args: argparse.Namespace, fmt):
     elif step_id == "validate":
         exp["mode"] = _run_flag(args, "validate_mode", "auto") or "auto"
         exp["strict"] = bool(_run_flag(args, "strict", False))
-        exp["frontier"] = bool(_run_flag(args, "frontier", False))
         _vbm = _run_flag(args, "budget_mb", None)
+        frontier_budget = (
+            isinstance(_vbm, str) and _vbm.strip().lower() == "frontier"
+        )
+        exp["frontier"] = bool(
+            _run_flag(args, "frontier", False) or frontier_budget
+        )
         # Standalone validate accepts the literal "frontier"; run/fit
         # carry a numeric MiB budget (or None) — normalize for compare.
         exp["budget_mb"] = _vbm if isinstance(_vbm, str) else (
@@ -1296,6 +1348,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     pipeline = [
         ("resolve", cmd_resolve),
+        ("freeze_gguf", cmd_freeze_gguf),
         ("load", cmd_load),
         ("enumerate", cmd_enumerate),
         ("classify", cmd_classify),
@@ -1303,7 +1356,6 @@ def cmd_run(args: argparse.Namespace) -> int:
         ("weight_features", cmd_weight_features),
         ("corpus", cmd_corpus),
         ("activation_features", cmd_activation_features),
-        ("freeze_gguf", cmd_freeze_gguf),
         ("imatrix", cmd_imatrix),
         ("reband", cmd_reband),
         ("reference_logits", cmd_reference_logits),
@@ -1320,6 +1372,28 @@ def cmd_run(args: argparse.Namespace) -> int:
         "freeze_gguf": "freeze-gguf",
         "reference_logits": "reference-logits",
     }
+
+    budget_raw = _run_flag(args, "budget_mb", None)
+    frontier_budget = (
+        isinstance(budget_raw, str) and budget_raw.strip().lower() == "frontier"
+    )
+    try:
+        grouping = _effective_grouping(args)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if frontier_budget:
+        raw_start = args.from_step.replace("-", "_") if args.from_step else None
+        raw_until = args.until.replace("-", "_") if args.until else None
+        if raw_start == "export" or raw_until == "export":
+            print(
+                "ERROR: --budget-mb frontier skips the step-14 export; "
+                "do not combine it with --from-step export or --until export.",
+                file=sys.stderr,
+            )
+            return 1
+        pipeline = [(sid, fn) for sid, fn in pipeline if sid != "export"]
 
     start_id = args.from_step.replace("-", "_") if args.from_step else pipeline[0][0]
     until_id = args.until.replace("-", "_") if args.until else pipeline[-1][0]
@@ -1382,6 +1456,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         else:
             step_mode = _run_flag(args, "mode", "auto") or "auto"
 
+        step_budget = budget_raw
+        if frontier_budget:
+            step_budget = "frontier" if step_id == "validate" else None
+
         step_args = argparse.Namespace(
             command=step_cli.get(step_id, step_id.replace("_", "-")),
             artifacts=args.artifacts,
@@ -1407,7 +1485,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             mode=step_mode,
             max_docs=int(_run_flag(args, "max_docs", 32) or 32),
             bands_per_role=int(_run_flag(args, "bands_per_role", 3) or 3),
-            grouping=_run_flag(args, "grouping", "banded") or "banded",
+            grouping=grouping,
             convert_script=_run_flag(args, "convert_script", None),
             require_bf16=bool(_run_flag(args, "require_bf16", False)),
             llama_imatrix=None,
@@ -1420,7 +1498,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             probe_types=_run_flag(args, "probe_types", None),
             fixed_groups=_run_flag(args, "fixed_groups", None),
             # threaded through by odg fit (hardware-derived budget)
-            budget_mb=_run_flag(args, "budget_mb", None),
+            budget_mb=step_budget,
             budget_ratio=_run_flag(args, "budget_ratio", None),
             optimizer=_run_flag(args, "optimizer", "dp_mckp") or "dp_mckp",
             kld_objective=_run_flag(args, "kld_objective", "mean") or "mean",
@@ -1682,10 +1760,23 @@ def cmd_load(args: argparse.Namespace) -> int:
         )
         return 0
 
+    freeze_out = store.read_step_output(meta.run_id, "freeze_gguf") or {}
+    freeze_path = freeze_out.get("gguf_path")
+    use_freeze = bool(freeze_path and Path(freeze_path).is_file())
+    load_source = dict(resolve_out)
+    from_step = "resolve"
+    if use_freeze:
+        load_source["local_path"] = freeze_path
+        load_source["source_is_quantized"] = not bool(
+            freeze_out.get("is_bf16_reference")
+        )
+        from_step = "freeze_gguf"
+
     input_data = {
-        "from_step": "resolve",
-        "local_path": resolve_out.get("local_path"),
-        "source_is_quantized": resolve_out.get("source_is_quantized"),
+        "from_step": from_step,
+        "local_path": load_source.get("local_path"),
+        "source_is_quantized": load_source.get("source_is_quantized"),
+        "gguf_sha256": freeze_out.get("gguf_sha256") if use_freeze else None,
     }
 
     try:
@@ -1695,15 +1786,17 @@ def cmd_load(args: argparse.Namespace) -> int:
 
     try:
         with ui.working('Loading model / parsing GGUF…', explain=print_explain):
-            loaded = load_model(resolve_out)
+            loaded = load_model(load_source)
             # Full tensor index for Step 03 (separate artifact — can be large)
-            tensors = tensor_index_from_resolve(resolve_out)
+            tensors = tensor_index_from_resolve(load_source)
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "load", str(exc))
         ui.error(2, "load", exc, store.step_path(meta.run_id, "load"))
         return 1
 
     payload = loaded.to_dict()
+    if use_freeze:
+        payload["gguf_sha256"] = freeze_out.get("gguf_sha256")
     log_text = "\n".join(loaded.steps_log) + "\n"
     store.complete_step(
         meta.run_id,
@@ -1989,9 +2082,14 @@ def cmd_catalog(args: argparse.Namespace) -> int:
 
     resolve_out = store.read_step_output(meta.run_id, "resolve") or {}
     load_out = store.read_step_output(meta.run_id, "load") or {}
+    freeze_out = store.read_step_output(meta.run_id, "freeze_gguf") or {}
 
     source_path = load_out.get("source_path") or resolve_out.get("local_path")
-    source_sha = resolve_out.get("source_sha256")
+    source_sha = load_out.get("gguf_sha256")
+    if not source_sha and freeze_out.get("gguf_path") == source_path:
+        source_sha = freeze_out.get("gguf_sha256")
+    if not source_sha:
+        source_sha = resolve_out.get("source_sha256")
     if source_path and not source_sha:
         try:
             h = hashlib.sha256()
@@ -2467,10 +2565,10 @@ def cmd_freeze_gguf(args: argparse.Namespace) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    if not store.is_step_done(meta.run_id, "activation_features"):
+    if not store.is_step_done(meta.run_id, "resolve"):
         print(
-            "ERROR: Step 08 (activation-features) is not done.\n"
-            f"  Run: odg activation-features --model {meta.model_ref}",
+            "ERROR: Step 01 (resolve) is not done.\n"
+            f"  Run: odg resolve --model {meta.model_ref}",
             file=sys.stderr,
         )
         return 1
@@ -2494,9 +2592,11 @@ def cmd_freeze_gguf(args: argparse.Namespace) -> int:
     resolve_out = store.read_step_output(meta.run_id, "resolve") or {}
     load_out = store.read_step_output(meta.run_id, "load") or {}
 
-    source_path = load_out.get("source_path") or resolve_out.get("local_path")
+    # Always freeze the resolved source, not an already-frozen load source:
+    # after the pipeline reorder, load_out.source_path is the step-09 file.
+    source_path = resolve_out.get("local_path") or load_out.get("source_path")
     source_is_quantized = bool(
-        load_out.get("source_is_quantized") or resolve_out.get("source_is_quantized")
+        resolve_out.get("source_is_quantized") or load_out.get("source_is_quantized")
     )
 
     hf_local = None
@@ -2513,8 +2613,9 @@ def cmd_freeze_gguf(args: argparse.Namespace) -> int:
             catalog_names = list((cat.get("tensors") or {}).keys())
             break
 
+    load_done = store.is_step_done(meta.run_id, "load")
     input_data = {
-        "from_step": "activation_features",
+        "from_step": "load" if load_done else "resolve",
         "mode": args.mode,
         "source_path": source_path,
         "hf_local_path": hf_local,
@@ -3073,19 +3174,21 @@ def _ensure_splice_farm(
             "The farm bakes in that imatrix, so build the imatrix first."
         )
     status = farm_status(farm_root)
-    if not status["complete"]:
-        detail = (
-            "missing"
-            if not status["exists"]
-            else "incomplete ("
-            + (", ".join(status["missing"]) or "uneven shard counts")
-            + ")"
-        )
+    missing_manifest = status.get("manifest") is None
+    if not status["complete"] or missing_manifest:
+        if not status["exists"]:
+            detail = "missing"
+        elif missing_manifest and status["complete"]:
+            detail = "complete but missing farm_manifest.json"
+        else:
+            detail = "incomplete (" + (
+                ", ".join(status["missing"]) or "uneven shard counts"
+            ) + ")"
         if explain:
             print(
                 f"Splice farm {farm_root} is {detail}. Building it from "
                 f"{Path(model_gguf).name} + imatrix.gguf now. Expect roughly "
-                "6 GB of shards per GB of model and about ten minutes.",
+                "6 GB of shards per GB of model and 20 to 40 minutes.",
                 flush=True,
             )
         build_farm(
@@ -3219,7 +3322,7 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
         "kld_objective": getattr(args, "kld_objective", "mean"),
         "certificate": getattr(args, "certificate", "bounded"),
         "lipschitz": getattr(args, "lipschitz", None),
-        "budget_mb": getattr(args, "budget_mb", None),
+        "budget_mb": _budget_number(getattr(args, "budget_mb", None)),
         "budget_ratio": (
             float(getattr(args, "budget_ratio"))
             if getattr(args, "budget_ratio", None) is not None
@@ -3267,9 +3370,9 @@ def cmd_sensitivity(args: argparse.Namespace) -> int:
         pricing_reference_budget as _sens_ref,
     )
 
-    _sens_bm = getattr(args, "budget_mb", None)
+    _sens_bm = _budget_number(getattr(args, "budget_mb", None))
     if _sens_bm is not None:
-        _intended = int(float(_sens_bm) * 1024 * 1024)
+        _intended = int(_sens_bm * 1024 * 1024)
     else:
         _sens_br = getattr(args, "budget_ratio", None)
         _intended = _sens_budget(
@@ -3439,9 +3542,10 @@ def cmd_optimize(args: argparse.Namespace) -> int:
                   file=sys.stderr)
             file_overhead_bytes = 0
 
+    _opt_bm = _budget_number(args.budget_mb)
     budget_bytes = None
-    if args.budget_mb is not None:
-        budget_bytes = int(float(args.budget_mb) * 1024 * 1024)
+    if _opt_bm is not None:
+        budget_bytes = int(_opt_bm * 1024 * 1024)
     budget_ratio = (
         float(args.budget_ratio)
         if args.budget_ratio is not None
@@ -3450,7 +3554,7 @@ def cmd_optimize(args: argparse.Namespace) -> int:
 
     input_data = {
         "from_step": "sensitivity",
-        "budget_mb": args.budget_mb,
+        "budget_mb": _opt_bm,
         "budget_ratio": budget_ratio,
         "quant_format": fmt.id,
         "gguf_sha256": freeze_out.get("gguf_sha256"),
@@ -3742,14 +3846,16 @@ def cmd_export(args: argparse.Namespace) -> int:
 def _validate_frontier(
     store, meta, step_dir: Path, optimize_manifest: dict | None,
     ref_out: dict, export_out: dict, args: argparse.Namespace,
-    *, keep_winner: bool,
+    *, keep_winner: bool, include_primary: bool = True,
+    base_type: str | None = None,
 ) -> dict[str, Any]:
-    """Step-15 frontier sweep: measure the 9-point recipe set, plot it.
+    """Step-15 frontier sweep: measure the selected recipe set, plot it.
 
     Recipes come from the step-13 manifest frontier selection (BPW
-    points) plus the primary recipe.yaml. Exports are transient; with
-    keep_winner=False every GGUF is deleted after measuring (export
-    deferred — plots + frontier.json stay).
+    points). The primary recipe.yaml is included only when include_primary
+    is true; the frontier-budget path sets it false, so no primary quant is
+    measured. Exports are transient; with keep_winner=False every GGUF is
+    deleted after measuring (plots + frontier.json stay).
     """
     from validate import run_sweep
 
@@ -3778,7 +3884,11 @@ def _validate_frontier(
         if p.is_file() and str(p) not in files:
             files.append(str(p))
     primary_recipe = opt_dir / "recipe.yaml"
-    if primary_recipe.is_file() and str(primary_recipe) not in files:
+    if (
+        include_primary
+        and primary_recipe.is_file()
+        and str(primary_recipe) not in files
+    ):
         files.append(str(primary_recipe))
     if not files:
         raise ValueError(
@@ -3857,7 +3967,7 @@ def _validate_frontier(
         heldout_txt=Path(heldout_txt),
         heldout_bin=Path(heldout_bin),
         out_dir=step_dir / "frontier",
-        base_type=export_out.get("base_type") or "q4_k_m",
+        base_type=export_out.get("base_type") or base_type or "q4_k_m",
         llama_quantize=getattr(args, "llama_quantize", None),
         llama_perplexity=(
             str(args.llama_perplexity)
@@ -4014,6 +4124,8 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     store, meta, step_dir, optimize_manifest,
                     ref_out, export_out, args,
                     keep_winner=not frontier_only,
+                    include_primary=not frontier_only,
+                    base_type=resolve_out.get("quant_base_type"),
                 )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "validate", str(exc))
@@ -4042,7 +4154,12 @@ def cmd_validate(args: argparse.Namespace) -> int:
     # Mark run complete when validate finishes
     try:
         meta2 = store.load_run(meta.run_id)
-        if result is not None and result.verdict in {"RELEASE", "PROVISIONAL"}:
+        released = (
+            result is not None
+            and result.verdict in {"RELEASE", "PROVISIONAL"}
+        )
+        frontier_only_done = result is None and frontier_record is not None
+        if released or frontier_only_done:
             meta2.status = "done"
             meta2.current_step = None
             store._write_run_meta(meta2)  # noqa: SLF001
@@ -4235,7 +4352,7 @@ def cmd_fit(args: argparse.Namespace) -> int:
         prefer_hf=bool(args.prefer_hf),
         download_weights=bool(args.download_weights),
         until=args.until,
-        from_step="load",
+        from_step="freeze_gguf",
         quiet=bool(args.quiet),
         no_explain=args.no_explain,
         budget_mb=plan.weight_budget_mb,
@@ -4253,7 +4370,7 @@ def cmd_fit(args: argparse.Namespace) -> int:
         imatrix_args=_run_flag(args, "imatrix_args", None),
         perplexity_args=_run_flag(args, "perplexity_args", None),
         bands_per_role=int(_run_flag(args, "bands_per_role", 3) or 3),
-        grouping=_run_flag(args, "grouping", "banded") or "banded",
+        grouping=_run_flag(args, "grouping", None),
         jobs=int(_run_flag(args, "jobs", 1) or 1),
         probe_types=_run_flag(args, "probe_types", None),
         fixed_groups=_run_flag(args, "fixed_groups", None),
@@ -4599,7 +4716,9 @@ def _banner_freeze_gguf(model: str, run_id: str, root: str) -> None:
         run_id=run_id,
         root=root,
         goal="Freeze the reference GGUF used for imatrix / logits / export.",
-        bullets=["Promotes Ollama/HF source into a stable model-ref.gguf"],
+        bullets=[
+            "Converts an HF checkpoint to BF16, or promotes a resolved GGUF"
+        ],
     )
 
 

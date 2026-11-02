@@ -107,9 +107,19 @@ odg run --model functiongemma:latest -q q4_k_m --new-run --no-ask
 # stop early / resume mid-pipeline
 odg run --model functiongemma:latest -q q4_k_m --until optimize --no-ask
 odg run --model functiongemma:latest --from-step export --no-ask
+
+# frontier set only: no primary quant, no step-14 export
+odg run --model functiongemma:latest -q q4_k_m --no-ask \
+  --certificate exhaustive --budget-mb frontier \
+  --splice-farm ~/splice-farm-<model> --jobs 2
 ```
 
 This runs steps **01 → 15** into a checkpointed run under `artifacts/runs/<run-id>/`.
+The pipeline freezes first (step 09), then loads the frozen text GGUF for
+steps 02–08. In `--budget-mb frontier` mode steps 12–13 still solve a primary
+allocation so step 13 can write its exhaustive certificate, but no primary
+GGUF is exported or measured. Step 14 is skipped entirely; step 15 measures
+only the frontier recipes and leaves the run complete.
 
 After it finishes, always check whether export was real:
 
@@ -130,7 +140,11 @@ MODEL=functiongemma:latest
 # 01 · any ref → original full-precision / working GGUF + architecture descriptor
 odg resolve --model $MODEL --quant q4_k_m --no-ask
 
-# 02–05 · open model → inventory → roles → tensor_catalog.json
+# 09 · freeze hashed GGUF reference (HF→BF16 if possible, else promote source)
+#      Run this before load: steps 02–08 index this frozen text GGUF.
+odg freeze-gguf --model $MODEL
+
+# 02–05 · open frozen model → inventory → roles → tensor_catalog.json
 odg load        --model $MODEL
 odg enumerate   --model $MODEL
 odg classify    --model $MODEL
@@ -144,9 +158,6 @@ odg corpus --model $MODEL --target-tokens 300000
 
 # 08 · activation stats (forward if BF16+torch available, else proxy)
 odg activation-features --model $MODEL
-
-# 09 · freeze hashed GGUF reference (HF→BF16 if possible, else promote source)
-odg freeze-gguf --model $MODEL
 
 # 10–11 · imatrix + reference logits (llama tools if present, else proxy)
 odg imatrix           --model $MODEL
@@ -343,9 +354,15 @@ Every step directory also has `input.json`, `output.json`, `status.json`, and `l
 | `--download-weights` | `resolve`, `run` | Fetch resolved weights. |
 | `--mode auto\|llama\|dry-run` | `export` | `auto` falls back to dry-run; `llama` requires the binary. |
 | `--mode auto\|llama\|proxy` | `imatrix`, `reference-logits`, `sensitivity`, `validate` | Prefer real llama tools or stay in proxy. |
-| `--budget-mb` / `--budget-ratio` | `optimize` | Override the size budget. |
+| `--budget-mb` / `--budget-ratio` | `optimize`, `run` | Override the size budget. On `run`, the literal `frontier` skips the primary export and measurement. |
+| `--budget-mb` | `validate` | The literal `frontier` measures the frontier selection only; requires the exhaustive certificate. |
+| `--frontier` | `run`, `validate` | Also measure the frontier recipe set (primary included when a numeric budget is used). |
+| `--freeze-mode` | `freeze-gguf`, `run` | `auto` converts an HF directory or promotes a GGUF; `hf-convert` and `promote` force one path. |
+| `--require-bf16` | `freeze-gguf`, `run` | Fail unless the frozen file is BF16/F16. Use it when the resolved source may be a quantized GGUF. |
+| `--grouping` | `reband`, `run`, `fit` | `banded` or `per-tensor`. On `run`/`fit`, omission means per-tensor when `--certificate exhaustive`, otherwise banded. |
+| `--splice-farm` | `sensitivity`, `run`, `fit` | Per-tensor rung-shard farm. Built from the frozen model and imatrix when missing or incomplete. |
 | `--strict` | `validate` | Fail if there is no real GGUF (no PROVISIONAL). |
-| `--until` / `--from-step` | `run` | Partial pipeline. |
+| `--until` / `--from-step` | `run` | Partial pipeline. A frontier budget rejects the export step. |
 | `--artifacts` | global | Change artifacts root (default `./artifacts`). |
 
 ---
@@ -384,14 +401,13 @@ Expected after a dry-run export. Re-export with `--mode llama`, then validate ag
 
 ### Source GGUF is Q8, not BF16
 
-`odg freeze-gguf` in `auto` mode may **promote** a working Ollama/local GGUF when HF→BF16 conversion isn’t available. For a true BF16 freeze:
+`odg freeze-gguf` in `auto` mode **promotes** a working Ollama/local GGUF when HF→BF16 conversion isn’t available. When the resolved source is an HF directory with config plus safetensors, `auto` converts it to BF16 without extra flags. Add `--require-bf16` to fail on a promoted quantized GGUF:
 
 ```bash
-export LLAMA_CPP_DIR=~/llama.cpp
-odg freeze-gguf --model <model> --mode hf-convert --require-bf16 --force
+odg freeze-gguf --model <model> --require-bf16 --force
 ```
 
-(Requires a resolved HF checkpoint + `convert_hf_to_gguf.py`.)
+A local `LLAMA_CPP_DIR` or `~/llama.cpp` is used when present; otherwise the converter is fetched into `~/.cache/odg/llama.cpp/<sha>/`.
 
 ### Proxy imatrix / logits
 

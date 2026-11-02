@@ -108,6 +108,98 @@ def test_frontier_gate_requires_exhaustive(tmp_path):
         )
 
 
+def test_frontier_budget_excludes_primary_recipe(monkeypatch, tmp_path):
+    from store import RunStore
+
+    store = RunStore(tmp_path)
+    meta = store.create_run("m")
+    opt = store.step_path(meta.run_id, "optimize")
+    (opt / "pareto").mkdir(parents=True)
+    frontier = _recipe(
+        opt / "pareto" / "frontier-bpw-3.yaml",
+        budget=100, pred=0.02, bodies={"a": "Q4_K"},
+    )
+    _recipe(opt / "recipe.yaml", budget=200, pred=0.01,
+            bodies={"a": "Q5_K"})
+    frozen = tmp_path / "frozen.gguf"
+    frozen.write_bytes(b"f")
+    store.begin_step(meta.run_id, "freeze_gguf", {})
+    store.complete_step(meta.run_id, "freeze_gguf", {
+        "gguf_path": str(frozen), "gguf_sha256": "abc",
+    })
+    heldout = tmp_path / "heldout.txt"
+    heldout.write_text("x", encoding="utf-8")
+    heldout_bin = tmp_path / "heldout.bin"
+    heldout_bin.write_bytes(b"x")
+
+    manifest = {
+        "primary": {"certificate": {"mode": "exhaustive"}},
+        "frontier": {"selection": {"3": {"path": str(frontier)}}},
+    }
+    seen: dict = {}
+
+    def fake_sweep(**kwargs):
+        seen.update(kwargs)
+        return {"n_measured": 1, "plots": [], "winner": {}}
+
+    monkeypatch.setattr("validate.run_sweep", fake_sweep)
+    _validate_frontier(
+        store, meta, tmp_path / "val", manifest,
+        {"heldout_path": str(heldout),
+         "logits_heldout_path": str(heldout_bin)},
+        {}, argparse.Namespace(
+            llama_quantize=None, llama_perplexity=None,
+            perplexity_args=None,
+        ),
+        keep_winner=False, include_primary=False,
+        base_type="q4_k_m",
+    )
+    names = [Path(p).name for p in seen["recipe_files"]]
+    assert names == ["frontier-bpw-3.yaml"]
+    assert seen["base_type"] == "q4_k_m"
+    assert seen["keep_winner"] is False
+
+
+def test_frontier_only_marks_run_done(monkeypatch, tmp_path):
+    from store import RunStore
+
+    store = RunStore(tmp_path)
+    meta = store.create_run("m")
+    run_id = meta.run_id
+    store.begin_step(run_id, "resolve", {})
+    store.complete_step(run_id, "resolve", {
+        "descriptor": {}, "quant_base_type": "q4_k_m",
+    })
+    store.begin_step(run_id, "optimize", {})
+    store.complete_step(run_id, "optimize", {"assignments": {}})
+    (store.step_path(run_id, "optimize") / "recipe.yaml").write_text(
+        "schema: odg/recipe/v1\n", encoding="utf-8"
+    )
+    reband = store.step_path(run_id, "reband")
+    (reband / "tensor_catalog.json").write_text(
+        json.dumps({"tensors": {"x": {"n_elements": 1}}}),
+        encoding="utf-8",
+    )
+    store.begin_step(run_id, "reference_logits", {})
+    store.complete_step(run_id, "reference_logits", {
+        "heldout_path": str(tmp_path / "h.txt"),
+        "logits_heldout_path": str(tmp_path / "h.bin"),
+    })
+    monkeypatch.setattr(
+        cli, "_validate_frontier",
+        lambda *a, **k: {"n_measured": 8, "plots": [], "winner": {},
+                         "out_dir": str(tmp_path)},
+    )
+    code = cli.cmd_validate(argparse.Namespace(
+        artifacts=tmp_path, model="m", run=run_id,
+        force=True, no_explain=True, mode="llama", strict=False,
+        budget_mb="frontier", frontier=False, perplexity_args=None,
+        llama_perplexity=None, llama_quantize=None,
+    ))
+    assert code == 0
+    assert store.load_run(run_id).status == "done"
+
+
 def test_validate_frontier_flags(monkeypatch, tmp_path):
     seen: dict[str, argparse.Namespace] = {}
 

@@ -20,6 +20,7 @@ Each step file answers the same questions:
 
 ```text
 01 Resolve model ref ──────────────► original BF16 HF checkpoint
+09 Freeze BF16 GGUF ──────────────► frozen text GGUF (runs before load)
 02 Load model
 03 Enumerate tensors (state_dict)
 04 Classify roles (attn / mlp / …)
@@ -27,7 +28,6 @@ Each step file answers the same questions:
 06 Compute weight features ────────► (no text needed)
 07 Build calibration corpus ───────► calib / search / held-out
 08 Compute activation features ────► (needs calib text)
-09 Freeze BF16 GGUF
 10 Build imatrix
 11b Imatrix re-banding ───────────► measured depth bands
 11 Cache reference logits
@@ -36,6 +36,10 @@ Each step file answers the same questions:
 14 Export GGUF
 15 Validate & release
 ```
+
+The step numbers stay stable. In `odg run`, freeze executes second so steps
+02–08 analyze the frozen text GGUF. A multimodal HF checkpoint's audio and
+vision towers are not converted and do not enter the catalog.
 
 ---
 

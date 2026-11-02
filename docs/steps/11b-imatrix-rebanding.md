@@ -17,7 +17,10 @@ odg reband --model functiongemma:latest
 
 `odg run` executes this step automatically after step 10 (imatrix). Use
 `--bands-per-role N` to change the number of bands and `--grouping per-tensor`
-to skip banding.
+to skip banding. On `odg run` and `odg fit`, omitting `--grouping` selects
+`per-tensor` when `--certificate exhaustive` is set, otherwise `banded`.
+Standalone `odg reband` still defaults to `banded`; explicit `banded` with
+`--certificate exhaustive` is rejected.
 
 ## How it works
 

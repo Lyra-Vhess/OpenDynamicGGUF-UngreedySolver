@@ -9,12 +9,14 @@ non-interactive sessions warn and keep the checkpoint.
 """
 
 import argparse
+import json
 
 import pytest
 
 import cli
 from cli import (
     _check_stale_step,
+    _effective_grouping,
     _pipeline_expected_inputs,
 )
 
@@ -46,6 +48,7 @@ def _pipeline_ns(**over):
         imatrix_args=None,
         perplexity_args=None,
         bands_per_role=3,
+        grouping=None,
         jobs=1,
         probe_types=None,
         fixed_groups=None,
@@ -60,6 +63,8 @@ def _pipeline_ns(**over):
         base_type=None,
         validate_mode="auto",
         strict=False,
+        frontier=False,
+        splice_farm=None,
         only_quantizable=True,
     )
     base.update(over)
@@ -124,6 +129,26 @@ def test_expected_inputs_optimize_budget_resolution():
     )
     assert exp2["budget_mb"] == pytest.approx(4888.0)
     assert exp2["budget_ratio"] == pytest.approx(0.72)
+
+
+def test_frontier_budget_and_exhaustive_grouping():
+    from quant_formats import get_format
+
+    fmt = get_format("q4_k_m")
+    args = _pipeline_ns(certificate="exhaustive", budget_mb="frontier")
+
+    assert _effective_grouping(args) == "per-tensor"
+    assert _pipeline_expected_inputs("sensitivity", args, fmt)["budget_mb"] is None
+    assert _pipeline_expected_inputs("optimize", args, fmt)["budget_mb"] is None
+    val = _pipeline_expected_inputs("validate", args, fmt)
+    assert val["budget_mb"] == "frontier"
+    assert val["frontier"] is True
+    assert _pipeline_expected_inputs("reband", args, fmt)["grouping"] == "per-tensor"
+
+    with pytest.raises(ValueError, match="per-tensor"):
+        _effective_grouping(
+            _pipeline_ns(certificate="exhaustive", grouping="banded")
+        )
 
 
 def test_expected_inputs_chunks_normalization():
@@ -291,6 +316,143 @@ def test_run_threads_flags_to_step_namespaces(monkeypatch, tmp_path):
     # Global probe mode reaches the llama-capable steps untouched.
     assert seen["cmd_imatrix"].mode == "auto"
     assert seen["cmd_sensitivity"].mode == "auto"
+
+
+def test_run_frontier_reorders_and_skips_export(monkeypatch, tmp_path):
+    order: list[str] = []
+    seen: dict[str, argparse.Namespace] = {}
+
+    def fake(name):
+        def _fn(args: argparse.Namespace) -> int:
+            order.append(name)
+            seen[name] = args
+            return 0
+        return _fn
+
+    for step_fn in ("cmd_resolve", "cmd_load", "cmd_enumerate", "cmd_classify",
+                    "cmd_catalog", "cmd_weight_features", "cmd_corpus",
+                    "cmd_activation_features", "cmd_freeze_gguf", "cmd_imatrix",
+                    "cmd_reband", "cmd_reference_logits", "cmd_sensitivity",
+                    "cmd_optimize", "cmd_export", "cmd_validate"):
+        monkeypatch.setattr(cli, step_fn, fake(step_fn))
+
+    code = cli.main([
+        "--artifacts", str(tmp_path),
+        "run", "--model", "m", "--quant", "q4_k_m", "--no-ask",
+        "--certificate", "exhaustive",
+        "--budget-mb", "frontier",
+        "--quiet", "--no-explain",
+    ])
+    assert code == 0
+    assert order.index("cmd_freeze_gguf") < order.index("cmd_load")
+    assert "cmd_export" not in order
+    assert seen["cmd_reband"].grouping == "per-tensor"
+    assert seen["cmd_load"].grouping == "per-tensor"
+    assert seen["cmd_sensitivity"].budget_mb is None
+    assert seen["cmd_optimize"].budget_mb is None
+    assert seen["cmd_validate"].budget_mb == "frontier"
+
+
+def test_run_frontier_rejects_export_target(tmp_path):
+    assert cli.main([
+        "--artifacts", str(tmp_path),
+        "run", "--model", "m", "--budget-mb", "frontier",
+        "--until", "export",
+    ]) == 1
+
+
+def test_freeze_prefers_resolved_source_over_frozen_load(monkeypatch, tmp_path):
+    from store import RunStore
+
+    store = RunStore(tmp_path)
+    meta = store.create_run("m")
+    hf_dir = tmp_path / "hf"
+    hf_dir.mkdir()
+    frozen = tmp_path / "frozen.gguf"
+    frozen.write_bytes(b"frozen")
+    store.begin_step(meta.run_id, "resolve", {})
+    store.complete_step(meta.run_id, "resolve", {
+        "local_path": str(hf_dir),
+        "source_is_quantized": False,
+    })
+    store.begin_step(meta.run_id, "load", {})
+    store.complete_step(meta.run_id, "load", {
+        "source_path": str(frozen),
+        "source_is_quantized": False,
+    })
+    seen: dict = {}
+
+    class Result:
+        steps_log = ["frozen"]
+        gguf_path = str(frozen)
+        def summary_dict(self):
+            return {"gguf_path": str(frozen), "gguf_sha256": "abc",
+                    "is_bf16_reference": True}
+
+    def fake_freeze(**kwargs):
+        seen.update(kwargs)
+        return Result()
+
+    monkeypatch.setattr("freeze.freeze_gguf", fake_freeze)
+    code = cli.cmd_freeze_gguf(argparse.Namespace(
+        artifacts=tmp_path, model="m", run=meta.run_id,
+        force=True, no_explain=True, mode="auto",
+        convert_script=None, require_bf16=False,
+    ))
+    assert code == 0
+    assert seen["source_path"] == str(hf_dir)
+    assert seen["hf_local_path"] == str(hf_dir)
+
+
+def test_load_uses_frozen_gguf(monkeypatch, tmp_path):
+    from store import RunStore
+
+    store = RunStore(tmp_path)
+    meta = store.create_run("m")
+    hf_dir = tmp_path / "hf"
+    hf_dir.mkdir()
+    frozen = tmp_path / "frozen.gguf"
+    frozen.write_bytes(b"frozen")
+
+    store.begin_step(meta.run_id, "resolve", {"model": "m"})
+    store.complete_step(meta.run_id, "resolve", {
+        "local_path": str(hf_dir),
+        "source_is_quantized": False,
+        "descriptor": {"family": "gemma4"},
+    })
+    store.begin_step(meta.run_id, "freeze_gguf", {})
+    store.complete_step(meta.run_id, "freeze_gguf", {
+        "gguf_path": str(frozen),
+        "gguf_sha256": "abc123",
+        "is_bf16_reference": True,
+    })
+
+    seen: dict = {}
+
+    class Loaded:
+        steps_log = ["loaded"]
+        def to_dict(self):
+            return {"backend": "gguf", "source_path": str(frozen)}
+
+    def fake_load(source):
+        seen["source"] = dict(source)
+        return Loaded()
+
+    monkeypatch.setattr("load.load_model", fake_load)
+    monkeypatch.setattr("load.tensor_index_from_resolve", lambda source: [])
+
+    code = cli.cmd_load(argparse.Namespace(
+        artifacts=tmp_path, model="m", run=meta.run_id,
+        force=True, no_explain=True,
+    ))
+    assert code == 0
+    assert seen["source"]["local_path"] == str(frozen)
+    assert seen["source"]["source_is_quantized"] is False
+    recorded = json.loads(
+        (store.step_path(meta.run_id, "load") / "input.json").read_text()
+    )
+    assert recorded["from_step"] == "freeze_gguf"
+    assert recorded["gguf_sha256"] == "abc123"
 
 
 def test_grouping_flag_parsers_and_stale_key(monkeypatch, tmp_path):
