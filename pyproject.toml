@@ -61,6 +61,7 @@ py-modules = [
   "colgen",
   "weight_features",
   "corpus",
+  "chat_template",
   "dp_mckp",
   "activation_features",
   "freeze",

@@ -33,14 +33,37 @@ GOOD: gemma4:e2b-mlx → find original HF BF16 → use that
 **Architecture descriptor** (example fields):
 
 ```yaml
-family: gemma
-layer_count: 18
+family: gemma4
+layer_count: 42
 is_moe: false
 is_hybrid_ssm: false
-chat_template: gemma
+chat_template: gemma4
+chat_template_text: "…full Jinja source…"
+chat_template_source: local:chat_template.jinja
+chat_template_sha256: "603a42db…"
+chat_template_variant: null
+bos_token: "<bos>"
+eos_token: "<eos>"
+add_bos_token: true
 specialty_domain: null   # or "function_calling" for FunctionGemma
-source_sha256: "…"
 ```
+
+---
+
+## Chat template resolution
+
+The resolver stores the model's actual template, not a family name.
+
+| Source | Order |
+|---|---|
+| Local directory | `chat_template.jinja`, inline `chat_template` in `tokenizer_config.json`, `chat_template.json`, `config.json` |
+| HF snapshot | Same local order; the small template files are fetched when only `config.json` was downloaded |
+| GGUF / Ollama | `tokenizer.chat_template` in the GGUF metadata |
+| Override | `--chat-template` (Jinja text or llama.cpp built-in name) or `--chat-template-file` |
+
+A template list uses the entry named `default`, otherwise the first. The
+chosen variant is recorded. If no template exists, the descriptor has no
+template text and Step 07 fails. The resolver does not guess a family format.
 
 ---
 
@@ -111,7 +134,7 @@ def resolve(user_ref: str) -> ResolvedModel:
 ## Done when
 
 - [x] You have identified the **full-precision** upstream (`google/functiongemma-270m-it` for `functiongemma:latest`)
-- [x] Descriptor has family, layer count, chat template, specialty domain (from Ollama/GGUF metadata; HF config when unlocked)
+- [x] Descriptor has family, layer count, the actual chat-template text, its source and SHA-256, and specialty domain
 - [ ] Source BF16 weights downloaded (requires Hugging Face login for gated Gemma repos)
 
 ## Implementation

@@ -71,6 +71,17 @@ def _pipeline_ns(**over):
     return argparse.Namespace(**base)
 
 
+def test_expected_inputs_template_override_reaches_resolve_and_corpus():
+    args = _pipeline_ns(
+        chat_template="chatml", chat_template_file=None,
+    )
+    res = _pipeline_expected_inputs("resolve", args, fmt=None)
+    assert res["chat_template"] == "chatml"
+    corpus = _pipeline_expected_inputs("corpus", args, fmt=None)
+    assert corpus["chat_template"] == "chatml"
+    assert corpus["chat_template_file"] is None
+
+
 def test_expected_inputs_sensitivity():
     args = _pipeline_ns(
         jobs=3, perplexity_args="-ngl 99", fixed_groups="other@global",

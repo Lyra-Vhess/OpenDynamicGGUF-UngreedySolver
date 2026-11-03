@@ -11,6 +11,14 @@ import json
 import struct
 import subprocess
 
+from chat_template import (
+    TemplateInfo,
+    apply_override,
+    load_local_template,
+    select_variant,
+    template_from_text,
+)
+
 
 # --- from resolve/types.py ---
 class SourceKind(str, Enum):
@@ -34,6 +42,14 @@ class ArchitectureDescriptor:
     is_moe: bool = False
     is_hybrid_ssm: bool = False
     chat_template: str | None = None
+    chat_template_text: str | None = None
+    chat_template_source: str | None = None
+    chat_template_sha256: str | None = None
+    chat_template_variant: str | None = None
+    chat_template_builtin: str | None = None
+    bos_token: str | None = None
+    eos_token: str | None = None
+    add_bos_token: bool | None = None
     specialty_domain: str | None = None
     # Provenance / warnings
     ollama_quantization: str | None = None
@@ -214,9 +230,9 @@ def inspect_local_dir(path: Path) -> tuple[ArchitectureDescriptor, bool]:
         embedding_length=config.get("hidden_size"),
         context_length=config.get("max_position_embeddings"),
         is_moe=bool(config.get("num_local_experts") or config.get("num_experts")),
-        chat_template=_guess_chat_template(path, family),
         specialty_domain=_guess_specialty(path, family),
     )
+    _apply_template_info(desc, load_local_template(path, label=family))
     if looks_quantized:
         desc.notes.append(
             "config.json contains quantization_config — this directory may not be BF16."
@@ -224,13 +240,22 @@ def inspect_local_dir(path: Path) -> tuple[ArchitectureDescriptor, bool]:
     return desc, not looks_quantized
 
 
-def _guess_chat_template(path: Path, family: str) -> str | None:
-    tok = path / "tokenizer_config.json"
-    if tok.is_file():
-        data = json.loads(tok.read_text())
-        if data.get("chat_template"):
-            return family
-    return family or None
+def _apply_template_info(
+    desc: ArchitectureDescriptor, info: TemplateInfo | None
+) -> ArchitectureDescriptor:
+    if info is None:
+        return desc
+    desc.chat_template = info.label or desc.family
+    desc.chat_template_text = info.text
+    desc.chat_template_source = info.source
+    desc.chat_template_sha256 = info.sha256
+    desc.chat_template_variant = info.variant
+    desc.chat_template_builtin = info.builtin
+    desc.bos_token = info.bos_token or desc.bos_token
+    desc.eos_token = info.eos_token or desc.eos_token
+    if info.add_bos_token is not None:
+        desc.add_bos_token = info.add_bos_token
+    return desc
 
 
 def _guess_specialty(path: Path, family: str) -> str | None:
@@ -270,7 +295,7 @@ def descriptor_from_hf_config(
         embedding_length=config.get("hidden_size"),
         context_length=config.get("max_position_embeddings"),
         is_moe=bool(config.get("num_local_experts") or config.get("num_experts")),
-        chat_template=family,
+        chat_template=None,
         specialty_domain=specialty,
     )
 
@@ -346,6 +371,8 @@ class OllamaInspectResult:
     model_blob_path: Path | None = None
     config_blob: dict | None = None
     upstream_hf: str | None = None
+    chat_template_text: str | None = None
+    add_bos_token: bool | None = None
     is_quantized: bool = True
     raw_show: str = ""
 
@@ -463,7 +490,19 @@ def read_gguf_metadata(path: Path, max_keys: int = 64) -> dict[str, object]:
         for _ in range(min(n_kv, max_keys * 4)):
             key = read_str(f)
             t = struct.unpack("<I", f.read(4))[0]
-            keep = key.startswith("general.") or ".block_count" in key or ".context_length" in key or ".embedding_length" in key or key.endswith(".architecture")
+            keep = (
+                key.startswith("general.")
+                or ".block_count" in key
+                or ".context_length" in key
+                or ".embedding_length" in key
+                or key.endswith(".architecture")
+                or key == "tokenizer.chat_template"
+                or key in {
+                    "tokenizer.ggml.add_bos_token",
+                    "tokenizer.ggml.bos_token_id",
+                    "tokenizer.ggml.eos_token_id",
+                }
+            )
             if keep:
                 interesting[key] = read_val(f, t)
             else:
@@ -521,8 +560,14 @@ def inspect_ollama(tag: str, ollama_root: Path | None = None) -> OllamaInspectRe
             blob = _digest_to_blob(root, layer["digest"])
             result.model_blob_path = blob
             if blob.is_file():
-                meta = read_gguf_metadata(blob)
+                meta = read_gguf_metadata(blob, max_keys=256)
                 result.architecture = result.architecture or _as_str(meta.get("general.architecture"))
+                ct = meta.get("tokenizer.chat_template")
+                if isinstance(ct, str) and ct.strip():
+                    result.chat_template_text = ct
+                ab = meta.get("tokenizer.ggml.add_bos_token")
+                if isinstance(ab, bool):
+                    result.add_bos_token = ab
                 pc = meta.get("general.parameter_count")
                 if isinstance(pc, int):
                     result.parameter_count = pc
@@ -572,6 +617,8 @@ def resolve_model(
     prefer_hf: bool = False,
     hf_token: str | None = None,
     ollama_root: str | Path | None = None,
+    chat_template: str | None = None,
+    chat_template_file: str | Path | None = None,
 ) -> ResolvedModel:
     """
     Resolve ``user_ref``.
@@ -592,13 +639,13 @@ def resolve_model(
     log.append(f"1. Classified {user_ref!r} as {kind.value.upper()}")
 
     if kind == SourceKind.LOCAL:
-        return _resolve_local(user_ref, log)
-
-    if kind == SourceKind.MLX:
-        return _resolve_mlx(user_ref, log, cache, download_weights, hf_token)
-
-    if kind == SourceKind.OLLAMA:
-        return _resolve_ollama(
+        result = _resolve_local(user_ref, log)
+    elif kind == SourceKind.MLX:
+        result = _resolve_mlx(
+            user_ref, log, cache, download_weights, hf_token
+        )
+    elif kind == SourceKind.OLLAMA:
+        result = _resolve_ollama(
             user_ref,
             log,
             cache,
@@ -607,8 +654,20 @@ def resolve_model(
             hf_token=hf_token,
             ollama_root=ollama_root,
         )
+    else:
+        result = _resolve_hf(user_ref, log, cache, download_weights, hf_token)
 
-    return _resolve_hf(user_ref, log, cache, download_weights, hf_token)
+    if chat_template or chat_template_file:
+        info = apply_override(
+            chat_template,
+            chat_template_file,
+            label=result.descriptor.family,
+        )
+        _apply_template_info(result.descriptor, info)
+        result.steps_log.append(
+            f"Applied chat template override: {info.source if info else 'none'}"
+        )
+    return result
 
 
 def _resolve_local(user_ref: str, log: list[str]) -> ResolvedModel:
@@ -661,6 +720,24 @@ def _resolve_local_gguf(user_ref: str, path: Path, log: list[str]) -> ResolvedMo
         parameter_count=info.get("parameter_count"),
         notes=[f"local GGUF source, dtype mix={dict(mix)}"],
     )
+    metadata = info.get("metadata") or {}
+    template_text = metadata.get("tokenizer.chat_template")
+    if isinstance(template_text, str) and template_text.strip():
+        add_bos = metadata.get("tokenizer.ggml.add_bos_token")
+        _apply_template_info(
+            desc,
+            template_from_text(
+                template_text,
+                source="gguf:tokenizer.chat_template",
+                label=info.get("architecture"),
+                add_bos_token=add_bos if isinstance(add_bos, bool) else None,
+            ),
+        )
+    else:
+        _apply_template_info(
+            desc,
+            load_local_template(path.parent, label=info.get("architecture")),
+        )
     if quantized:
         desc.notes.append(
             "GGUF holds quantized weights — Step 02 indexes without "
@@ -756,11 +833,20 @@ def _resolve_ollama(
         embedding_length=info.embedding_length,
         parameter_count=info.parameter_count,
         context_length=info.context_length,
-        chat_template=(info.architecture or "").lower() or None,
         specialty_domain=specialty,
         ollama_quantization=info.quantization,
         notes=[],
     )
+    if info.chat_template_text:
+        _apply_template_info(
+            base,
+            template_from_text(
+                info.chat_template_text,
+                source="gguf:tokenizer.chat_template",
+                label=(info.architecture or "").lower() or None,
+                add_bos_token=info.add_bos_token,
+            ),
+        )
     if info.layer_count:
         log.append(
             f"{step_n}. Enriched descriptor from GGUF metadata: "
@@ -848,6 +934,100 @@ def _resolve_hf(
     )
 
 
+def _fetch_hf_template(
+    repo_id: str,
+    cache: Path,
+    token: str | None,
+) -> TemplateInfo | None:
+    """Fetch the small template files without downloading model weights."""
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        return None
+
+    def _get(name: str) -> Path | None:
+        try:
+            return Path(
+                hf_hub_download(
+                    repo_id=repo_id,
+                    filename=name,
+                    cache_dir=str(cache),
+                    token=token,
+                )
+            )
+        except Exception:  # noqa: BLE001 — missing file or offline
+            return None
+
+    tok_path = _get("tokenizer_config.json")
+    tok: dict[str, Any] = {}
+    if tok_path is not None:
+        try:
+            data = json.loads(tok_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                tok = data
+        except (OSError, ValueError):
+            tok = {}
+
+    def _tok(name: str) -> str | None:
+        value = tok.get(name)
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict) and isinstance(value.get("content"), str):
+            return value["content"]
+        return None
+
+    bos = _tok("bos_token")
+    eos = _tok("eos_token")
+    add_bos = tok.get("add_bos_token")
+    add_bos = add_bos if isinstance(add_bos, bool) else None
+
+    jinja = _get("chat_template.jinja")
+    if jinja is not None:
+        try:
+            text = jinja.read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        if text.strip():
+            return template_from_text(
+                text,
+                source="hf:chat_template.jinja",
+                bos_token=bos,
+                eos_token=eos,
+                add_bos_token=add_bos,
+            )
+
+    if tok.get("chat_template"):
+        text, variant = select_variant(tok["chat_template"])
+        if text:
+            return template_from_text(
+                text,
+                source="hf:tokenizer_config.json",
+                variant=variant,
+                bos_token=bos,
+                eos_token=eos,
+                add_bos_token=add_bos,
+            )
+
+    ctj_path = _get("chat_template.json")
+    if ctj_path is not None:
+        try:
+            data = json.loads(ctj_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = None
+        value = data.get("chat_template", data) if isinstance(data, dict) else data
+        text, variant = select_variant(value)
+        if text:
+            return template_from_text(
+                text,
+                source="hf:chat_template.json",
+                variant=variant,
+                bos_token=bos,
+                eos_token=eos,
+                add_bos_token=add_bos,
+            )
+    return None
+
+
 def _finish_hf(
     *,
     user_ref: str,
@@ -891,6 +1071,20 @@ def _finish_hf(
             else "Identity resolved; BF16 weights download deferred"
         )
 
+    info = (
+        load_local_template(local_path, label=desc.family)
+        if local_path
+        else None
+    )
+    if info is None:
+        info = _fetch_hf_template(hf_id, cache, hf_token)
+    if info is not None:
+        info.label = info.label or desc.family
+        _apply_template_info(desc, info)
+        log.append(f"Chat template: {info.source} (sha256={info.sha256[:12]})")
+    else:
+        log.append("No chat template found in local snapshot or Hub files")
+
     return ResolvedModel(
         user_ref=user_ref,
         kind=kind,
@@ -908,6 +1102,7 @@ def _finish_hf(
 def _merge_desc(
     base: ArchitectureDescriptor, hf: ArchitectureDescriptor
 ) -> ArchitectureDescriptor:
+    hf_has_template = bool(hf.chat_template_text or hf.chat_template_builtin)
     return ArchitectureDescriptor(
         family=hf.family or base.family,
         layer_count=hf.layer_count or base.layer_count,
@@ -916,7 +1111,31 @@ def _merge_desc(
         context_length=hf.context_length or base.context_length,
         is_moe=hf.is_moe or base.is_moe,
         is_hybrid_ssm=hf.is_hybrid_ssm or base.is_hybrid_ssm,
-        chat_template=hf.chat_template or base.chat_template,
+        chat_template=(
+            hf.chat_template if hf_has_template else base.chat_template
+        ),
+        chat_template_text=(
+            hf.chat_template_text or base.chat_template_text
+        ),
+        chat_template_source=(
+            hf.chat_template_source if hf_has_template else base.chat_template_source
+        ),
+        chat_template_sha256=(
+            hf.chat_template_sha256 if hf_has_template else base.chat_template_sha256
+        ),
+        chat_template_variant=(
+            hf.chat_template_variant if hf_has_template else base.chat_template_variant
+        ),
+        chat_template_builtin=(
+            hf.chat_template_builtin or base.chat_template_builtin
+        ),
+        bos_token=hf.bos_token or base.bos_token,
+        eos_token=hf.eos_token or base.eos_token,
+        add_bos_token=(
+            hf.add_bos_token
+            if hf.add_bos_token is not None
+            else base.add_bos_token
+        ),
         specialty_domain=hf.specialty_domain or base.specialty_domain,
         ollama_quantization=base.ollama_quantization,
         notes=list(base.notes) + list(hf.notes),

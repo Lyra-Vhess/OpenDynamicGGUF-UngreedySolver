@@ -154,6 +154,8 @@ odg catalog     --model $MODEL
 odg weight-features --model $MODEL --only-quantizable
 
 # 07 · calib / search / held-out text (use 300000+ for production)
+#      needs the step-09 frozen GGUF and llama-server; renders the model's
+#      own chat template and fails if none is available.
 odg corpus --model $MODEL --target-tokens 300000
 
 # 08 · activation stats (forward if BF16+torch available, else proxy)
@@ -352,6 +354,8 @@ Every step directory also has `input.json`, `output.json`, `status.json`, and `l
 | `--force` | most commands | Recompute even if checkpointed `done`. |
 | `--prefer-hf` | `resolve`, `run` | Prefer upstream HF BF16 over local Ollama GGUF. |
 | `--download-weights` | `resolve`, `run` | Fetch resolved weights. |
+| `--chat-template` | `resolve`, `corpus`, `run`, `fit` | Override the model's template with Jinja text or a llama.cpp built-in name. |
+| `--chat-template-file` | `resolve`, `corpus`, `run`, `fit` | Read the template from a Jinja file. |
 | `--mode auto\|llama\|dry-run` | `export` | `auto` falls back to dry-run; `llama` requires the binary. |
 | `--mode auto\|llama\|proxy` | `imatrix`, `reference-logits`, `sensitivity`, `validate` | Prefer real llama tools or stay in proxy. |
 | `--budget-mb` / `--budget-ratio` | `optimize`, `run` | Override the size budget. On `run`, the literal `frontier` skips the primary export and measurement. |

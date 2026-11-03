@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Callable
 import hashlib
 import random
 from pathlib import Path
+
+from chat_template import TemplateInfo
 
 
 # --- from corpus/types.py ---
@@ -30,117 +32,15 @@ class CorpusResult:
     chars_total: int
     domain_counts: dict[str, int]
     files: dict[str, str]
+    chat_template_source: str | None = None
+    chat_template_sha256: str | None = None
+    chat_template_variant: str | None = None
+    add_bos_token: bool | None = None
     steps_log: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
     def summary_dict(self) -> dict[str, Any]:
         return asdict(self)
-
-# --- from corpus/templates.py ---
-def render_chat(
-    user: str,
-    assistant: str | None = None,
-    *,
-    template: str | None = "gemma3",
-) -> str:
-    """Render a user(/assistant) turn with the model's chat template."""
-    t = (template or "plain").lower()
-    if t in {"gemma", "gemma2", "gemma3", "functiongemma"}:
-        return _gemma(user, assistant)
-    if t in {"chatml", "qwen", "qwen2"}:
-        return _chatml(user, assistant)
-    if t in {"llama3", "llama-3"}:
-        return _llama3(user, assistant)
-    return _plain(user, assistant)
-
-
-def render_document(doc: dict[str, Any], *, template: str | None) -> str:
-    """
-    doc keys:
-      user / assistant  — single turn
-      turns             — list of {role, content}
-      text              — already-formatted raw text (no template)
-    """
-    if "text" in doc and doc["text"]:
-        return str(doc["text"]).strip() + "\n"
-
-    turns = doc.get("turns")
-    if turns:
-        return render_turns(turns, template=template)
-
-    user = str(doc.get("user") or "").strip()
-    assistant = doc.get("assistant")
-    assistant_s = str(assistant).strip() if assistant is not None else None
-    return render_chat(user, assistant_s, template=template)
-
-
-def render_turns(turns: list[dict[str, str]], *, template: str | None) -> str:
-    t = (template or "plain").lower()
-    if t in {"gemma", "gemma2", "gemma3", "functiongemma"}:
-        parts: list[str] = []
-        for turn in turns:
-            role = turn.get("role", "user")
-            content = (turn.get("content") or "").strip()
-            if role == "system":
-                # Gemma has no system turn; prepend to first user
-                continue
-            gemma_role = "model" if role in {"assistant", "model"} else "user"
-            parts.append(f"<start_of_turn>{gemma_role}\n{content}<end_of_turn>")
-        # If system present, prepend to first user content
-        sys_msgs = [x.get("content", "") for x in turns if x.get("role") == "system"]
-        if sys_msgs and parts:
-            sys_text = "\n".join(s.strip() for s in sys_msgs if s).strip()
-            if sys_text and parts[0].startswith("<start_of_turn>user\n"):
-                parts[0] = parts[0].replace(
-                    "<start_of_turn>user\n",
-                    f"<start_of_turn>user\n{sys_text}\n\n",
-                    1,
-                )
-        return "\n".join(parts) + "\n"
-
-    # Fallback: concatenate plain turns
-    lines = []
-    for turn in turns:
-        role = turn.get("role", "user").capitalize()
-        lines.append(f"{role}: {(turn.get('content') or '').strip()}")
-    return "\n".join(lines) + "\n"
-
-
-def _gemma(user: str, assistant: str | None) -> str:
-    parts = [f"<start_of_turn>user\n{user.strip()}<end_of_turn>"]
-    if assistant:
-        parts.append(f"<start_of_turn>model\n{assistant.strip()}<end_of_turn>")
-    return "\n".join(parts) + "\n"
-
-
-def _chatml(user: str, assistant: str | None) -> str:
-    parts = [
-        "<|im_start|>user\n" + user.strip() + "<|im_end|>",
-    ]
-    if assistant:
-        parts.append("<|im_start|>assistant\n" + assistant.strip() + "<|im_end|>")
-    return "\n".join(parts) + "\n"
-
-
-def _llama3(user: str, assistant: str | None) -> str:
-    parts = [
-        "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
-        + user.strip()
-        + "<|eot_id|>"
-    ]
-    if assistant:
-        parts.append(
-            "<|start_header_id|>assistant<|end_header_id|>\n\n"
-            + assistant.strip()
-            + "<|eot_id|>"
-        )
-    return "".join(parts) + "\n"
-
-
-def _plain(user: str, assistant: str | None) -> str:
-    if assistant:
-        return f"User: {user.strip()}\nAssistant: {assistant.strip()}\n"
-    return f"User: {user.strip()}\n"
 
 # --- from corpus/prompts.py ---
 def conversation_bank() -> list[dict[str, Any]]:
@@ -457,8 +357,6 @@ def _vary(doc: dict[str, Any], variant: int) -> dict[str, Any]:
                 t["content"] = str(t.get("content") or "") + tag
                 break
         d["turns"] = turns
-    if "text" in d and d["text"]:
-        d["text"] = str(d["text"]) + tag
     return d
 
 
@@ -475,13 +373,14 @@ def _collect_banks(specialty: str | None) -> dict[str, list[dict[str, Any]]]:
 def build_document_pool(
     *,
     specialty_domain: str | None,
-    chat_template: str | None,
+    template_label: str | None,
+    render_document,
     target_tokens: int,
     seed: int,
 ) -> tuple[list[str], dict[str, int], list[str]]:
     """
-    Mix domains by share, render with chat template, tile until ~target_tokens.
-    Returns (documents, domain_counts, log).
+    Mix domains by share, render through the live template, tile until
+    ~target_tokens.  Returns (documents, domain_counts, log).
     """
     log: list[str] = []
     rng = random.Random(seed)
@@ -519,7 +418,9 @@ def build_document_pool(
         f"2. Seed pool size={len(mixed)} domains="
         + ",".join(f"{k}:{len(banks[k])}" for k in banks)
     )
-    log.append(f"3. Chat template={chat_template!r} target_tokens≈{target_tokens}")
+    log.append(
+        f"3. Chat template={template_label!r} target_tokens≈{target_tokens}"
+    )
 
     docs: list[str] = []
     domain_counts: dict[str, int] = {k: 0 for k in shares}
@@ -532,7 +433,7 @@ def build_document_pool(
         order = list(mixed)
         rng.shuffle(order)
         for domain, doc in order:
-            rendered = render_document(_vary(doc, variant), template=chat_template)
+            rendered = render_document(_vary(doc, variant))
             docs.append(rendered)
             domain_counts[domain] = domain_counts.get(domain, 0) + 1
             tokens += estimate_tokens(rendered)
@@ -593,7 +494,8 @@ def build_corpus(
     *,
     model_ref: str,
     out_dir: Path,
-    chat_template: str | None = "gemma3",
+    template: TemplateInfo,
+    render_document: Callable[[dict[str, Any]], str],
     specialty_domain: str | None = None,
     target_tokens: int = 50_000,
     seed: int = 42,
@@ -604,13 +506,16 @@ def build_corpus(
 
     Writes: calib.txt, search.txt, heldout.txt, corpus_manifest.json
     """
+    if not template.usable:
+        raise ValueError("Cannot build a corpus without a usable chat template")
     splits = splits or dict(DEFAULT_SPLITS)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     docs, domain_counts, log = build_document_pool(
         specialty_domain=specialty_domain,
-        chat_template=chat_template,
+        template_label=template.label or template.source,
+        render_document=render_document,
         target_tokens=target_tokens,
         seed=seed,
     )
@@ -648,7 +553,11 @@ def build_corpus(
     result = CorpusResult(
         model_ref=model_ref,
         corpus_id=CORPUS_ID,
-        chat_template=chat_template,
+        chat_template=template.label,
+        chat_template_source=template.source,
+        chat_template_sha256=template.sha256,
+        chat_template_variant=template.variant,
+        add_bos_token=template.add_bos_token,
         specialty_domain=specialty_domain,
         seed=seed,
         target_tokens=target_tokens,

@@ -340,8 +340,8 @@ The generalization that makes this work for *any* model: the pipeline never star
 | `./my-finetune/` | Local full-precision checkpoint | Used directly |
 
 **Consumes:** any model reference.
-**Produces:** BF16 safetensors + an *architecture descriptor* (family, layer count, MoE/SSM flags, chat template, specialty domain).
-**Failure prevented:** requantizing already-quantized weights (MLX 4-bit, Ollama Q4). Quantization error compounds — no downstream search can recover it.
+**Produces:** BF16 safetensors + an *architecture descriptor* (family, layer count, MoE/SSM flags, the model's actual chat-template text, its source and SHA-256, specialty domain).
+**Failure prevented:** requantizing already-quantized weights (MLX 4-bit, Ollama Q4). Quantization error compounds, and no downstream search can recover it.
 
 The architecture descriptor drives two later decisions: which tensor-role taxonomy to use ([per-architecture policies](#one-pipeline-every-architecture)) and which domain data/checks to add (e.g. function-calling traces and JSON-validity gates for a `functiongemma`-style fine-tune).
 
@@ -543,19 +543,24 @@ Only a forward pass on representative prompts reveals that.
 
 #### What the corpus looks like
 
-A calibration file is plain text — thousands of prompts concatenated, ideally rendered with the model's **chat template** for instruct models:
+A calibration file is plain text: thousands of prompts concatenated and
+rendered with the model's own **chat template**. The exact text depends on
+the model. A Gemma 4 document starts like this:
 
 ```text
-User:
-Explain quantum mechanics.
-Assistant:
-…
-
-User:
-Write a Python function that merges two sorted lists.
-Assistant:
+<|turn>system
+<|think|>
+<turn|>
+<|turn>user
+Explain quantum mechanics.<turn|>
+<|turn>model
 …
 ```
+
+Step 07 renders with `llama-server /apply-template`, so the text matches what
+llama.cpp would send. It fails if the model has no template; pass
+`--chat-template` or `--chat-template-file` to supply one. There is no
+plain-text fallback.
 
 There is no single standard dataset. Community GGUF builders commonly mix WikiText, C4, code, chat, math, and multilingual text. OpenDynamicGGUF is more deliberate than Wikipedia-only:
 

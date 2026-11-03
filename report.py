@@ -74,6 +74,9 @@ def extract_summary(run_root: Path) -> dict[str, Any]:
         "params": desc.get("parameter_count"),
         "context_length": desc.get("context_length"),
         "specialty_domain": desc.get("specialty_domain"),
+        "chat_template": desc.get("chat_template"),
+        "chat_template_source": desc.get("chat_template_source"),
+        "chat_template_sha256": desc.get("chat_template_sha256"),
         "fit_plan": fit_plan,
     }
 

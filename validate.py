@@ -302,6 +302,8 @@ def build_report_card_data(
             "parameter_count": desc.get("parameter_count"),
             "specialty_domain": desc.get("specialty_domain"),
             "chat_template": desc.get("chat_template"),
+            "chat_template_source": desc.get("chat_template_source"),
+            "chat_template_sha256": desc.get("chat_template_sha256"),
         },
         "baseline": baseline,
         "size": {

@@ -1,5 +1,34 @@
 # Changes: DP-MCKP optimizer with column generation (`feat/dp-mckp-colgen`)
 
+## Model chat templates (2026-11-03)
+
+- **Resolve the real template.** Step 01 now reads the model's actual Jinja
+  template instead of storing a family name. Local directories use
+  `chat_template.jinja`, then inline `chat_template` in
+  `tokenizer_config.json`, then `chat_template.json`, then `config.json`.
+  HF snapshots use the same local order and fetch the small template files
+  when only `config.json` was downloaded. GGUF and Ollama sources read
+  `tokenizer.chat_template` from metadata.
+- **Provenance.** The descriptor records the template text, source, SHA-256,
+  variant, BOS/EOS tokens, and `add_bos_token`. A template list uses the
+  entry named `default`, otherwise the first.
+- **Rendering.** Step 07 writes the template to `07_corpus/chat_template.jinja`
+  and renders every document with `llama-server /apply-template`. The server
+  runs with `--no-prefill-assistant` so a final assistant turn is closed
+  instead of treated as a prefill. The returned prompt has no leading BOS
+  when the tokenizer adds one, which avoids the double-BOS bug. Step 07 now
+  requires a GGUF (the step-09 freeze in `odg run`) and `llama-server`.
+- **No guessing.** The static Gemma/ChatML/Llama renderers and the plain-text
+  fallback are gone. If no template exists, Step 07 fails with the model and
+  the places searched. `--chat-template` (Jinja text or a llama.cpp built-in
+  name) and `--chat-template-file` override the model's template on
+  `resolve`, `corpus`, `run`, and `fit`.
+- **Stale checks.** The corpus input and manifest record the template source
+  and hash; a changed template invalidates the checkpoint.
+- **Tests:** local priority, inline and named variants, GGUF metadata,
+  overrides, renderer command and request shape, corpus provenance, hard
+  failures, and template hashes. Full suite: 288 passed.
+
 ## Single-run frontier pipeline (2026-11-02)
 
 - **Order:** `odg run` now resolves, then freezes, then loads. Steps 02–08

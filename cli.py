@@ -90,6 +90,19 @@ def main(argv: list[str] | None = None) -> int:
         help="Optional extra copy of output JSON",
     )
     p_resolve.add_argument("--cache-dir", type=Path, default=None)
+    p_resolve.add_argument(
+        "--chat-template",
+        default=None,
+        metavar="JINJA_OR_NAME",
+        help="Override the model's chat template with Jinja text or a "
+        "llama.cpp built-in template name",
+    )
+    p_resolve.add_argument(
+        "--chat-template-file",
+        type=Path,
+        default=None,
+        help="Read the chat template from a Jinja file",
+    )
     p_resolve.add_argument("--no-explain", action="store_true")
 
     # --- load (step 02) ---
@@ -162,6 +175,19 @@ def main(argv: list[str] | None = None) -> int:
         help="Approximate token budget (chars/4). Default 50000; use 300000+ for production",
     )
     p_corp.add_argument("--seed", type=int, default=42)
+    p_corp.add_argument(
+        "--chat-template",
+        default=None,
+        metavar="JINJA_OR_NAME",
+        help="Override the model's chat template with Jinja text or a "
+        "llama.cpp built-in template name",
+    )
+    p_corp.add_argument(
+        "--chat-template-file",
+        type=Path,
+        default=None,
+        help="Read the chat template from a Jinja file",
+    )
     p_corp.add_argument("--no-explain", action="store_true")
 
     # --- activation-features (step 08) ---
@@ -628,6 +654,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_run.add_argument("--seed", type=int, default=42, help="Corpus split seed")
     p_run.add_argument(
+        "--chat-template",
+        default=None,
+        metavar="JINJA_OR_NAME",
+        help="Override the model's chat template with Jinja text or a "
+        "llama.cpp built-in template name",
+    )
+    p_run.add_argument(
+        "--chat-template-file",
+        type=Path,
+        default=None,
+        help="Read the chat template from a Jinja file",
+    )
+    p_run.add_argument(
         "--max-docs",
         type=int,
         default=32,
@@ -871,6 +910,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_fit.add_argument("--target-tokens", type=int, default=50_000)
     p_fit.add_argument("--seed", type=int, default=42)
+    p_fit.add_argument(
+        "--chat-template",
+        default=None,
+        metavar="JINJA_OR_NAME",
+        help="Override the model's chat template with Jinja text or a "
+        "llama.cpp built-in template name",
+    )
+    p_fit.add_argument(
+        "--chat-template-file",
+        type=Path,
+        default=None,
+        help="Read the chat template from a Jinja file",
+    )
     p_fit.add_argument("--max-docs", type=int, default=32)
     p_fit.add_argument(
         "--freeze-mode",
@@ -1181,10 +1233,22 @@ def _pipeline_expected_inputs(step_id: str, args: argparse.Namespace, fmt):
     Keys requiring a resolved quant format are omitted when *fmt* is None.
     """
     exp: dict = {}
-    if step_id == "corpus":
+    if step_id == "resolve":
+        exp["model"] = _run_flag(args, "model", None)
+        exp["prefer_hf"] = bool(_run_flag(args, "prefer_hf", False))
+        exp["download_weights"] = bool(
+            _run_flag(args, "download_weights", False)
+        )
+        exp["chat_template"] = _run_flag(args, "chat_template", None)
+        ct_file = _run_flag(args, "chat_template_file", None)
+        exp["chat_template_file"] = str(ct_file) if ct_file else None
+    elif step_id == "corpus":
         exp["target_tokens"] = int(_run_flag(args, "target_tokens", 50_000) or 50_000)
         seed = _run_flag(args, "seed", 42)
         exp["seed"] = int(42 if seed is None else seed)
+        exp["chat_template"] = _run_flag(args, "chat_template", None)
+        ct_file = _run_flag(args, "chat_template_file", None)
+        exp["chat_template_file"] = str(ct_file) if ct_file else None
     elif step_id == "activation_features":
         exp["mode"] = _run_flag(args, "mode", "auto") or "auto"
         exp["max_docs"] = int(_run_flag(args, "max_docs", 32) or 32)
@@ -1481,6 +1545,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             target_tokens=int(_run_flag(args, "target_tokens", 50_000) or 50_000),
             seed=int(_run_flag(args, "seed", 42)
                      if _run_flag(args, "seed", 42) is not None else 42),
+            chat_template=_run_flag(args, "chat_template", None),
+            chat_template_file=_run_flag(args, "chat_template_file", None),
             # shared mode knobs
             mode=step_mode,
             max_docs=int(_run_flag(args, "max_docs", 32) or 32),
@@ -1647,10 +1713,16 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         )
         return 0
 
+    template_value = getattr(args, "chat_template", None)
+    template_file = getattr(args, "chat_template_file", None)
     input_data = {
         "model": args.model,
         "prefer_hf": args.prefer_hf,
         "download_weights": args.download_weights,
+        "chat_template": template_value,
+        "chat_template_file": (
+            str(template_file) if template_file else None
+        ),
         "quant_format": fmt.id,
         "quant_label": fmt.label,
     }
@@ -1670,6 +1742,8 @@ def cmd_resolve(args: argparse.Namespace) -> int:
                 cache_dir=args.cache_dir,
                 download_weights=args.download_weights,
                 prefer_hf=args.prefer_hf,
+                chat_template=template_value,
+                chat_template_file=template_file,
             )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "resolve", str(exc))
@@ -2288,6 +2362,12 @@ def cmd_weight_features(args: argparse.Namespace) -> int:
 
 
 def cmd_corpus(args: argparse.Namespace) -> int:
+    from chat_template import (
+        LlamaTemplateRenderer,
+        TemplateInfo,
+        apply_override,
+        write_template_file,
+    )
     from corpus import build_corpus
     from store import StepAlreadyDone
 
@@ -2312,7 +2392,39 @@ def cmd_corpus(args: argparse.Namespace) -> int:
     if print_explain:
         _banner_corpus(meta.model_ref, meta.run_id, meta.root)
 
+    resolve_out = store.read_step_output(meta.run_id, "resolve") or {}
+    load_out = store.read_step_output(meta.run_id, "load") or {}
+    freeze_out = store.read_step_output(meta.run_id, "freeze_gguf") or {}
+    desc = resolve_out.get("descriptor") or {}
+    specialty = desc.get("specialty_domain")
+
+    template = TemplateInfo.from_descriptor(desc)
+    override = apply_override(
+        getattr(args, "chat_template", None),
+        getattr(args, "chat_template_file", None),
+        label=desc.get("family"),
+    )
+    if override is not None:
+        template = override
+
     if store.is_step_done(meta.run_id, "corpus") and not args.force:
+        prev_path = store.step_path(meta.run_id, "corpus") / "input.json"
+        try:
+            prev_input = json.loads(prev_path.read_text())
+        except (OSError, ValueError):
+            prev_input = {}
+        prev_sha = prev_input.get("chat_template_sha256")
+        if template.usable and prev_sha and prev_sha != template.sha256:
+            print(
+                "ERROR: Step 07 was already built with a different chat "
+                "template.\n"
+                f"  checkpoint: {prev_sha}\n"
+                f"  current:    {template.sha256}\n"
+                "  Re-run with --force to rebuild the corpus and every "
+                "downstream step.",
+                file=sys.stderr,
+            )
+            return 1
         out = store.read_step_output(meta.run_id, "corpus")
         ui.already_done(
             7,
@@ -2325,14 +2437,60 @@ def cmd_corpus(args: argparse.Namespace) -> int:
         )
         return 0
 
-    resolve_out = store.read_step_output(meta.run_id, "resolve") or {}
-    desc = resolve_out.get("descriptor") or {}
-    chat_template = desc.get("chat_template") or "gemma3"
-    specialty = desc.get("specialty_domain")
+    if not template.usable:
+        print(
+            "ERROR: Step 07 needs a real chat template, and none was found.\n"
+            f"  Model: {meta.model_ref}\n"
+            "  Looked for chat_template.jinja, tokenizer_config.json, "
+            "chat_template.json, and config.json in the source, and for "
+            "tokenizer.chat_template in GGUF metadata.\n"
+            "  Pass --chat-template or --chat-template-file to provide one.",
+            file=sys.stderr,
+        )
+        return 1
+
+    model_gguf = freeze_out.get("gguf_path")
+    if not model_gguf or not Path(model_gguf).is_file():
+        for candidate in (
+            load_out.get("source_path"),
+            resolve_out.get("local_path"),
+        ):
+            if (
+                candidate
+                and Path(candidate).is_file()
+                and Path(candidate).suffix.lower() == ".gguf"
+            ):
+                model_gguf = candidate
+                break
+    if not model_gguf or not Path(model_gguf).is_file():
+        print(
+            "ERROR: Step 07 needs a GGUF to load the model's tokenizer and "
+            "template.\n"
+            f"  Model: {meta.model_ref}\n"
+            "  Run `odg freeze-gguf` first, or resolve a GGUF source.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if template.add_bos_token is None:
+        try:
+            from load import open_gguf
+
+            md = open_gguf(Path(model_gguf)).get("metadata") or {}
+            add_bos = md.get("tokenizer.ggml.add_bos_token")
+            if isinstance(add_bos, bool):
+                template.add_bos_token = add_bos
+        except Exception:  # noqa: BLE001 — BOS provenance is best effort
+            pass
 
     input_data = {
         "from_step": "weight_features",
-        "chat_template": chat_template,
+        "chat_template": template.label,
+        "chat_template_source": template.source,
+        "chat_template_sha256": template.sha256,
+        "chat_template_variant": template.variant,
+        "chat_template_builtin": template.builtin,
+        "model_gguf": str(model_gguf),
         "specialty_domain": specialty,
         "target_tokens": int(args.target_tokens),
         "seed": int(args.seed),
@@ -2347,15 +2505,28 @@ def cmd_corpus(args: argparse.Namespace) -> int:
         return cmd_corpus(args)
 
     try:
-        with ui.working('Building calibration corpus…', explain=print_explain):
-            result, manifest = build_corpus(
-                model_ref=meta.model_ref,
-                out_dir=step_dir,
-                chat_template=chat_template,
-                specialty_domain=specialty,
-                target_tokens=int(args.target_tokens),
-                seed=int(args.seed),
-            )
+        template_path = write_template_file(
+            step_dir / "chat_template.jinja", template
+        )
+        with ui.working(
+            'Rendering calibration corpus with llama.cpp…',
+            explain=print_explain,
+        ):
+            with LlamaTemplateRenderer(
+                model_gguf=model_gguf,
+                template=template,
+                template_path=template_path,
+                log_path=step_dir / "llama-server.log",
+            ) as renderer:
+                result, manifest = build_corpus(
+                    model_ref=meta.model_ref,
+                    out_dir=step_dir,
+                    template=template,
+                    render_document=renderer.render_document,
+                    specialty_domain=specialty,
+                    target_tokens=int(args.target_tokens),
+                    seed=int(args.seed),
+                )
     except Exception as exc:  # noqa: BLE001
         store.fail_step(meta.run_id, "corpus", str(exc))
         ui.error(7, "corpus", exc, store.step_path(meta.run_id, "corpus"))
@@ -2381,7 +2552,7 @@ def cmd_corpus(args: argparse.Namespace) -> int:
         ui.checkpoint_saved(
             run_id=meta.run_id,
             step_dir=step_dir,
-            files=('output.json', 'calib.txt', 'search.txt', 'heldout.txt', 'corpus_manifest.json', 'status.json', 'log.txt'),
+            files=('output.json', 'calib.txt', 'search.txt', 'heldout.txt', 'corpus_manifest.json', 'chat_template.jinja', 'llama-server.log', 'status.json', 'log.txt'),
             explain=True,
         )
         ui.run_summary(store.summary(meta.run_id))
@@ -4361,6 +4532,8 @@ def cmd_fit(args: argparse.Namespace) -> int:
         target_tokens=int(_run_flag(args, "target_tokens", 50_000) or 50_000),
         seed=int(_run_flag(args, "seed", 42)
                  if _run_flag(args, "seed", 42) is not None else 42),
+        chat_template=_run_flag(args, "chat_template", None),
+        chat_template_file=_run_flag(args, "chat_template_file", None),
         max_docs=int(_run_flag(args, "max_docs", 32) or 32),
         freeze_mode=_run_flag(args, "freeze_mode", "auto") or "auto",
         convert_script=_run_flag(args, "convert_script", None),
@@ -4982,6 +5155,11 @@ def _explain_corpus(result) -> None:
             ("Docs (calib/search/heldout)", f"{result.n_calib} / {result.n_search} / {result.n_heldout}"),
             ("Tokens est total", f"{result.tokens_est_total:,}"),
             ("Chat template", result.chat_template or "-"),
+            ("Template source", result.chat_template_source or "-"),
+            (
+                "Template sha256",
+                (result.chat_template_sha256 or "-")[:16],
+            ),
             ("Domain counts", result.domain_counts),
         ]
     )
